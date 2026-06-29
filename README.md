@@ -259,14 +259,20 @@ sees a struct that is mid-update.
 
 ```cpp
 struct SensorData {
-  float    co_ppm, co_raw;           byte co_phase;   bool co_fault;
+  float    co_ppm, co_raw;           
+  byte     co_phase;   
+  bool     co_fault;
   float    no2_raw, no2_voltage;
   float    uvi;
   float    sound_v;
   float    dust_mg;
-  float    temp, hum;                bool dht_fault;
-  float    angle[3], imu_temp;       bool imu_ok;
-  double   lat, lng;   float hdop, sats;   bool gps_fix;
+  float    temp, hum;                
+  bool     dht_fault;
+  float    angle[3], imu_temp;       
+  bool     imu_ok;
+  double   lat, lng;   
+  float    hdop, sats;   
+  bool     gps_fix;
   uint32_t status_flags;
   char     eng_msg[128];
   int      rand_num;
@@ -455,7 +461,7 @@ same sketch folder. **Never commit this file to version control** — add it to
 #define WIFI_SSID    "YourNetworkName"
 #define WIFI_PASS    "YourPassword"
 #define BLYNK_AUTH   "YourBlynkAuthToken"
-#define BLYNK_SERVER "192.168.x.x"       // local server IP
+#define BLYNK_SERVER "192.168.x.x"        // local server IP
 #define BLYNK_PORT   8080                 // plain TCP; use 8441 for TLS
 ```
 
