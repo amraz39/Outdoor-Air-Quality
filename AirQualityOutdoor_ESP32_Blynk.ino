@@ -1,268 +1,303 @@
 // ============================================================================
-// Outdoor Air Quality Station — ESP32 Production Firmware v1.2
+// Outdoor Air Quality Station — ESP32 Production Firmware v2.2
 // Migrated & rewritten from original Arduino Mega + Esp8266EasyIoT (AM, 2017)
 //
-// Hardware: ESP32 DevKit, MQ-7 CO sensor board, MICS-2710 NO2,
-//           DHT21 temp/hum, Sharp GP2Y1010 dust, ML8511 UV,
-//           Analog mic, JY-901/WT901 IMU, u-blox GPS (UART)
+// ─── HARDWARE v2.0/2.1 ───────────────────────────────────────────────────────
+//   KEPT:       MQ-7 CO board (5V heater, closed-loop via A1 feedback)
+//               ML8511 UV (3.3V ratiometric, direct)
+//               Sharp GP2Y1010 dust (5V, 10k+10k divider)
+//               JY-901/WT901 IMU (UART2 GPIO16/17, 3.3V)
+//               LEDs, buzzer, CO PWM
 //
-// Backend:  Blynk 0.6.1 LOCAL SERVER (Java 21 patched build)
-//           Plain TCP port 8080. For TLS use BlynkSimpleEsp32_SSL.h + port 8441.
+//   REPLACED:
+//     DHT21          → AHT2x on ENS160 board   (I2C 0x38, 3.3V, no pull-up)
+//     MICS-2710 NO2  → ENS160 TVOC/eCO2/AQI    (I2C 0x53, 3.3V, no divider)
+//     Analogue mic   → INMP441 I2S 24-bit mic   (GPIO25/26/33, 3.3V)
+//     u-blox GPS     → ATGM336H NMEA GPS        (UART1 GPIO13/23, 9600 baud)
 //
-// Architecture: Core 0 = Blynk / WiFi / reporting (BlynkTimer)
-//               Core 1 = All sensor reads + CO state machine
-//               FreeRTOS mutex protects shared SensorData struct
+// ─── MQ-7 HEATER BOARD — CLOSED LOOP (from datasheet analysis) ──────────────
+//   Board pins:
+//     VCC → ESP32 VIN (5V)
+//     GND → GND
+//     D2  → GPIO4  (PWM direct, 3.3V logic drives NPN base via 1kΩ — sufficient)
+//     A0  → 10kΩ+10kΩ divider → GPIO36 (CO sense, smoothed by 470µF on board)
+//     A1  → 10kΩ+10kΩ divider → GPIO39 (heater voltage feedback, 0–5V → 0–2.5V)
 //
-// Credentials: secrets.h (never commit that file to version control)
+//   New closed-loop calibration: instead of open-loop PWM sweep, we read A1
+//   (heater voltage feedback) and adjust duty cycle until A1 hits target voltage.
+//   Heating phase:     target A1 = 5.0V  → duty = 255 (full on)
+//   Measurement phase: target A1 = 1.4V  → duty adjusted via closed loop
+//
+// ─── PIN MAP v2.0 ────────────────────────────────────────────────────────────
+//   GPIO36 VP — CO sense AO (10k+10k divider from board A0)
+//   GPIO39 VN — CO heater feedback A1 (10k+10k divider from board A1)
+//   GPIO34    — UV OUT (ML8511, direct 3.3V)
+//   GPIO35    — UV REF (ML8511, direct 3.3V)
+//   GPIO32    — Dust AO (GP2Y1010, 10k+10k divider)
+//   GPIO21    — I2C SDA (ENS160+AHT2x)
+//   GPIO22    — I2C SCL (ENS160+AHT2x)
+//   GPIO13    — GPS UART1 RX ← ATGM336H TX  [moved from 22 to free I2C SCL]
+//   GPIO23    — GPS UART1 TX → ATGM336H RX
+//   GPIO16    — IMU UART2 RX ← JY-901 TX
+//   GPIO17    — IMU UART2 TX → JY-901 RX
+//   GPIO25    — INMP441 I2S SCK (BCLK)
+//   GPIO26    — INMP441 I2S WS  (LRCLK)  [ADC2 output only — no WiFi ADC conflict]
+//   GPIO33    — INMP441 I2S SD  (data in) [freed from NO2 analogue]
+//   GPIO4     — CO PWM (LEDC, direct to D2 on heater board)
+//   GPIO18    — Dust IR LED (active LOW)
+//   GPIO14    — LED green   (CO ≤ 10 ppm)
+//   GPIO27    — LED orange  (CO 10–20 ppm)
+//   GPIO15    — LED red     (CO > 20 ppm) [GPIO26 freed for I2S WS]
+//   GPIO19    — Buzzer
+//
+// ─── VOLTAGE DIVIDERS v2.0 ───────────────────────────────────────────────────
+//   Only 3 remain (all new sensors are 3.3V native):
+//   MQ-7  A0 → 10kΩ + 10kΩ → GPIO36    Vout@5V = 2.5V ✓
+//   MQ-7  A1 → 10kΩ + 10kΩ → GPIO39    Vout@5V = 2.5V ✓ (heater feedback)
+//   GP2Y  Vo → 10kΩ + 10kΩ → GPIO32    Vout@5V = 2.5V ✓
+//
+// ─── BLYNK VIRTUAL PINS ──────────────────────────────────────────────────────
+//   FAST (5s):  V2  CO ppm      V6  CO phase    V7  CO raw
+//               V12 GPS lat     V13 GPS lng      V14 GPS sats
+//               V15 Humidity    V16 Temperature  V17 HDOP
+//               V19 Eng msg     V20 Status flags V21 RSSI dBm
+//               V22 WiFi qual%
+//   SLOW (10s): V1  Sound dB    V3  UVI          V4  Diagnostic
+//               V5  TVOC ppb    V8  Roll         V9  Pitch
+//               V10 Yaw         V11 IMU temp     V18 Dust mg/m³
+//               V23 eCO2 ppm    V24 AQI          V25 Heater V (A1 feedback)
+//
+// ─── ARCHITECTURE ────────────────────────────────────────────────────────────
+//   Core 1 (app_cpu) — Arduino loop(): WiFi, Blynk.run(), BlynkTimer
+//   Core 0 (pro_cpu) — sensorTask:     all sensors, CO state machine
+//   Shared SensorData struct protected by FreeRTOS mutex.
+//   Blynk.connect(timeout) NOT used — avoids IWDT crash on Core 1.
+//
+// ─── v2.1 CHANGES ────────────────────────────────────────────────────────────
+//   • Replaced Adafruit_ENS160 with ScioSense_ENS160 library (correct library
+//     for this sensor module). API calls updated throughout.
+//   • Fixed "ADC: CONFLICT driver_ng" error:
+//     Root cause: analogSetAttenuation() in Arduino core 3.x internally calls
+//     the new adc_oneshot (driver_ng) API. The legacy I2S driver installs its
+//     own ADC handle via the legacy ADC API. Both cannot coexist — firmware
+//     aborts with "CONFLICT! driver_ng is not allowed to be used with the
+//     legacy driver".
+//     Fix: replaced analogSetAttenuation() with analogSetPinAttenuation()
+//     called individually for each ADC pin. Per-pin calls do NOT invoke
+//     driver_ng and are safe alongside the legacy I2S driver.
+//     I2S (initINMP441) is also installed LAST in setup(), after all ADC
+//     pin configuration is complete.
+//
+// ─── v2.2 CHANGES — DEFINITIVE FIX FOR ADC/I2S COLLISION ───────────────────
+//   The v2.1 fix above (per-pin attenuation + install-order) reduced the
+//   frequency of the "ADC: CONFLICT driver_ng is not allowed to be used
+//   with the legacy driver" abort but did not eliminate it, because the
+//   TRUE root cause is not ordering — it is that <driver/i2s.h> (legacy
+//   I2S driver) and analogRead()/analogSetPinAttenuation() (which use the
+//   new driver_ng ADC API on ESP32 Arduino core 3.x) belong to two
+//   different, mutually-exclusive ESP-IDF driver families. Once the
+//   legacy I2S driver is installed, ANY subsequent driver_ng ADC call
+//   (including calls made later inside sensorTask, e.g. every CO/UV/dust
+//   analogRead()) can abort — no init ordering fixes this permanently.
+//
+//   HARMONIZED FIX: migrated the INMP441 microphone driver from the legacy
+//   <driver/i2s.h> API (i2s_driver_install / i2s_set_pin / i2s_read) to the
+//   new standard driver <driver/i2s_std.h> API (i2s_new_channel /
+//   i2s_channel_init_std_mode / i2s_channel_enable / i2s_channel_read).
+//   The new i2s_std driver is part of the same "new driver" family as
+//   driver_ng ADC and never touches the ADC peripheral or its driver
+//   state at all — I2S and ADC are fully independent hardware blocks in
+//   this API family, so no conflict is possible in either init order or
+//   at runtime. This is the same class of fix as replacing legacy ADC
+//   calls with driver_ng equivalents: harmonizing both libraries onto the
+//   same modern driver generation removes the collision at its source
+//   instead of merely avoiding it by sequencing.
+//
+//   All CO/UV/dust ADC logic, EMA smoothing, closed-loop heater control,
+//   GPS/IMU/ENS160/AHT2x logic, Blynk architecture, and pin map are
+//   UNCHANGED from v2.1 — only the internal implementation of
+//   initINMP441() and readINMP441_dB() changed to use the new driver.
+//   The public behaviour (function signatures, return values, dB output
+//   range, SENSOR_UNAVAILABLE sentinel) is identical.
 // ============================================================================
 
-// ─── CREDENTIALS from secrets.h ──────────────────────────────────────────────
-// secrets.h must sit in the same sketch folder. Contents:
-//   #pragma once
-//   #define WIFI_SSID    "yourSSID"
-//   #define WIFI_PASS    "yourPass"
-//   #define BLYNK_AUTH   "yourToken"
-//   #define BLYNK_SERVER "192.168.x.x"
-//   #define BLYNK_PORT   8080
-#include "secrets.h"
+#define BLYNK_HEARTBEAT 60
 
-// ─── BLYNK — local server 0.6.1 ─────────────────────────────────────────────
-// NOTE: BLYNK_TEMPLATE_ID / BLYNK_TEMPLATE_NAME are Blynk Cloud concepts only.
-// They must NOT be defined when connecting to a local server — 0.6.1 does not
-// recognise them and some library versions reject the connection.
+#include "secrets.h"
+// secrets.h: #define WIFI_SSID / WIFI_PASS / BLYNK_AUTH / BLYNK_SERVER / BLYNK_PORT
 #define BLYNK_PRINT Serial
 #include <WiFi.h>
-#include <BlynkSimpleEsp32.h>   // plain TCP — matches local server port 8080
-                                 // Switch to BlynkSimpleEsp32_SSL.h for port 8441
-
+#include <BlynkSimpleEsp32.h>
+#include <esp_mac.h>
 #include <TinyGPS++.h>
-#include <DHT.h>
-#include <Adafruit_SSD1306.h>
 #include <Wire.h>
+// ENS160: use ScioSense_ENS160 library (NOT Adafruit_ENS160 which does not exist)
+// Install: https://github.com/sciosense/ENS160_driver  or via Library Manager
+#include "ScioSense_ENS160.h"
+#include <Adafruit_AHTX0.h>      // AHT20/AHT21 temp+hum — install: Adafruit AHTX0
+#include <Adafruit_SSD1306.h>
+#include <driver/i2s_std.h>      // ESP32 NEW standard I2S driver for INMP441 (v2.2)
+// v2.1 previously used the legacy <driver/i2s.h> here. That header put the
+// firmware at risk of the "ADC: CONFLICT driver_ng" abort because the legacy
+// I2S driver and the driver_ng ADC API used by analogRead() cannot safely
+// coexist. <driver/i2s_std.h> is the new-generation I2S driver family and
+// does not touch the ADC driver at all — see v2.2 CHANGES note above.
+// NOTE: Use legacy <driver/i2s.h> not the new ESP-IDF 5.x i2s_std.h —
+// the legacy driver is what the Arduino ESP32 core 3.x still exposes via
+// the compatibility shim. To avoid the "ADC: CONFLICT driver_ng" abort:
+//   1. Call analogReadResolution() + analogSetPinAttenuation() per pin in setup() FIRST.
+//   2. Do NOT call analogSetAttenuation() (global) — it uses driver_ng internally.
+//   3. Call i2s_driver_install() (initINMP441) LAST in setup(), after all ADC config.
+// ^ Superseded by v2.2: the above three-step workaround is no longer required
+//   now that INMP441 uses <driver/i2s_std.h>, which never touches the ADC.
+//   Kept here for historical context only — the current initINMP441() below
+//   uses the new driver and can be initialised in ANY order relative to ADC.
 
 // ─── FEATURE SWITCHES ────────────────────────────────────────────────────────
-#define DEBUGON           false  // verbose serial output
-#define DISPLAYON         false  // OLED display (shares SCL/GPIO22 with GPS — see note)
-#define WIFI              true   // Blynk / WiFi enabled
-#define COsensorThere     true   // MQ-7 CO sensor board present
-#define IMUsensorThere    true   // JY-901 / WT901 IMU present
+#define DEBUGON        false
+#define DISPLAYON      false
+#define WIFI           true
+#define COsensorThere  true
+#define IMUsensorThere true
+#define ENSsensorThere true    // ENS160 + AHT2x combo board
+#define INMPsensorThere true   // INMP441 I2S microphone
 
-// Set true to enable 10-minute watchdog auto-reset (useful for unattended field use)
 bool ten_mins_autoreset = false;
 
-// ─── VOLTAGE DIVIDER CONFIGURATION ───────────────────────────────────────────
-// Used on all 5V analogue sensor outputs before they reach 3.3V ESP32 ADC pins.
-// Circuit:  Sensor_AO ── R_DIVIDER_SERIES ──┬── ESP32 ADC pin
-//                                            │
-//                                       R_DIVIDER_GND (can be two resistors in series)
-//                                            │
-//                                           GND
-//
-// Current wiring: 10 kΩ series, then 10 kΩ + 10 kΩ = 20 kΩ to GND.
-// Set values in kΩ below. The divider_scale factor is computed once in setup().
-//
-// !! SAFETY WARNING !!
-// With R_DIVIDER_SERIES = 10 kΩ and R_DIVIDER_GND = 20 kΩ:
-//   Vout = Vin × 20/(10+20) = Vin × 0.6667
-//   At Vin = 5.0V → Vout = 3.333V — which is 33mV ABOVE the ESP32 GPIO
-//   absolute maximum of 3.3V. This is a marginal configuration.
-//   In practice sensor outputs rarely hit the full 5V rail in normal
-//   operating conditions, but be aware of the risk.
-//   For a safer margin use 10 kΩ + 15 kΩ (Vout_max = 3.0V).
-const float R_DIVIDER_SERIES = 10.0f;  // kΩ — series resistor (between sensor and ADC pin)
-const float R_DIVIDER_GND    = 20.0f;  // kΩ — ground leg (e.g. two 10kΩ in series)
+#define SENSOR_UNAVAILABLE (-999.0f)
 
-// Computed once in setup() — do not edit these directly.
-float divider_scale  = 1.5f;   // Vin/Vout = (R_series + R_gnd) / R_gnd
-float divider_ratio  = 0.667f; // Vout/Vin = R_gnd / (R_series + R_gnd)
+volatile bool setupDone = false;
 
-// ─── BLYNK VIRTUAL PIN MAP ───────────────────────────────────────────────────
-// V1  = Sound level (V peak-to-peak, at actual sensor)
-// V2  = CO ppm (calculated)
-// V3  = UV index (UVI)
-// V4  = Random diagnostic number
-// V5  = NO2 actual sensor voltage (V)
-// V6  = CO phase (0=measuring 1=heating)
-// V7  = CO raw ADC EMA
-// V8  = IMU Roll  (°)
-// V9  = IMU Pitch (°)
-// V10 = IMU Yaw   (°)
-// V11 = IMU temperature (°C)
-// V12 = GPS Latitude  (decimal degrees)
-// V13 = GPS Longitude (decimal degrees)
-// V14 = GPS Satellites
-// V15 = DHT21 Humidity (%)
-// V16 = DHT21 Temperature (°C)
-// V17 = GPS HDOP
-// V18 = Dust density (mg/m³)
-// V19 = Engineering / diagnostic message (string)
-// V20 = System status bitmask (int)
-//         bit 0 = WiFi OK      bit 1 = GPS fix OK
-//         bit 2 = IMU OK       bit 3 = DHT OK
-//         bit 4 = CO fault     bit 5 = GPS data fault
-//         bit 6 = IMU stuck    bit 7 = DHT fault
+// ─── VOLTAGE DIVIDER  10kΩ + 10kΩ → Vout@5V = 2.5V ─────────────────────────
+const float R_DIVIDER_SERIES = 10.0f;
+const float R_DIVIDER_GND    = 10.0f;
+float divider_scale = 2.0f;
+float divider_ratio = 0.5f;
 
 // ─── OLED ────────────────────────────────────────────────────────────────────
-// OLED I2C SCL = GPIO22. GPS UART1 RX is also remapped to GPIO22.
-// DISPLAYON false (default) → no conflict.
-// If DISPLAYON=true: remap GPS_RX_PIN to a free GPIO (e.g. GPIO13) first.
 #define OLED_RESET -1
 Adafruit_SSD1306 display(128, 64, &Wire, OLED_RESET);
 
-// ─── GPS — UART1 remapped away from flash pins GPIO9/10 ──────────────────────
-#define GPS_RX_PIN    22       // GPS TX → ESP32 GPIO22 (UART1 RX remapped)
-#define GPS_TX_PIN    23       // GPS RX ← ESP32 GPIO23 (UART1 TX remapped)
-#define GPS_BAUD_INIT  9600
-#define GPS_BAUD_FAST  115200
+// ─── GPS — ATGM336H on UART1 GPIO13(RX)/GPIO23(TX) ──────────────────────────
+// ATGM336H outputs standard NMEA0183 at 9600 baud — no UBX init needed.
+// GPIO13 chosen to free GPIO22 for I2C SCL (ENS160+AHT2x).
+#define GPS_RX_PIN    13
+#define GPS_TX_PIN    23
+#define GPS_BAUD      9600
 HardwareSerial gps_serial(1);
 TinyGPSPlus    gps;
 
-// ─── GPS DIGITAL OUTPUT SAFETY NOTE ─────────────────────────────────────────
-// The u-blox GPS module (NEO-6M/7M/8M) UART TX operates at 3.3V logic.
-// It is SAFE to connect directly to ESP32 GPIO without a level shifter.
-// Most breakout modules include an onboard 3.3V LDO regulator — supply
-// the module from the ESP32 3V3 pin to ensure correct logic levels.
-
-// Corrected UBLOX_INIT — all checksums verified, 5 Hz, GGA explicitly enabled,
-// stray POLL byte removed, inter-message delay added in initGPS():
-//   GLL off · GSV off · VTG off · GSA off · RMC off
-//   GGA ON (rate=1) · CFG-RATE 200ms=5Hz · CFG-PRT baud=115200
-const unsigned char UBLOX_INIT[] = {
-  0xB5,0x62,0x06,0x01,0x08,0x00,0xF0,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x06,0x2A, // GLL off
-  0xB5,0x62,0x06,0x01,0x08,0x00,0xF0,0x03,0x01,0x01,0x01,0x01,0x01,0x01,0x08,0x3E, // GSV off
-  0xB5,0x62,0x06,0x01,0x08,0x00,0xF0,0x05,0x01,0x01,0x01,0x01,0x01,0x01,0x0A,0x52, // VTG off
-  0xB5,0x62,0x06,0x01,0x08,0x00,0xF0,0x02,0x01,0x01,0x01,0x01,0x01,0x01,0x07,0x34, // GSA off
-  0xB5,0x62,0x06,0x01,0x08,0x00,0xF0,0x04,0x01,0x01,0x01,0x01,0x01,0x01,0x09,0x48, // RMC off
-  0xB5,0x62,0x06,0x01,0x08,0x00,0xF0,0x00,0x01,0x01,0x01,0x01,0x01,0x01,0x05,0x22, // GGA ON
-  0xB5,0x62,0x06,0x08,0x06,0x00,0xC8,0x00,0x01,0x00,0x01,0x00,0xDE,0x6A,           // 5 Hz
-  0xB5,0x62,0x06,0x00,0x14,0x00,0x01,0x00,0x00,0x00,0xD0,0x08,0x00,0x00,           // baud 115200
-  0x00,0xC2,0x01,0x00,0x07,0x00,0x07,0x00,0x00,0x00,0x00,0x00,0xC4,0x96,
-};
-
-// ─── IMU — UART2 GPIO16 (RX) / GPIO17 (TX) ──────────────────────────────────
-// ─── IMU DIGITAL OUTPUT SAFETY NOTE ─────────────────────────────────────────
-// The JY-901/WT901 UART TX level matches its supply voltage.
-// POWER THE IMU FROM THE ESP32 3V3 PIN — this makes TX = 3.3V logic,
-// safe for direct connection to ESP32 UART2 RX (GPIO16).
-// If powered at 5V, the 5V UART TX would damage the ESP32 GPIO.
-#define IMU_RX_PIN  16
-#define IMU_TX_PIN  17
+// ─── IMU — JY-901 UART2 GPIO16(RX)/GPIO17(TX) ───────────────────────────────
+#define IMU_RX_PIN 16
+#define IMU_TX_PIN 17
 HardwareSerial imu_serial(2);
 
-// ─── DHT ─────────────────────────────────────────────────────────────────────
-// GPIO5 is a strapping pin (must be HIGH at boot). DHT idle line is HIGH → safe.
-//
-// ─── DHT21 DIGITAL OUTPUT SAFETY NOTE ───────────────────────────────────────
-// The DHT21 uses a single open-drain data line pulled up to Vcc.
-// POWER THE DHT21 FROM THE ESP32 3V3 PIN — the data line will then idle
-// at 3.3V, safe for direct connection to GPIO5.
-// If the DHT21 is powered at 5V, the data line idles at 5V and WILL
-// damage the ESP32 GPIO. No level shifter is needed when using 3.3V supply.
-// The 4.7 kΩ pull-up resistor must connect to 3.3V, not 5V.
-#define DHTPIN  5
-#define DHTTYPE DHT21
-DHT dht(DHTPIN, DHTTYPE);
+// ─── ENS160 + AHT2x — I2C GPIO21(SDA)/GPIO22(SCL) ──────────────────────────
+// ScioSense_ENS160 API:
+//   ens160.begin()           — init, returns void
+//   ens160.available()       — returns bool (true if responding)
+//   ens160.setMode(ENS160_OPMODE_STD) — set standard operating mode
+//   ens160.set_envdata(tempC_int, hum_int) — compensation (int values)
+//   ens160.measure(true)     — trigger measurement
+//   ens160.measureRaw(true)  — trigger raw measurement
+//   ens160.getAQI()          — uint8_t  1–5 index
+//   ens160.getTVOC()         — uint16_t ppb
+//   ens160.geteCO2()         — uint16_t ppm equivalent CO2
+ScioSense_ENS160 ens160(ENS160_I2CADDR_1);  // 0x53 (ADD pin → VCC on this board)
+Adafruit_AHTX0   aht;
 
-// ─── ANALOG PINS (ADC1 only — ADC2 unusable while WiFi is active) ────────────
-// 5V sensor signals pass through the voltage divider defined above
-// before reaching the ESP32 ADC pins. See divider_scale / divider_ratio.
-//
-// ML8511 UV sensor is 3.3V ratiometric — no divider needed.
-// Sharp GP2Y1010 IR LED control pin (GPIO18) is a digital output from the
-// ESP32 at 3.3V — safe to connect directly to the sensor's ILED input.
-//
-// Mega A0/A1 (CO node)  → GPIO36 VP  ADC1_CH0  [input-only, 5V divider]
-// Mega A2    (UV OUT)   → GPIO39 VN  ADC1_CH3  [input-only, direct 3.3V]
-// Mega A3    (UV REF)   → GPIO34     ADC1_CH6  [input-only, direct 3.3V]
-// Mega A4    (Dust AO)  → GPIO35     ADC1_CH7  [input-only, 5V divider]
-// Mega A5    (Mic AO)   → GPIO32     ADC1_CH4  [5V divider if module is 5V]
-// Mega A7    (NO2 AO)   → GPIO33     ADC1_CH5  [5V divider]
-#define CO_ADC_PIN      36
-#define UVOUT           39
-#define REF_3V3         34
-#define dustPin         35
-#define micPin          32
-#define NO2_SENSOR_PIN  33
+// ─── INMP441 I2S microphone ──────────────────────────────────────────────────
+#define I2S_PORT        I2S_NUM_0
+#define I2S_SCK_PIN     25   // BCLK
+#define I2S_WS_PIN      26   // LRCLK  [ADC2 output only — no WiFi ADC conflict]
+#define I2S_SD_PIN      33   // SD data in [freed from NO2 analogue]
+#define I2S_SAMPLE_RATE 16000
+#define I2S_BUF_SAMPLES 256
+// v2.2: RX channel handle for the new i2s_std driver. Replaces the old
+// legacy-driver pattern of addressing the peripheral by I2S_PORT number
+// alone — the new driver family uses an explicit channel handle instead.
+i2s_chan_handle_t inmp441_rx_handle = NULL;
+
+// ─── ANALOG PINS (ADC1 only) ─────────────────────────────────────────────────
+// All 5V sensor outputs require 10kΩ + 10kΩ voltage divider before ESP32 ADC.
+// ML8511 UV is 3.3V ratiometric — direct connection, no divider.
+#define CO_ADC_PIN    36    // VP ADC1_CH0 input-only — MQ-7 A0 (CO sense, via divider)
+#define CO_A1_PIN     39    // VN ADC1_CH3 input-only — MQ-7 A1 (heater feedback, via divider)
+#define UV_OUT_PIN    34    //    ADC1_CH6 input-only — ML8511 OUT (direct 3.3V)
+#define UV_REF_PIN    35    //    ADC1_CH7 input-only — ML8511 REF (direct 3.3V)
+#define DUST_ADC_PIN  32    //    ADC1_CH4 — GP2Y1010 Vo (via 10k+10k divider)
 
 // ─── DIGITAL PINS ────────────────────────────────────────────────────────────
-// Mega D10 → GPIO14  LED green  (no boot constraint)
-// Mega D11 → GPIO27  LED orange (ADC2, output-only — no WiFi conflict)
-// Mega D12 → GPIO26  LED red    (ADC2, output-only — no WiFi conflict)
-// Mega D7  → GPIO19  Buzzer
-// Mega D9  → GPIO4   CO heater PWM via LEDC (avoids all strapping pins)
-// Mega D53 → GPIO18  Sharp GP2Y1010 dust IR LED (active LOW, 3.3V safe direct)
-#define ledPin11   14   // GREEN  — CO ≤ 10 ppm
-#define ledPin12   27   // ORANGE — CO 10–20 ppm
-#define ledPin13   26   // RED    — CO > 20 ppm
-#define buzzPin    19   // Passive buzzer
-#define dustLED    18   // Dust sensor IR LED, active LOW
-#define CO_PWM_PIN  4   // CO heater PWM output (LEDC)
+#define ledPin11   14    // GREEN  CO ≤ 10 ppm
+#define ledPin12   27    // ORANGE CO 10–20 ppm  (ADC2, output only — no WiFi conflict)
+#define ledPin13   15    // RED    CO > 20 ppm   (GPIO26 freed for I2S WS)
+#define buzzPin    19    // Passive buzzer
+#define dustLED    18    // Sharp GP2Y1010 IR LED (active LOW)
+#define CO_PWM_PIN  4    // CO heater D2 PWM (direct to NPN base via 1kΩ on board)
 
-// ─── LEDC (replaces Mega Timer2 hardware registers) ──────────────────────────
-#define LEDC_CHAN_CO   0
-#define LEDC_CHAN_BUZ  1
-#define LEDC_FREQ_CO   5000
-#define LEDC_RES_CO    8     // 8-bit duty: 0–255
+// ─── LEDC ────────────────────────────────────────────────────────────────────
+#define LEDC_FREQ_CO 5000
+#define LEDC_RES_CO  8
 
-// ─── WATCHDOG / HEALTH TIMEOUTS ──────────────────────────────────────────────
-#define GPS_TIMEOUT_MS    15000  // GPS fix considered stale after 15 s
-#define IMU_TIMEOUT_MS     5000  // IMU frame gap > 5 s → stuck
-#define DHT_MAX_FAILS         5  // consecutive DHT read failures → fault flag
-#define CO_PHASE_MAX_MS  180000  // CO phase stuck > 3 min → force transition
-#define WIFI_RECONNECT_MS 30000  // retry WiFi every 30 s when dropped
-#define ENG_MSG_INTERVAL  10000  // engineering message Blynk flush interval
-#define BLYNK_SEND_MS      5000  // sensor data send cadence
+// ─── TIMEOUTS & INTERVALS ────────────────────────────────────────────────────
+#define GPS_TIMEOUT_MS        15000
+#define IMU_TIMEOUT_MS         5000
+#define ENS_MAX_FAILS             5
+#define ENS_RETRY_MS          10000
+#define CO_PHASE_MAX_MS      180000
+#define WIFI_RECONNECT_MS     30000
+#define ENG_MSG_INTERVAL      15000
+#define BLYNK_SEND_FAST_MS     5000
+#define BLYNK_SEND_SLOW_MS    10000
+#define SENSOR_TASK_PERIOD_MS     25
+#define GPS_FEED_MS               50
+#define IMU_POLL_MS               50
+#define BUZZER_GPS_INTERVAL     5000
+#define VWRITE_GAP_MS            10
 
-// ─── SYSTEM STATUS BITMASK ───────────────────────────────────────────────────
+// ─── CO CLOSED-LOOP HEATER TARGETS ───────────────────────────────────────────
+// A1 feedback divider scales 5V→2.5V at ADC. We target the ADC-side voltage.
+// Physical heater voltages: heat=5.0V, measure=1.4V
+// At ADC after 10k+10k divider: heat=2.5V, measure=0.7V
+#define CO_HEAT_TARGET_V   2.50f   // ADC target during heating phase (=5V at sensor)
+#define CO_MEAS_TARGET_V   0.70f   // ADC target during measurement phase (=1.4V at sensor)
+#define CO_CLOSED_LOOP_TOL 0.05f   // ±tolerance in V at ADC before adjusting duty
+
+// ─── STATUS FLAGS ────────────────────────────────────────────────────────────
 #define STATUS_WIFI_OK   (1<<0)
 #define STATUS_GPS_OK    (1<<1)
 #define STATUS_IMU_OK    (1<<2)
-#define STATUS_DHT_OK    (1<<3)
+#define STATUS_ENS_OK    (1<<3)    // was DHT_OK, now ENS160+AHT2x
 #define STATUS_CO_FAULT  (1<<4)
 #define STATUS_GPS_FAULT (1<<5)
 #define STATUS_IMU_STUCK (1<<6)
-#define STATUS_DHT_FAULT (1<<7)
-
-// ─── TIMING ──────────────────────────────────────────────────────────────────
-#define SLEEP_TIME 25          // sensor loop minimum cadence (ms)
-const int sampleSoundWindow = 50;
+#define STATUS_ENS_FAULT (1<<7)    // was DHT_FAULT
+#define STATUS_CO_NO_SNS (1<<8)
 
 // ─── CO CALIBRATION ──────────────────────────────────────────────────────────
-// !! IMPORTANT: sensor_reading_clean_air is the raw 12-bit ADC value seen at
-//    GPIO36 — i.e. the DIVIDED voltage, NOT the actual sensor node voltage.
-//    The divider scale is applied internally in raw_value_to_CO_ppm(). !!
-//
-// To calibrate: power station outdoors in fresh air, wait for the first full
-// 90 s measurement phase, then read the raw ADC value from Serial debug output
-// and set it here.
-float reference_resistor_kOhm   = 9.98;
-float sensor_reading_clean_air  = 600.65; // raw 12-bit ADC at GPIO36 in clean air — CALIBRATE
-float sensor_reading_100_ppm_CO = -1;     // optional: raw ADC at GPIO36 at known 100 ppm CO
+// sensor_reading_clean_air: raw 12-bit ADC at GPIO36 (after divider) in fresh air
+float reference_resistor_kOhm   = 9.98f;
+float sensor_reading_clean_air  = 600.65f;
+float sensor_reading_100_ppm_CO = -1.0f;
 
 // ─── SHARED DATA STRUCT ──────────────────────────────────────────────────────
-// Written exclusively by sensorTask (Core 1).
-// Read exclusively by blynkTask (Core 0) after taking dataMutex.
 struct SensorData {
-  float    co_ppm;
-  float    co_raw;          // raw ADC EMA at GPIO36 (after divider)
+  float    co_ppm, co_raw, co_heater_v; // heater_v = actual A1 voltage (×divider_scale)
   byte     co_phase;
-  bool     co_fault;
-  float    no2_raw;         // raw ADC at GPIO33 (after divider)
-  float    no2_voltage;     // actual sensor voltage (divider corrected)
+  bool     co_fault, co_no_sensor;
+  float    tvoc_ppb, eco2_ppm, aqi;     // ENS160
   float    uvi;
-  float    sound_v;         // actual peak-to-peak voltage at sensor (corrected if 5V mic)
-  float    dust_mg;         // dust density mg/m³ (divider-corrected Vo)
-  float    temp;
-  float    hum;
-  bool     dht_fault;
-  float    angle[3];
-  float    imu_temp;
+  float    sound_db;                    // INMP441 dB SPL estimate
+  float    dust_mg;
+  float    temp, hum;                   // AHT2x
+  bool     ens_fault;
+  float    angle[3], imu_temp;
   bool     imu_ok;
-  double   lat;
-  double   lng;
-  float    hdop;
-  float    sats;
+  double   lat, lng;
+  float    hdop, sats;
   bool     gps_fix;
+  int32_t  rssi;
+  uint8_t  wifi_qual;
   uint32_t status_flags;
   char     eng_msg[128];
   int      rand_num;
@@ -271,82 +306,76 @@ struct SensorData {
 SensorData        sd;
 SemaphoreHandle_t dataMutex;
 
-// ─── CO STATE MACHINE ────────────────────────────────────────────────────────
-float opt_voltage              = 0;
-byte  opt_width                = 240;
-byte  co_phase                 = 0;
-unsigned long co_phase_start   = 0;
-float sens_val                 = 0;
-float sens_val_last            = 0;
-float last_CO_ppm              = 0;
-float sensor_base_resistance_kOhm;
-float sensor_100ppm_CO_resistance_kOhm;
+// ─── CO STATE ────────────────────────────────────────────────────────────────
+byte          co_phase          = 0;    // 0=measure, 1=heat
+unsigned long co_phase_start    = 0;
+float         sens_val          = 0;   // EMA of CO_ADC_PIN
+float         sens_val_last     = 0;
+float         last_CO_ppm       = 0;
+byte          co_duty           = 255; // closed-loop duty output
+float         sensor_base_resistance_kOhm;
+float         sensor_100ppm_CO_resistance_kOhm;
 
 // ─── IMU ─────────────────────────────────────────────────────────────────────
-unsigned char  Re_buf[12];
-unsigned char  imu_sign    = 0;
-int            imu_counter = 0;
-unsigned long  lastIMUframe = 0;
-float          angle[3]    = {0, 0, 0};
-float          imuT        = 0;
-const float    tempComp    = -7.2;
+unsigned char Re_buf[12];
+int           imu_counter  = 0;
+unsigned long lastIMUframe = 0;
+float         angle[3]     = {0,0,0};
+float         imuT         = 0;
+const float   tempComp     = -7.2f;
 
-// ─── FAULT / TIMING STATE ────────────────────────────────────────────────────
-int           dht_fail_count = 0;
-unsigned long lastGPSdata    = 0;
-unsigned long lastWiFiCheck  = 0;
-long          countNum       = 0;
-int           counterNum     = 0;
-int           countReset     = 0;
+// ─── ENS160 / AHT2x state ────────────────────────────────────────────────────
+int           ens_fail_count = 0;
+unsigned long lastENSattempt = 0;
+bool          ensReady       = false;  // true after first successful init
+float         hum_prev = 20.0f, temp_prev = 20.0f;
 
-// ─── GPS MISC ────────────────────────────────────────────────────────────────
-float hum_prev = 0, temp_prev = 0;
-bool  prevZeroVal = false;
-char  LatGPS[12], LongGPS[12];
-char  LatGPS_Prev[12], LongGPS_Prev[12];
-float SatGPS = 0, HDOP = 0;
-String pin11state = "", pin12state = "", pin13state = "";
+// ─── MISC STATE ──────────────────────────────────────────────────────────────
+unsigned long lastGPSdata   = 0;
+unsigned long lastGPSbeep   = 0;
+unsigned long lastWiFiCheck = 0;
+long          countReset    = 0;
+bool          prevZeroVal   = false;
+float         SatGPS = 0, HDOP = 0;
 
-// ─── BLYNK TIMER ─────────────────────────────────────────────────────────────
 BlynkTimer blynkTimer;
 
 // ============================================================================
-// HELPER FUNCTIONS
+// HELPERS
 // ============================================================================
 
-// 9-sample ADC average — small gaps improve ESP32 ADC linearity
-int averageAnalogRead(int pinToRead)
+int averageAnalogRead(int pin)
 {
-  const byte N = 9;
   unsigned long sum = 0;
-  for (byte i = 0; i < N; i++) {
-    sum += analogRead(pinToRead);
-    delayMicroseconds(100);
-  }
-  return (int)(sum / N);
+  for (byte i = 0; i < 9; i++) { sum += analogRead(pin); delayMicroseconds(100); }
+  return (int)(sum / 9);
 }
 
-float mapfloat(float x, float in_min, float in_max, float out_min, float out_max)
+float adcToSensorVoltage(int counts)
 {
-  if (in_max == in_min) return out_min;
-  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+  // Convert post-divider ADC counts to actual sensor voltage (multiplied by divider_scale)
+  return counts * (3.3f / 4095.0f) * divider_scale;
 }
 
-// Convert raw 12-bit ADC reading (after divider) to actual sensor voltage.
-// Applies the divider_scale factor computed from R_DIVIDER_SERIES / R_DIVIDER_GND.
-//   actual_V = adc_counts × (3.3V / 4095) × divider_scale
-float adcToSensorVoltage(int adcCounts)
+// Convert raw ADC counts to actual voltage AT the ADC pin (no scale, just V)
+float adcToVolts(int counts)
 {
-  return (float)adcCounts * (3.3f / 4095.0f) * divider_scale;
+  return counts * (3.3f / 4095.0f);
 }
 
-// Engineering message — mutex-safe, writes to Serial and shared struct
+uint8_t rssiToQuality(int32_t rssi)
+{
+  if (rssi >= -50)  return 100;
+  if (rssi <= -100) return 0;
+  return (uint8_t)(2 * (rssi + 100));
+}
+
 void engMsg(const char* msg)
 {
   Serial.print("[ENG] "); Serial.println(msg);
   if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-    strncpy(sd.eng_msg, msg, sizeof(sd.eng_msg) - 1);
-    sd.eng_msg[sizeof(sd.eng_msg) - 1] = '\0';
+    strncpy(sd.eng_msg, msg, sizeof(sd.eng_msg)-1);
+    sd.eng_msg[sizeof(sd.eng_msg)-1] = '\0';
     xSemaphoreGive(dataMutex);
   }
 }
@@ -354,253 +383,319 @@ void engMsg(const char* msg)
 void engMsgf(const char* fmt, ...)
 {
   char buf[128];
-  va_list args;
-  va_start(args, fmt);
+  va_list args; va_start(args, fmt);
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
   engMsg(buf);
 }
 
-// Buzzer — LEDC channel 1, separate from CO PWM channel 0
 void buzzerTone(uint16_t frequency, uint16_t durationMs)
 {
-  if (frequency == 0) return;
-  ledcSetup(LEDC_CHAN_BUZ, frequency, 8);
-  ledcAttachPin(buzzPin, LEDC_CHAN_BUZ);
-  ledcWrite(LEDC_CHAN_BUZ, 128);
-  delay(durationMs);
-  ledcWrite(LEDC_CHAN_BUZ, 0);
-  ledcDetachPin(buzzPin);
+  if (!frequency) return;
+  ledcAttach(buzzPin, frequency, 8);
+  ledcWrite(buzzPin, 128);
+  vTaskDelay(pdMS_TO_TICKS(durationMs));
+  ledcWrite(buzzPin, 0);
+  ledcDetach(buzzPin);
 }
 
+void safeWrite(int vpin, float val)        { Blynk.virtualWrite(vpin, val); delay(VWRITE_GAP_MS); }
+void safeWriteI(int vpin, int val)         { Blynk.virtualWrite(vpin, val); delay(VWRITE_GAP_MS); }
+void safeWriteS(int vpin, const char* val) { Blynk.virtualWrite(vpin, val); delay(VWRITE_GAP_MS); }
+
 // ============================================================================
-// GPS
+// GPS — ATGM336H (NMEA only, no UBX init)
 // ============================================================================
 
 void initGPS()
 {
-  gps_serial.begin(GPS_BAUD_INIT, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-  delay(200);
-  // Send UBX messages one at a time with a 15 ms gap — u-blox needs ~10 ms
-  // per CFG command. Sending back-to-back can cause the baud-switch to be lost.
-  int i = 0;
-  while (i < (int)sizeof(UBLOX_INIT)) {
-    if (UBLOX_INIT[i] == 0xB5 && i + 5 < (int)sizeof(UBLOX_INIT)) {
-      int paylen = UBLOX_INIT[i + 4] | (UBLOX_INIT[i + 5] << 8);
-      int msglen = 6 + paylen + 2;
-      gps_serial.write(&UBLOX_INIT[i], msglen);
-      gps_serial.flush();
-      delay(15);
-      i += msglen;
-    } else {
-      i++;
-    }
-  }
-  delay(200);
-  gps_serial.end();
+  // ATGM336H speaks standard NMEA0183 at 9600 baud out of the box.
+  // No proprietary init sequence needed — TinyGPS++ decodes NMEA directly.
+  gps_serial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   delay(100);
-  gps_serial.begin(GPS_BAUD_FAST, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-  engMsg("GPS: UBX config sent, running at 115200 baud 5Hz GGA-only");
+  engMsg("GPS: ATGM336H NMEA 9600 baud — no init needed");
 }
 
-int feedGPS(unsigned long maxMs)
+void feedGPS()
 {
-  int fed = 0;
   unsigned long t = millis();
-  while (millis() - t < maxMs) {
-    while (gps_serial.available()) {
-      gps.encode(gps_serial.read());
-      fed++;
-    }
-    if (fed > 0 && !gps_serial.available()) break;
-    delay(1);
+  while (millis() - t < GPS_FEED_MS) {
+    while (gps_serial.available()) gps.encode(gps_serial.read());
+    taskYIELD();
   }
-  return fed;
 }
 
 // ============================================================================
-// CO SENSOR (MQ-7) — PWM calibration and state machine
+// ENS160 + AHT2x (I2C) — ScioSense_ENS160 library
 // ============================================================================
 
-void setHeatDuty(byte duty) { ledcWrite(LEDC_CHAN_CO, duty); }
+bool initENS()
+{
+  // ScioSense API: ens160.begin() returns void; check ens160.available() after.
+  ens160.begin();
+  if (!ens160.available()) {
+    engMsg("ENS160: not available (addr 0x53) — check wiring");
+    return false;
+  }
+  // Set standard operating mode (continuous measurement)
+  if (!ens160.setMode(ENS160_OPMODE_STD)) {
+    engMsg("ENS160: setMode failed");
+    return false;
+  }
+  // AHT2x init
+  if (!aht.begin()) {
+    engMsg("AHT2x: init failed — check wiring");
+    return false;
+  }
+  engMsg("ENS160+AHT2x: OK");
+  return true;
+}
+
+// Read ENS160 + AHT2x. Returns true if valid data obtained.
+// ENS160 needs temperature+humidity compensation for accuracy — we feed it
+// from AHT2x which shares the same I2C bus on the same board.
+// ScioSense API uses integer temp (°C) and humidity (%) for set_envdata().
+bool readENS(float& tvoc, float& eco2, float& aqi_out, float& temp_out, float& hum_out)
+{
+  // Read AHT2x first — provides compensation values for ENS160
+  sensors_event_t humEvent, tempEvent;
+  if (!aht.getEvent(&humEvent, &tempEvent)) return false;
+  temp_out = tempEvent.temperature;
+  hum_out  = humEvent.relative_humidity;
+
+  // Provide integer temp/humidity compensation to ENS160 for improved accuracy
+  // ScioSense set_envdata() takes int (°C) and int (%) — cast from float
+  ens160.set_envdata((int)temp_out, (int)hum_out);
+
+  // Trigger measurement
+  ens160.measure(true);
+  ens160.measureRaw(true);
+
+  // Read results — always available after measure()
+  tvoc    = (float)ens160.getTVOC();   // ppb
+  eco2    = (float)ens160.geteCO2();   // ppm equivalent CO2
+  aqi_out = (float)ens160.getAQI();    // 1–5 index
+
+  return true;
+}
+
+// ============================================================================
+// INMP441 I2S microphone — legacy driver/i2s.h
+// IMPORTANT: ADC must be fully configured (analogReadResolution +
+// analogSetAttenuation) in setup() BEFORE i2s_driver_install() is called.
+// Calling ADC config AFTER I2S install triggers:
+//   E (321) ADC: CONFLICT! driver_ng is not allowed to be used with the legacy driver
+//
+// v2.2 UPDATE: the above ordering requirement applied to the legacy
+// <driver/i2s.h> API and is now HISTORICAL — initINMP441() below has been
+// migrated to the new <driver/i2s_std.h> driver, which does not use or
+// conflict with the ADC driver at all. The functions can now be called in
+// any order relative to ADC setup. The old comment is kept for context.
+// ============================================================================
+
+bool initINMP441()
+{
+  // v2.2: new i2s_std driver — replaces legacy i2s_driver_install/i2s_set_pin.
+  // Step 1: allocate an RX channel on I2S_PORT (I2S_NUM_0).
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG((i2s_port_t)I2S_PORT, I2S_ROLE_MASTER);
+  chan_cfg.dma_desc_num  = 4;              // was dma_buf_count = 4 in legacy config
+  chan_cfg.dma_frame_num = I2S_BUF_SAMPLES; // was dma_buf_len = I2S_BUF_SAMPLES in legacy config
+  if (i2s_new_channel(&chan_cfg, NULL, &inmp441_rx_handle) != ESP_OK) {
+    engMsg("INMP441: new_channel failed");
+    return false;
+  }
+
+  // Step 2: configure standard I2S mode — sample rate, slot width, and pins.
+  // channel_format = I2S_CHANNEL_FMT_ONLY_LEFT (legacy) becomes slot_mask =
+  // I2S_STD_SLOT_LEFT (new) — L/R pin tied to GND still selects left channel.
+  i2s_std_config_t std_cfg = {
+    .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE),
+    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+    .gpio_cfg = {
+      .mclk = I2S_GPIO_UNUSED,
+      .bclk = (gpio_num_t)I2S_SCK_PIN,
+      .ws   = (gpio_num_t)I2S_WS_PIN,
+      .dout = I2S_GPIO_UNUSED,
+      .din  = (gpio_num_t)I2S_SD_PIN,
+      .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false }
+    }
+  };
+  std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;  // L/R tied to GND = left channel
+
+  if (i2s_channel_init_std_mode(inmp441_rx_handle, &std_cfg) != ESP_OK) {
+    engMsg("INMP441: init_std_mode failed");
+    return false;
+  }
+
+  // Step 3: enable the channel — equivalent to the old driver being ready
+  // for i2s_read() calls immediately after i2s_driver_install()+i2s_set_pin().
+  if (i2s_channel_enable(inmp441_rx_handle) != ESP_OK) {
+    engMsg("INMP441: channel_enable failed");
+    return false;
+  }
+
+  engMsg("INMP441: I2S mic OK (new i2s_std driver, no ADC conflict)");
+  return true;
+}
+
+// Read one buffer from INMP441, return RMS level converted to approximate dBFS.
+// INMP441 is 24-bit left-justified in 32-bit slot — shift right 8 to get 24-bit signed.
+float readINMP441_dB()
+{
+  int32_t samples[I2S_BUF_SAMPLES];
+  size_t  bytes_read = 0;
+  // v2.2: i2s_channel_read() replaces legacy i2s_read(I2S_PORT, ...).
+  // Same blocking-with-timeout semantics as the legacy call.
+  i2s_channel_read(inmp441_rx_handle, &samples, sizeof(samples), &bytes_read, pdMS_TO_TICKS(50));
+  int count = bytes_read / sizeof(int32_t);
+  if (count == 0) return SENSOR_UNAVAILABLE;
+
+  double sum_sq = 0;
+  for (int i = 0; i < count; i++) {
+    int32_t s = samples[i] >> 8;   // 32-bit slot → 24-bit signed value
+    sum_sq += (double)s * (double)s;
+  }
+  double rms = sqrt(sum_sq / count);
+  if (rms < 1.0) return SENSOR_UNAVAILABLE;
+  // dBFS relative to full-scale 24-bit (2^23 = 8388608)
+  float db = 20.0f * log10f((float)(rms / 8388608.0));
+  return db;   // typically -60 to 0 dBFS
+}
+
+// ============================================================================
+// CO SENSOR — CLOSED LOOP heater control using A1 feedback
+// ============================================================================
+
+void setHeatDuty(byte duty)
+{
+  co_duty = duty;
+  ledcWrite(CO_PWM_PIN, duty);
+}
 
 void startMeasurementPhase()
 {
-  co_phase       = 0;
-  co_phase_start = millis();
-  setHeatDuty(opt_width);
-  engMsgf("CO: measurement phase (duty=%d, ~1.4V at sensor)", opt_width);
+  co_phase = 0; co_phase_start = millis();
+  // Start at initial duty guess for 1.4V; closed loop in tickCO() will refine
+  setHeatDuty(64);  // ~25% duty ≈ reasonable starting point for 1.4V target
+  engMsg("CO: measure phase — closed-loop targeting 1.4V heater");
 }
 
 void startHeatingPhase()
 {
-  co_phase       = 1;
-  co_phase_start = millis();
-  setHeatDuty(255);
-  engMsg("CO: heating phase (duty=255, ~5V at sensor)");
+  co_phase = 1; co_phase_start = millis();
+  setHeatDuty(255);  // Full duty = full 5V heater
+  engMsg("CO: heat phase (duty=255 → 5V heater)");
 }
 
-// Sweep LEDC duty 0→249 and find the width that produces ~1.4V at the MQ-7
-// sense node. Because the sense node is read through the voltage divider,
-// the ADC pin will see:
-//   Vout_adc = 1.4V × divider_ratio  (= 1.4 × R_gnd / (R_series + R_gnd))
-// This target is computed from the user-configured divider values so it
-// remains correct regardless of which resistors are fitted.
-bool pwm_adjust()
+bool coSensorPresent()
 {
-  const float target_sensor_V = 1.4f;                        // desired voltage AT the MQ-7 node
-  const float target_adc_V    = target_sensor_V * divider_ratio; // what the ADC pin will see
-  const float raw2v           = 3.3f / 4095.0f;
-  float prev_v = 3.3f;
-  opt_width = 240; // safe fallback
-
-  engMsgf("CO-CAL: target %.3fV at sensor → %.3fV at ADC (divider=%.4f)",
-          target_sensor_V, target_adc_V, divider_ratio);
-
-  for (int w = 0; w < 250; w++) {
-    setHeatDuty((byte)w);
-    delay(50);
-    float avg = 0;
-    for (int x = 0; x < 20; x++) { avg += analogRead(CO_ADC_PIN); delay(2); }
-    avg /= 20.0f;
-    float v = avg * raw2v;   // voltage at ADC pin (after divider)
-    if (DEBUGON) Serial.printf("CO-CAL w=%d Vadc=%.3f Vsensor=%.3f\n",
-                               w, v, v * divider_scale);
-    if (v < target_adc_V && prev_v >= target_adc_V) {
-      float dn = target_adc_V - v, dp = prev_v - target_adc_V;
-      opt_width   = (dn < dp) ? (byte)w : (byte)(w > 0 ? w - 1 : 0);
-      opt_voltage = ((dn < dp) ? v : prev_v) * divider_scale; // report actual sensor V
-      engMsgf("CO-CAL OK: duty=%d sensor_V=%.3fV adc_V=%.3fV",
-              opt_width, opt_voltage, opt_voltage * divider_ratio);
-      return true;
-    }
-    prev_v = v;
-  }
-  engMsg("CO-CAL WARN: 1.4V target not found in sweep, using duty=240");
-  return false;
+  // GPIO36 (VP) floats near 0 when nothing is connected.
+  // With MQ-7 divider circuit, it reads well above noise floor.
+  long sum = 0;
+  for (int i = 0; i < 20; i++) { sum += analogRead(CO_ADC_PIN); delay(5); }
+  return ((sum / 20) > 50);
 }
 
-// Convert EMA-smoothed raw ADC reading (as seen at GPIO36, after divider) to CO ppm.
-// The reading must be scaled back to the actual sensor node voltage before
-// computing the MQ-7 resistance, because reference_resistor_kOhm is measured
-// in the physical circuit at the sensor node — not at the ADC pin.
-float raw_value_to_CO_ppm(float adc_ema)
+float raw_to_CO_ppm(float adc_ema)
 {
-  if (adc_ema < 1.0f) return -1.0f;
-
-  // Scale ADC reading back to what it would be at the actual sensor node voltage.
-  // The divider attenuates the sensor voltage:
-  //   V_adc = V_sensor × divider_ratio
-  // so: V_sensor / V_adc = divider_scale = (R_series + R_gnd) / R_gnd
-  // We re-scale the ADC count proportionally:
-  //   adc_sensor_equivalent = adc_ema × divider_scale
-  //   (this equals the ADC count we'd get if we sampled at the sensor node directly)
-  float adc_sensor_equiv = adc_ema * divider_scale;
-
-  // Guard: clamp to 12-bit range after scaling
-  if (adc_sensor_equiv > 4095.0f) adc_sensor_equiv = 4095.0f;
-
-  // MQ-7 resistance from voltage-divider bridge formula (unchanged from original):
-  //   R_sensor = R_ref × (ADC_max / ADC_reading) − R_ref
+  if (adc_ema < 1.0f) return SENSOR_UNAVAILABLE;
+  float adc_eq   = constrain(adc_ema * divider_scale, 1.0f, 4095.0f);
+  float clean_eq = constrain(sensor_reading_clean_air * divider_scale, 1.0f, 4095.0f);
   sensor_base_resistance_kOhm =
-    reference_resistor_kOhm * 4095.0f / sensor_reading_clean_air - reference_resistor_kOhm;
-
-  // Note: sensor_reading_clean_air is stored as the raw ADC value AT GPIO36 (divided).
-  // When used in the formula above it must also be scaled so both sides of the
-  // equation are in the same "space" (sensor-node equivalent counts).
-  // We pre-scale it here consistently:
-  float clean_equiv = sensor_reading_clean_air * divider_scale;
-  if (clean_equiv > 4095.0f) clean_equiv = 4095.0f;
-  sensor_base_resistance_kOhm =
-    reference_resistor_kOhm * 4095.0f / clean_equiv - reference_resistor_kOhm;
-
+    reference_resistor_kOhm * 4095.0f / clean_eq - reference_resistor_kOhm;
   if (sensor_reading_100_ppm_CO > 0.0f) {
-    float cal100_equiv = sensor_reading_100_ppm_CO * divider_scale;
-    if (cal100_equiv > 4095.0f) cal100_equiv = 4095.0f;
+    float c = constrain(sensor_reading_100_ppm_CO * divider_scale, 1.0f, 4095.0f);
     sensor_100ppm_CO_resistance_kOhm =
-      reference_resistor_kOhm * 4095.0f / cal100_equiv - reference_resistor_kOhm;
+      reference_resistor_kOhm * 4095.0f / c - reference_resistor_kOhm;
   } else {
     sensor_100ppm_CO_resistance_kOhm = sensor_base_resistance_kOhm * 0.5f;
   }
-
   if (sensor_base_resistance_kOhm <= 0.0f || sensor_100ppm_CO_resistance_kOhm <= 0.0f)
-    return -1.0f;
-
-  float sensor_R = reference_resistor_kOhm * 4095.0f / adc_sensor_equiv - reference_resistor_kOhm;
+    return SENSOR_UNAVAILABLE;
+  float sensor_R = reference_resistor_kOhm * 4095.0f / adc_eq - reference_resistor_kOhm;
   if (sensor_R <= 0.0f) return 0.0f;
-
-  float CO_ppm = 100.0f * (expf(sensor_100ppm_CO_resistance_kOhm / sensor_R) - 1.648f);
-  return (CO_ppm < 0.0f) ? 0.0f : CO_ppm;
+  float ppm = 100.0f * (expf(sensor_100ppm_CO_resistance_kOhm / sensor_R) - 1.648f);
+  return (ppm < 0.0f) ? 0.0f : ppm;
 }
 
 void tickCO()
 {
   unsigned long elapsed = millis() - co_phase_start;
 
-  // Watchdog: phase stuck longer than CO_PHASE_MAX_MS
+  // Read A1 heater feedback (via divider, so multiply by scale to get actual V)
+  float a1_adc_v = adcToVolts(averageAnalogRead(CO_A1_PIN));  // voltage at ADC pin
+  float heater_v = a1_adc_v * divider_scale;                  // actual heater voltage
+
+  // Closed-loop duty adjustment toward target
+  // Target is in ADC-pin volts (after divider).
+  // Simple proportional: ±1 duty step per tick when outside tolerance band.
+  float target = (co_phase == 1) ? CO_HEAT_TARGET_V : CO_MEAS_TARGET_V;
+  float error  = target - a1_adc_v;
+  if (fabsf(error) > CO_CLOSED_LOOP_TOL) {
+    int new_duty = (int)co_duty + (error > 0 ? 1 : -1);
+    new_duty = constrain(new_duty, 0, 255);
+    setHeatDuty((byte)new_duty);
+  }
+
+  // Watchdog — phase stuck beyond CO_PHASE_MAX_MS
   if (elapsed > CO_PHASE_MAX_MS) {
-    engMsgf("CO WATCHDOG: phase %d stuck >%lus — forcing transition",
-            co_phase, (unsigned long)(CO_PHASE_MAX_MS / 1000));
+    engMsgf("CO WATCHDOG: phase %d stuck >%lus heater=%.2fV",
+            co_phase, CO_PHASE_MAX_MS/1000, heater_v);
     (co_phase == 1) ? startMeasurementPhase() : startHeatingPhase();
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-      sd.co_fault = true;
-      sd.status_flags |= STATUS_CO_FAULT;
+      sd.co_fault = true; sd.status_flags |= STATUS_CO_FAULT;
       xSemaphoreGive(dataMutex);
     }
     return;
   }
 
-  // Normal phase transitions
+  // Phase transitions
   if (co_phase == 1 && elapsed > 60000UL) {
     startMeasurementPhase();
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
       sd.co_fault = false; sd.status_flags &= ~STATUS_CO_FAULT;
       xSemaphoreGive(dataMutex);
     }
+    return;
   }
   if (co_phase == 0 && elapsed > 90000UL) {
-    float ppm = raw_value_to_CO_ppm(sens_val);
-    last_CO_ppm   = (ppm >= 0.0f) ? ppm : last_CO_ppm;
+    float ppm = raw_to_CO_ppm(sens_val);
+    if (ppm >= 0.0f) last_CO_ppm = ppm;
     sens_val_last = sens_val;
+    engMsgf("CO: cycle done ppm=%.1f raw=%.0f heater=%.2fV duty=%d",
+            last_CO_ppm, sens_val, heater_v, co_duty);
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-      sd.co_ppm   = last_CO_ppm;
-      sd.co_raw   = sens_val;
-      sd.co_phase = co_phase;
-      sd.co_fault = (ppm < 0.0f);
-      if (ppm < 0.0f) sd.status_flags |= STATUS_CO_FAULT;
-      else            sd.status_flags &= ~STATUS_CO_FAULT;
+      sd.co_ppm = last_CO_ppm; sd.co_raw = sens_val; sd.co_phase = co_phase;
+      sd.co_heater_v = heater_v;
+      sd.co_fault = (ppm == SENSOR_UNAVAILABLE);
+      if (ppm == SENSOR_UNAVAILABLE) sd.status_flags |= STATUS_CO_FAULT;
+      else                           sd.status_flags &= ~STATUS_CO_FAULT;
       xSemaphoreGive(dataMutex);
     }
-    engMsgf("CO: cycle done ppm=%.1f raw_adc=%.0f sensor_equiv=%.0f",
-            last_CO_ppm, sens_val, sens_val * divider_scale);
     startHeatingPhase();
     return;
   }
 
-  // ADC read every tick — guard for open-circuit / rail conditions
-  // The rail check uses the ADC-pin range (after divider), so full 5V sensor output
-  // maps to 4095 × divider_ratio at the ADC. We check against ±5% of that.
+  // Continuous CO sense ADC read + exponential moving average (α=0.3)
   float v = (float)analogRead(CO_ADC_PIN);
-  float expected_max_adc = 4095.0f * divider_ratio;
-  if (v < 10.0f || v > (expected_max_adc * 1.05f)) {
-    if (DEBUGON) Serial.printf("CO ADC out of range: %.0f (expected 0–%.0f)\n",
-                               v, expected_max_adc);
-    return;
-  }
-  sens_val = 0.7f * sens_val + 0.3f * v; // EMA α=0.3 (original coefficients)
+  float maxADC = 4095.0f * divider_ratio;
+  if (v >= 10.0f && v <= maxADC * 1.05f)
+    sens_val = 0.7f * sens_val + 0.3f * v;
 
+  // Update shared struct — brief mutex hold
   if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
     sd.co_raw = sens_val; sd.co_phase = co_phase;
+    sd.co_heater_v = heater_v;
     xSemaphoreGive(dataMutex);
   }
+
   if (DEBUGON)
-    Serial.printf("CO phase=%d t=%lus adc=%.0f ema=%.1f sensor_V=%.3fV ppm=%.1f\n",
-                  co_phase, elapsed / 1000, v, sens_val,
-                  v * (3.3f / 4095.0f) * divider_scale, last_CO_ppm);
+    Serial.printf("CO phase=%d t=%lus ema=%.0f ppm=%.1f a1_v=%.3f heater_v=%.3f duty=%d\n",
+                  co_phase, elapsed/1000, sens_val, last_CO_ppm, a1_adc_v, heater_v, co_duty);
 }
 
 // ============================================================================
-// IMU (JY-901 / WT901 — 0x55 framed 11-byte protocol)
+// IMU — JY-901 (unchanged 0x55 framed protocol)
 // ============================================================================
 
 bool pollIMU()
@@ -611,11 +706,11 @@ bool pollIMU()
     Re_buf[imu_counter++] = b;
     if (imu_counter == 11) {
       imu_counter = 0;
-      if (Re_buf[0] == 0x55 && Re_buf[1] == 0x53) {
-        angle[0] = (short((Re_buf[3] << 8) | Re_buf[2])) / 32768.0f * 180.0f;
-        angle[1] = (short((Re_buf[5] << 8) | Re_buf[4])) / 32768.0f * 180.0f;
-        angle[2] = (short((Re_buf[7] << 8) | Re_buf[6])) / 32768.0f * 180.0f;
-        imuT = ((short((Re_buf[9] << 8) | Re_buf[8])) / 340.0f + 36.25f) + tempComp;
+      if (Re_buf[0]==0x55 && Re_buf[1]==0x53) {
+        angle[0] = (short((Re_buf[3]<<8)|Re_buf[2])) / 32768.0f * 180.0f;
+        angle[1] = (short((Re_buf[5]<<8)|Re_buf[4])) / 32768.0f * 180.0f;
+        angle[2] = (short((Re_buf[7]<<8)|Re_buf[6])) / 32768.0f * 180.0f;
+        imuT = ((short((Re_buf[9]<<8)|Re_buf[8])) / 340.0f + 36.25f) + tempComp;
         lastIMUframe = millis();
         return true;
       }
@@ -628,409 +723,441 @@ void readIMU()
 {
   unsigned long start = millis();
   bool got = false;
-  while (millis() - start < 200) { if (pollIMU()) { got = true; break; } delay(1); }
-
-  unsigned long age = millis() - lastIMUframe;
-  bool stuck = (lastIMUframe > 0 && age > IMU_TIMEOUT_MS);
-
-  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+  while (millis() - start < IMU_POLL_MS) { if (pollIMU()) { got=true; break; } taskYIELD(); }
+  bool stuck = (lastIMUframe > 0 && millis()-lastIMUframe > IMU_TIMEOUT_MS);
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
     if (got) {
-      sd.angle[0] = angle[0]; sd.angle[1] = angle[1]; sd.angle[2] = angle[2];
-      sd.imu_temp = imuT; sd.imu_ok = true;
+      sd.angle[0]=angle[0]; sd.angle[1]=angle[1]; sd.angle[2]=angle[2];
+      sd.imu_temp=imuT; sd.imu_ok=true;
       sd.status_flags |= STATUS_IMU_OK;
       sd.status_flags &= ~STATUS_IMU_STUCK;
     }
     if (stuck) {
-      sd.imu_ok = false;
+      sd.angle[0]=sd.angle[1]=sd.angle[2]=sd.imu_temp=SENSOR_UNAVAILABLE;
+      sd.imu_ok=false;
       sd.status_flags &= ~STATUS_IMU_OK;
       sd.status_flags |= STATUS_IMU_STUCK;
     }
     xSemaphoreGive(dataMutex);
   }
-  if (stuck) engMsgf("IMU STUCK: no frame for %lus", age / 1000);
+  if (stuck) engMsgf("IMU STUCK: no frame for %lus", (millis()-lastIMUframe)/1000);
 }
 
 // ============================================================================
-// SENSOR TASK — Core 1
+// SENSOR TASK — Core 0 (pro_cpu)
+// All blocking sensor I/O lives here, away from Blynk on Core 1.
+// Uses vTaskDelay for all waits so FreeRTOS tick ISR is never starved.
+// NOTE: ADC is NOT reconfigured here — it was already configured globally
+// in setup() BEFORE I2S init. Reconfiguring ADC after I2S install causes
+// the "ADC: CONFLICT driver_ng" error.
+// v2.2: this ordering constraint applied to the legacy I2S driver. Since
+// INMP441 now uses <driver/i2s_std.h> (see initINMP441()), the constraint
+// no longer applies — analogRead() calls in this task cannot collide with
+// I2S regardless of when initINMP441() was called in setup(). The original
+// ordering is kept anyway as good practice, not because it's still required.
 // ============================================================================
 
 void sensorTask(void* pvParam)
 {
-  analogReadResolution(12);
-  analogSetAttenuation(ADC_11db); // full 0–3.3V range on all ADC1 pins
+  while (!setupDone) vTaskDelay(pdMS_TO_TICKS(10));
+
+  // ADC config already done in setup() — do NOT call analogReadResolution()
+  // or analogSetAttenuation() here. That would trigger the driver conflict.
 
   while (true)
   {
     unsigned long loopStart = millis();
 
-    // ── UV (ML8511 — 3.3V ratiometric, NO voltage divider) ──────────────────
-    // The ML8511 outputs a voltage ratiometric to its own 3.3V supply.
-    // Both OUT and REF pins connect directly to the ESP32 — no divider, no scaling.
-    // Vout/Vref ratio is independent of supply voltage.
-    int uvLevel  = averageAnalogRead(UVOUT);
-    int refLevel = averageAnalogRead(REF_3V3);
-    float outV = (refLevel > 50) ? (3.3f / (float)refLevel) * (float)uvLevel : 0.0f;
-    float uvi  = (12.49f * (outV + (1.0f - 0.97f)) - 12.49f + 0.3f);
-    if (uvi < 0)  uvi = 0;
-    if (uvi > 20) uvi = 20;
-
-    // ── NO2 (MICS-2710 — 5V sensor, analogue output through voltage divider) ─
-    // ADC sees: Vadc = Vsensor × divider_ratio
-    // Recover actual sensor voltage: Vsensor = Vadc × divider_scale
-    int   no2_adc = averageAnalogRead(NO2_SENSOR_PIN);
-    float no2v    = adcToSensorVoltage(no2_adc);  // actual sensor voltage 0–5V
-
-    // ── Sound (analogue mic — divider applied if module is 5V) ───────────────
-    // Peak-to-peak measurement recovers amplitude; divider_scale restores
-    // the actual signal swing at the microphone output.
-    unsigned int sigMax = 0, sigMin = 4095;
-    unsigned long sw = millis();
-    while (millis() - sw < (unsigned long)sampleSoundWindow) {
-      unsigned int s = (unsigned int)analogRead(micPin);
-      if (s < 4095) { if (s > sigMax) sigMax = s; if (s < sigMin) sigMin = s; }
-    }
-    // Convert ADC peak-to-peak counts to actual sensor voltage swing.
-    // If the mic module runs at 3.3V, remove the × divider_scale term and
-    // connect it directly without a divider — then set MIC_IS_5V false below.
-    const bool MIC_IS_5V = true;  // set false if mic module powered at 3.3V
-    float soundV = 0;
-    if (sigMax > sigMin) {
-      float adc_pp_V = (sigMax - sigMin) * (3.3f / 4095.0f);
-      soundV = MIC_IS_5V ? (adc_pp_V * divider_scale) : adc_pp_V;
+    // ── UV (ML8511 3.3V ratiometric, direct — no divider) ───────────────────
+    int uvRaw = averageAnalogRead(UV_OUT_PIN);
+    int uvRef = averageAnalogRead(UV_REF_PIN);
+    float uvi = SENSOR_UNAVAILABLE;
+    if (uvRef > 50) {
+      float outV = (3.3f / (float)uvRef) * (float)uvRaw;
+      uvi = constrain(12.49f*(outV+0.03f)-12.49f+0.3f, 0.0f, 20.0f);
     }
 
-    // ── Dust (Sharp GP2Y1010 — 5V sensor, analogue output through divider) ───
-    // GPIO18 (digital output, 3.3V) drives the ILED input — safe direct connect.
-    // The Vo analogue output goes through the voltage divider; divider_scale
-    // restores the actual sensor Vo before applying the calibration curve.
+    // ── Dust (GP2Y1010 5V, 10k+10k divider) ─────────────────────────────────
+    // GPIO18 drives IR LED at 3.3V — safe direct connect to sensor ILED pin
     digitalWrite(dustLED, LOW);
     delayMicroseconds(280);
-    int voMeas = analogRead(dustPin);
+    int voMeas = analogRead(DUST_ADC_PIN);
     delayMicroseconds(40);
     digitalWrite(dustLED, HIGH);
-    float calcV    = adcToSensorVoltage(voMeas);   // actual Vo at sensor output
-    float dustDens = 0.17f * calcV - 0.1f;
-    if (dustDens < 0) dustDens = 0;
+    float dustDens = max(0.0f, 0.17f * adcToSensorVoltage(voMeas) - 0.1f);
 
-    // ── DHT21 — digital, 3.3V supply, direct GPIO connection ─────────────────
-    float h = dht.readHumidity(), t = dht.readTemperature();
-    bool dhtOK = (!isnan(h) && !isnan(t) && h >= 0 && h <= 100 && t > -40 && t < 80);
-    if (dhtOK) {
-      hum_prev = h; temp_prev = t; dht_fail_count = 0;
-    } else {
-      dht_fail_count++;
-      h = hum_prev; t = temp_prev;
-      if (dht_fail_count == DHT_MAX_FAILS)
-        engMsgf("DHT FAULT: %d consecutive read failures", dht_fail_count);
+    // ── ENS160 + AHT2x (I2C, ScioSense library) ─────────────────────────────
+    float tvoc=SENSOR_UNAVAILABLE, eco2=SENSOR_UNAVAILABLE, aqi=SENSOR_UNAVAILABLE;
+    float t=temp_prev, h=hum_prev;
+    bool ensOK = false;
+    bool ensFaulted = (ens_fail_count >= ENS_MAX_FAILS);
+    if (!ensFaulted || (millis()-lastENSattempt > ENS_RETRY_MS)) {
+      lastENSattempt = millis();
+      if (!ensReady) {
+        // Attempt (re)init — retried from sensorTask in case board was absent at boot
+        ensReady = initENS();
+      }
+      if (ensReady) {
+        ensOK = readENS(tvoc, eco2, aqi, t, h);
+        if (ensOK) { temp_prev=t; hum_prev=h; ens_fail_count=0; }
+        else        { ens_fail_count++; t=temp_prev; h=hum_prev; }
+      } else { ens_fail_count++; }
+      if (ens_fail_count == ENS_MAX_FAILS)
+        engMsgf("ENS FAULT: %d failures — retrying every %ds", ENS_MAX_FAILS, ENS_RETRY_MS/1000);
     }
+    if (ensFaulted && !ensOK) { t=SENSOR_UNAVAILABLE; h=SENSOR_UNAVAILABLE; }
+
+    // ── INMP441 I2S mic ───────────────────────────────────────────────────────
+    float soundDb = INMPsensorThere ? readINMP441_dB() : SENSOR_UNAVAILABLE;
 
     // ── CO state machine ─────────────────────────────────────────────────────
     if (COsensorThere) tickCO();
 
-    // ── GPS (digital UART 3.3V — direct connection) ──────────────────────────
-    feedGPS(150);
+    // ── GPS (ATGM336H NMEA, 9600 baud) ───────────────────────────────────────
+    feedGPS();
     SatGPS = (float)gps.satellites.value();
-    HDOP   = (SatGPS >= 1) ? (float)(gps.hdop.value()) / 100.0f : 99.9f;
-    memcpy(LatGPS_Prev, LatGPS, sizeof(LatGPS));
-    memcpy(LongGPS_Prev, LongGPS, sizeof(LongGPS));
-
-    bool gpsFix = (gps.location.isValid() && gps.location.age() < GPS_TIMEOUT_MS && SatGPS >= 4);
-    double lat = 0, lng = 0;
+    HDOP   = (SatGPS >= 1) ? gps.hdop.value()/100.0f : 99.9f;
+    bool gpsFix = (gps.location.isValid() &&
+                   gps.location.age() < GPS_TIMEOUT_MS && SatGPS >= 4);
+    double lat=0, lng=0;
     if (gpsFix) {
-      lat = gps.location.lat(); lng = gps.location.lng();
-      lastGPSdata = millis(); prevZeroVal = false;
+      lat=gps.location.lat(); lng=gps.location.lng();
+      lastGPSdata=millis(); prevZeroVal=false;
     } else {
       if (!prevZeroVal) {
-        lat = gps.location.lat() + 0.0001; lng = gps.location.lng() + 0.0001;
-        prevZeroVal = true;
+        lat=gps.location.lat()+0.0001; lng=gps.location.lng()+0.0001;
+        prevZeroVal=true;
         engMsgf("GPS: fix lost (sats=%.0f age=%lums)", SatGPS, gps.location.age());
-      } else { lat = 0; lng = 0; }
-      buzzerTone(12000, 90);
+      } else { lat=0; lng=0; }
+      if (millis()-lastGPSbeep > BUZZER_GPS_INTERVAL) {
+        lastGPSbeep=millis(); buzzerTone(12000, 90);
+      }
     }
-    if (lastGPSdata > 0 && millis() - lastGPSdata > GPS_TIMEOUT_MS)
-      engMsgf("GPS FAULT: no valid data for >%ds", GPS_TIMEOUT_MS / 1000);
+    if (lastGPSdata>0 && millis()-lastGPSdata>GPS_TIMEOUT_MS)
+      engMsgf("GPS FAULT: no data >%ds", GPS_TIMEOUT_MS/1000);
 
-    dtostrf(lat, 9, 6, LatGPS);
-    dtostrf(lng, 9, 6, LongGPS);
-
-    // ── IMU (digital UART 3.3V — direct connection) ──────────────────────────
+    // ── IMU — JY-901 UART2 ───────────────────────────────────────────────────
     if (IMUsensorThere) readIMU();
-
-    // ── Status flags ─────────────────────────────────────────────────────────
-    uint32_t flags = 0;
-    if (dhtOK)                                          flags |= STATUS_DHT_OK;
-    else if (dht_fail_count >= DHT_MAX_FAILS)           flags |= STATUS_DHT_FAULT;
-    if (gpsFix)                                         flags |= STATUS_GPS_OK;
-    if (lastGPSdata > 0 && millis() - lastGPSdata > GPS_TIMEOUT_MS)
-                                                        flags |= STATUS_GPS_FAULT;
+    else {
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        sd.angle[0]=sd.angle[1]=sd.angle[2]=sd.imu_temp=SENSOR_UNAVAILABLE;
+        xSemaphoreGive(dataMutex);
+      }
+    }
 
     // ── LED control ──────────────────────────────────────────────────────────
     float cppm = last_CO_ppm;
-    digitalWrite(ledPin11, (cppm <= 10)              ? HIGH : LOW);
-    digitalWrite(ledPin12, (cppm > 10 && cppm <= 20) ? HIGH : LOW);
-    digitalWrite(ledPin13, (cppm > 20)               ? HIGH : LOW);
-    pin11state = digitalRead(ledPin11);
-    pin12state = digitalRead(ledPin12);
-    pin13state = digitalRead(ledPin13);
+    digitalWrite(ledPin11, (cppm>=0 && cppm<=10) ? HIGH : LOW);
+    digitalWrite(ledPin12, (cppm>10 && cppm<=20) ? HIGH : LOW);
+    digitalWrite(ledPin13, (cppm>20)             ? HIGH : LOW);
 
     // ── OLED ─────────────────────────────────────────────────────────────────
     if (DISPLAYON) {
-      display.clearDisplay(); display.setCursor(0, 0); display.setTextSize(1);
-      display.printf("CO:%.1fppm UV:%.1f\n", cppm, uvi);
+      display.clearDisplay(); display.setCursor(0,0); display.setTextSize(1);
+      display.printf("CO:%.1f UV:%.1f\n", cppm, uvi);
       display.printf("T:%.1fC H:%.0f%%\n", t, h);
-      display.printf("NO2:%.2fV Dust:%.3f\n", no2v, dustDens);
-      display.printf("%s\n%s\n", LatGPS, LongGPS);
-      if (IMUsensorThere)
-        display.printf("IMU:%.0f/%.0f/%.0f\n", angle[0], angle[1], angle[2]);
+      display.printf("TVOC:%.0fppb CO2:%.0f\n", tvoc, eco2);
+      display.printf("%.6f\n%.6f\n", lat, lng);
+      if (IMUsensorThere && sd.imu_ok)
+        display.printf("R/P/Y:%.0f/%.0f/%.0f\n", angle[0],angle[1],angle[2]);
       display.display();
     }
 
-    // ── Write all results to shared struct ───────────────────────────────────
+    // ── Single mutex-protected struct write ──────────────────────────────────
+    // Mutex held only here — never during I/O operations above.
+    uint32_t flags = 0;
+    if (ensOK)                                               flags |= STATUS_ENS_OK;
+    if (ens_fail_count>=ENS_MAX_FAILS)                       flags |= STATUS_ENS_FAULT;
+    if (gpsFix)                                              flags |= STATUS_GPS_OK;
+    if (lastGPSdata>0&&millis()-lastGPSdata>GPS_TIMEOUT_MS) flags |= STATUS_GPS_FAULT;
+
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-      sd.uvi         = uvi;
-      sd.no2_raw     = (float)no2_adc;
-      sd.no2_voltage = no2v;
-      sd.sound_v     = soundV;
-      sd.dust_mg     = dustDens;
-      sd.temp        = t;
-      sd.hum         = h;
-      sd.dht_fault   = (dht_fail_count >= DHT_MAX_FAILS);
-      sd.lat         = lat;
-      sd.lng         = lng;
-      sd.hdop        = HDOP;
-      sd.sats        = SatGPS;
-      sd.gps_fix     = gpsFix;
-      sd.rand_num    = random(1, 10);
-      sd.status_flags = (sd.status_flags & (STATUS_WIFI_OK | STATUS_IMU_OK |
-                         STATUS_IMU_STUCK | STATUS_CO_FAULT)) | flags;
+      sd.uvi=uvi; sd.dust_mg=dustDens;
+      sd.tvoc_ppb=tvoc; sd.eco2_ppm=eco2; sd.aqi=aqi;
+      sd.sound_db=soundDb;
+      sd.temp=t; sd.hum=h; sd.ens_fault=(ens_fail_count>=ENS_MAX_FAILS);
+      sd.lat=lat; sd.lng=lng; sd.hdop=HDOP; sd.sats=SatGPS; sd.gps_fix=gpsFix;
+      sd.rand_num=random(1,10);
+      // Preserve WiFi/CO/IMU flags already set by their own functions; merge sensor flags
+      sd.status_flags = (sd.status_flags &
+        (STATUS_WIFI_OK|STATUS_IMU_OK|STATUS_IMU_STUCK|
+         STATUS_CO_FAULT|STATUS_CO_NO_SNS)) | flags;
       xSemaphoreGive(dataMutex);
     }
 
     if (DEBUGON)
-      Serial.printf("[SENS] CO=%.1fppm phase=%d NO2=%.3fV UV=%.2f Snd=%.3fV "
-                    "Dust=%.4f T=%.1f H=%.0f GPS=%d sats=%.0f "
-                    "IMU=%.1f/%.1f/%.1f divScale=%.4f\n",
-                    last_CO_ppm, co_phase, no2v, uvi, soundV, dustDens,
-                    t, h, (int)gpsFix, SatGPS,
-                    angle[0], angle[1], angle[2], divider_scale);
+      Serial.printf("[SENS] CO=%.1f ph=%d UV=%.2f Snd=%.1fdB "
+                    "Dst=%.3f T=%.1f H=%.0f TVOC=%.0f eCO2=%.0f AQI=%.0f "
+                    "GPS=%d sat=%.0f\n",
+                    last_CO_ppm,co_phase,uvi,soundDb,dustDens,
+                    t,h,tvoc,eco2,aqi,(int)gpsFix,SatGPS);
 
-    // ── 10-minute auto-reset (optional) ──────────────────────────────────────
-    countNum++; counterNum++; countReset++;
+    // ── 10-min optional auto-reset ────────────────────────────────────────────
+    countReset++;
     if (ten_mins_autoreset && countReset >= 600) {
-      engMsg("AUTO-RESET: 10-minute watchdog triggered");
-      delay(200);
+      engMsg("AUTO-RESET: 10-min watchdog");
+      vTaskDelay(pdMS_TO_TICKS(300));
       buzzerTone(1000, 200);
-      countReset = 0;
-      ESP.restart();
+      countReset=0; ESP.restart();
     }
 
-    unsigned long elapsed = millis() - loopStart;
-    if (elapsed < SLEEP_TIME) delay(SLEEP_TIME - elapsed);
+    unsigned long elapsed = millis()-loopStart;
+    vTaskDelay(pdMS_TO_TICKS(elapsed < SENSOR_TASK_PERIOD_MS
+                              ? SENSOR_TASK_PERIOD_MS - elapsed : 1));
   }
 }
 
 // ============================================================================
-// BLYNK SEND — called by BlynkTimer on Core 0
+// BLYNK SENDS — called from BlynkTimer in loop() (Core 1)
 // ============================================================================
 
-void blynkSendAll()
+void blynkSendFast()
 {
-  if (!WIFI || WiFi.status() != WL_CONNECTED) return;
-
+  // Critical / navigation data — sent every BLYNK_SEND_FAST_MS (5s)
+  if (WiFi.status() != WL_CONNECTED) return;
+  int32_t rssi = WiFi.RSSI();
+  uint8_t qual = rssiToQuality(rssi);
   SensorData snap;
-  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-    snap = sd;
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(30)) == pdTRUE) {
+    snap=sd; snap.rssi=rssi; snap.wifi_qual=qual;
+    sd.rssi=rssi; sd.wifi_qual=qual;
     xSemaphoreGive(dataMutex);
-  } else return;
+  } else { engMsg("BLYNK FAST: mutex timeout"); return; }
 
-  Blynk.virtualWrite(V1,  snap.sound_v);
-  Blynk.virtualWrite(V2,  snap.co_ppm);
-  Blynk.virtualWrite(V3,  snap.uvi);
-  Blynk.virtualWrite(V4,  snap.rand_num);
-  Blynk.virtualWrite(V5,  snap.no2_voltage);  // actual sensor voltage (divider corrected)
-  Blynk.virtualWrite(V6,  snap.co_phase);
-  Blynk.virtualWrite(V7,  snap.co_raw);
-  Blynk.virtualWrite(V8,  snap.angle[0]);
-  Blynk.virtualWrite(V9,  snap.angle[1]);
-  Blynk.virtualWrite(V10, snap.angle[2]);
-  Blynk.virtualWrite(V11, snap.imu_temp);
-  Blynk.virtualWrite(V12, snap.lat);
-  Blynk.virtualWrite(V13, snap.lng);
-  Blynk.virtualWrite(V14, snap.sats);
-  Blynk.virtualWrite(V15, snap.hum);
-  Blynk.virtualWrite(V16, snap.temp);
-  Blynk.virtualWrite(V17, snap.hdop);
-  Blynk.virtualWrite(V18, snap.dust_mg);
-  Blynk.virtualWrite(V19, snap.eng_msg);
-  Blynk.virtualWrite(V20, (int)snap.status_flags);
+  safeWrite (V2,  snap.co_ppm);
+  safeWriteI(V6,  snap.co_phase);
+  safeWrite (V7,  snap.co_raw);
+  safeWrite (V12, snap.lat);
+  safeWrite (V13, snap.lng);
+  safeWrite (V14, snap.sats);
+  safeWrite (V17, snap.hdop);
+  safeWrite (V15, snap.hum);
+  safeWrite (V16, snap.temp);
+  safeWriteS(V19, snap.eng_msg);
+  safeWriteI(V20, (int)snap.status_flags);
+  safeWriteI(V21, snap.rssi);
+  safeWriteI(V22, (int)snap.wifi_qual);
+}
 
-  if (DEBUGON) Serial.printf("[BLYNK] sent vPins, status=0x%02X\n", snap.status_flags);
+void blynkSendSlow()
+{
+  // Environmental / sensor data — sent every BLYNK_SEND_SLOW_MS (10s)
+  if (WiFi.status() != WL_CONNECTED) return;
+  SensorData snap;
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(30)) == pdTRUE) {
+    snap=sd; xSemaphoreGive(dataMutex);
+  } else { engMsg("BLYNK SLOW: mutex timeout"); return; }
+
+  safeWrite (V1,  snap.sound_db);
+  safeWrite (V3,  snap.uvi);
+  safeWriteI(V4,  snap.rand_num);
+  safeWrite (V5,  snap.tvoc_ppb);
+  safeWrite (V8,  snap.angle[0]);
+  safeWrite (V9,  snap.angle[1]);
+  safeWrite (V10, snap.angle[2]);
+  safeWrite (V11, snap.imu_temp);
+  safeWrite (V18, snap.dust_mg);
+  safeWrite (V23, snap.eco2_ppm);
+  safeWrite (V24, snap.aqi);
+  safeWrite (V25, snap.co_heater_v);
 }
 
 // ============================================================================
-// BLYNK / WIFI TASK — Core 0
+// WiFi CONNECT
 // ============================================================================
 
-void blynkTask(void* pvParam)
+bool wifiConnect()
 {
   Serial.printf("[WiFi] Connecting to %s...\n", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  unsigned long wStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wStart < 20000) {
-    delay(500); Serial.print(".");
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\n[WiFi] Connected, IP=%s\n", WiFi.localIP().toString().c_str());
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-      sd.status_flags |= STATUS_WIFI_OK;
-      xSemaphoreGive(dataMutex);
+  unsigned long t = millis();
+  while (WiFi.status()!=WL_CONNECTED && millis()-t<20000) { delay(500); Serial.print("."); }
+  if (WiFi.status()!=WL_CONNECTED) {
+    Serial.println("\n[WiFi] FAILED");
+    engMsg("WiFi FAILED: offline");
+    buzzerTone(1000,600); delay(200); buzzerTone(1000,600); delay(200); buzzerTone(1000,600);
+    if (xSemaphoreTake(dataMutex,pdMS_TO_TICKS(10))==pdTRUE) {
+      sd.status_flags&=~STATUS_WIFI_OK; xSemaphoreGive(dataMutex);
     }
-    Blynk.config(BLYNK_AUTH, BLYNK_SERVER, BLYNK_PORT);
-    Blynk.connect(5000);
-    engMsgf("Blynk connected to %s:%d", BLYNK_SERVER, BLYNK_PORT);
-    buzzerTone(5000, 100);
-  } else {
-    Serial.println("\n[WiFi] FAILED — running offline");
-    engMsg("WiFi FAILED: running offline");
-    buzzerTone(1000, 800); delay(300);
-    buzzerTone(1000, 800); delay(300);
-    buzzerTone(1000, 800);
+    return false;
   }
-
-  blynkTimer.setInterval(BLYNK_SEND_MS, blynkSendAll);
-
-  blynkTimer.setInterval(ENG_MSG_INTERVAL, []() {
-    if (!WIFI || WiFi.status() != WL_CONNECTED) return;
-    char msg[128];
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-      strncpy(msg, sd.eng_msg, sizeof(msg));
-      xSemaphoreGive(dataMutex);
-    }
-    if (strlen(msg) > 0) Blynk.virtualWrite(V19, msg);
-  });
-
-  while (true) {
-    if (WIFI) {
-      if (WiFi.status() != WL_CONNECTED && millis() - lastWiFiCheck > WIFI_RECONNECT_MS) {
-        lastWiFiCheck = millis();
-        Serial.println("[WiFi] Reconnecting...");
-        engMsg("WiFi: reconnect attempt");
-        WiFi.reconnect();
-        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-          sd.status_flags &= ~STATUS_WIFI_OK;
-          xSemaphoreGive(dataMutex);
-        }
-      } else if (WiFi.status() == WL_CONNECTED) {
-        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-          sd.status_flags |= STATUS_WIFI_OK;
-          xSemaphoreGive(dataMutex);
-        }
-      }
-      Blynk.run();
-      blynkTimer.run();
-    }
-    delay(10);
+  Serial.printf("\n[WiFi] Connected — IP=%s RSSI=%ddBm MAC=%s\n",
+                WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.macAddress().c_str());
+  // Blynk.config() sets server address only — does NOT block or spin.
+  // Blynk.run() in loop() completes the handshake on first call.
+  // DO NOT use Blynk.connect(timeout) — it spins internally for 5s and causes IWDT crash.
+  Blynk.config(BLYNK_AUTH, BLYNK_SERVER, BLYNK_PORT);
+  if (xSemaphoreTake(dataMutex,pdMS_TO_TICKS(10))==pdTRUE) {
+    sd.status_flags|=STATUS_WIFI_OK; xSemaphoreGive(dataMutex);
   }
+  engMsgf("WiFi OK — Blynk configured %s:%d", BLYNK_SERVER, BLYNK_PORT);
+  buzzerTone(5000, 100);
+  return true;
 }
 
 // ============================================================================
-// SETUP
+// SETUP — runs on Core 1 (Arduino default app_cpu)
 // ============================================================================
 
 void setup()
 {
   Serial.begin(115200);
-  Serial.println("\n[INIT] Air Quality Station ESP32 v1.2");
-  Serial.printf("[INIT] ten_mins_autoreset = %s\n", ten_mins_autoreset ? "ON" : "OFF");
+  Serial.println("\n[INIT] Air Quality Station ESP32 v2.2");
+  Serial.printf("[INIT] ten_mins_autoreset = %s\n", ten_mins_autoreset ? "ON":"OFF");
 
-  // ── Compute divider factors from user-configured resistor values ──────────
+  uint8_t mac[6];
+  esp_efuse_mac_get_default(mac);
+  Serial.printf("[INIT] WiFi MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+
   divider_ratio = R_DIVIDER_GND / (R_DIVIDER_SERIES + R_DIVIDER_GND);
   divider_scale = (R_DIVIDER_SERIES + R_DIVIDER_GND) / R_DIVIDER_GND;
-  float vout_at_5v = 5.0f * divider_ratio;
-  Serial.printf("[INIT] Divider: R_series=%.0fkΩ R_gnd=%.0fkΩ  "
-                "ratio=%.4f  scale=%.4f  Vout@5V=%.3fV\n",
-                R_DIVIDER_SERIES, R_DIVIDER_GND,
-                divider_ratio, divider_scale, vout_at_5v);
-  if (vout_at_5v > 3.3f) {
-    Serial.printf("[WARN] Vout at 5V sensor = %.3fV exceeds ESP32 GPIO max (3.3V)! "
-                  "Risk of GPIO damage at full sensor output.\n", vout_at_5v);
-    engMsg("WARN: divider Vout@5V exceeds 3.3V GPIO max — check resistors");
-  }
+  Serial.printf("[INIT] Divider: %.0fkΩ+%.0fkΩ ratio=%.4f scale=%.4f Vout@5V=%.3fV\n",
+                R_DIVIDER_SERIES,R_DIVIDER_GND,divider_ratio,divider_scale,5.0f*divider_ratio);
 
   dataMutex = xSemaphoreCreateMutex();
   memset(&sd, 0, sizeof(sd));
   strncpy(sd.eng_msg, "Booting...", sizeof(sd.eng_msg));
+  // Pre-fill all sensor fields with UNAVAILABLE until first valid reads
+  sd.co_ppm=sd.co_raw=sd.co_heater_v=SENSOR_UNAVAILABLE;
+  sd.tvoc_ppb=sd.eco2_ppm=sd.aqi=SENSOR_UNAVAILABLE;
+  sd.uvi=sd.sound_db=sd.dust_mg=SENSOR_UNAVAILABLE;
+  sd.temp=sd.hum=SENSOR_UNAVAILABLE;
+  sd.angle[0]=sd.angle[1]=sd.angle[2]=sd.imu_temp=SENSOR_UNAVAILABLE;
 
-  pinMode(ledPin11, OUTPUT); digitalWrite(ledPin11, LOW);
-  pinMode(ledPin12, OUTPUT); digitalWrite(ledPin12, LOW);
-  pinMode(ledPin13, OUTPUT); digitalWrite(ledPin13, LOW);
-  pinMode(dustLED,  OUTPUT); digitalWrite(dustLED,  HIGH); // active LOW → off
-  pinMode(buzzPin,  OUTPUT);
-  pinMode(UVOUT,          INPUT);
-  pinMode(REF_3V3,        INPUT);
-  pinMode(micPin,         INPUT);
-  pinMode(NO2_SENSOR_PIN, INPUT);
-  pinMode(CO_ADC_PIN,     INPUT);
+  // ── GPIO setup ───────────────────────────────────────────────────────────
+  pinMode(ledPin11,OUTPUT); digitalWrite(ledPin11,LOW);
+  pinMode(ledPin12,OUTPUT); digitalWrite(ledPin12,LOW);
+  pinMode(ledPin13,OUTPUT); digitalWrite(ledPin13,LOW);
+  pinMode(dustLED, OUTPUT); digitalWrite(dustLED, HIGH);
+  pinMode(buzzPin, OUTPUT);
+  pinMode(CO_ADC_PIN,   INPUT);
+  pinMode(CO_A1_PIN,    INPUT);
+  pinMode(UV_OUT_PIN,   INPUT);
+  pinMode(UV_REF_PIN,   INPUT);
+  pinMode(DUST_ADC_PIN, INPUT);
 
+  // ── ADC MUST be configured BEFORE I2S driver install ─────────────────────
+  // On ESP32 Arduino core 3.x, analogSetAttenuation() internally uses the
+  // new adc_oneshot driver (driver_ng). The legacy I2S driver installs its
+  // own ADC handle. When both run, the firmware aborts with:
+  //   E (322) ADC: CONFLICT! driver_ng is not allowed to be used with the legacy driver
+  //
+  // Fix: use analogReadResolution() + analogSetPinAttenuation() per ADC pin
+  // instead of the global analogSetAttenuation(). Per-pin calls do NOT
+  // touch driver_ng and are safe alongside the legacy I2S driver.
+  // ALSO: I2S is installed LAST in setup() so ADC is fully initialised first.
   analogReadResolution(12);
-  analogSetAttenuation(ADC_11db);
+  // Set 0–3.3V range (ADC_11db) individually on every ADC1 pin we use.
+  // Do NOT call analogSetAttenuation() — it conflicts with I2S legacy driver.
+  analogSetPinAttenuation(CO_ADC_PIN,   ADC_11db);
+  analogSetPinAttenuation(CO_A1_PIN,    ADC_11db);
+  analogSetPinAttenuation(UV_OUT_PIN,   ADC_11db);
+  analogSetPinAttenuation(UV_REF_PIN,   ADC_11db);
+  analogSetPinAttenuation(DUST_ADC_PIN, ADC_11db);
+  Serial.println("[INIT] ADC configured (12-bit, per-pin 11dB — no driver_ng conflict)");
 
-  if (COsensorThere) {
-    ledcSetup(LEDC_CHAN_CO, LEDC_FREQ_CO, LEDC_RES_CO);
-    ledcAttachPin(CO_PWM_PIN, LEDC_CHAN_CO);
-    ledcWrite(LEDC_CHAN_CO, 0);
+  // ── I2C for ENS160+AHT2x ─────────────────────────────────────────────────
+  Wire.begin(21, 22);  // SDA=GPIO21, SCL=GPIO22
+
+  // ── ENS160+AHT2x init ────────────────────────────────────────────────────
+  if (ENSsensorThere) {
+    ensReady = initENS();
+    if (!ensReady) Serial.println("[WARN] ENS160/AHT2x not detected — will retry in sensorTask");
   }
 
-  dht.begin();
+  // ── CO LEDC PWM ──────────────────────────────────────────────────────────
+  if (COsensorThere) {
+    ledcAttach(CO_PWM_PIN, LEDC_FREQ_CO, LEDC_RES_CO);
+    ledcWrite(CO_PWM_PIN, 0);
+  }
 
+  // ── IMU UART2 ────────────────────────────────────────────────────────────
   if (IMUsensorThere) {
     imu_serial.begin(115200, SERIAL_8N1, IMU_RX_PIN, IMU_TX_PIN);
     Serial.println("[INIT] IMU UART2 started (GPIO16/17)");
   }
 
+  // ── GPS — ATGM336H NMEA only, 9600 baud ──────────────────────────────────
   initGPS();
 
+  // ── OLED (optional, shares I2C) ──────────────────────────────────────────
   if (DISPLAYON) {
-    Wire.begin();
     if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
       Serial.println("[WARN] OLED init failed");
-    else {
-      display.setTextColor(WHITE);
-      display.clearDisplay();
-      display.display();
-    }
+    else { display.setTextColor(WHITE); display.clearDisplay(); display.display(); }
   }
 
   randomSeed(analogRead(0));
 
+  // ── INMP441 I2S — installed LAST, AFTER ADC configuration ────────────────
+  // This ordering is critical. i2s_driver_install() and analogRead() use
+  // different internal ADC driver layers. Installing I2S before configuring
+  // ADC with the legacy API causes the driver_ng conflict error.
+  // v2.2: initINMP441() now uses <driver/i2s_std.h>, which never touches the
+  // ADC driver — this call could be moved anywhere in setup() without risk.
+  // Left in this position since it costs nothing and keeps the safe pattern.
+  if (INMPsensorThere) initINMP441();
+
+  // ── Launch sensor task on Core 0 ─────────────────────────────────────────
+  // WiFi is connected on Core 1 (this setup() function) before CO startup,
+  // so the WiFi driver is running during any long CO initialisation.
+  xTaskCreatePinnedToCore(sensorTask, "sensorTask", 8192, NULL, 1, NULL, 0);
+
+  // ── WiFi + Blynk config ──────────────────────────────────────────────────
+  if (WIFI) wifiConnect();
+
+  // ── CO sensor startup ────────────────────────────────────────────────────
   if (COsensorThere) {
     sens_val = sensor_reading_clean_air;
-    Serial.println("[INIT] CO PWM calibration...");
-    bool calOK = pwm_adjust();
-    Serial.printf("[INIT] CO cal %s duty=%d sensor_V=%.3f\n",
-                  calOK ? "OK" : "WARN", opt_width, opt_voltage);
-    delay(2000);
+    if (!coSensorPresent()) {
+      Serial.println("[WARN] CO sensor not detected (GPIO36 floating)");
+      engMsg("CO: sensor absent — check A0 wiring and divider");
+      if (xSemaphoreTake(dataMutex,pdMS_TO_TICKS(20))==pdTRUE) {
+        sd.co_no_sensor=true; sd.status_flags|=STATUS_CO_NO_SNS;
+        sd.co_ppm=SENSOR_UNAVAILABLE; xSemaphoreGive(dataMutex);
+      }
+    } else {
+      engMsg("CO: sensor detected — starting closed-loop heater control");
+    }
     startMeasurementPhase();
   }
 
-  if (DEBUGON) {
-    Serial.printf("[INIT] Pins: CO_ADC=%d CO_PWM=%d UV=%d REF=%d "
-                  "Dust=%d dustLED=%d Mic=%d NO2=%d DHT=%d Buzz=%d\n",
-                  CO_ADC_PIN, CO_PWM_PIN, UVOUT, REF_3V3,
-                  dustPin, dustLED, micPin, NO2_SENSOR_PIN, DHTPIN, buzzPin);
-    Serial.printf("[INIT]       LED g=%d o=%d r=%d | "
-                  "GPS RX=%d TX=%d | IMU RX=%d TX=%d\n",
-                  ledPin11, ledPin12, ledPin13,
-                  GPS_RX_PIN, GPS_TX_PIN, IMU_RX_PIN, IMU_TX_PIN);
-  }
+  // ── BlynkTimer intervals ──────────────────────────────────────────────────
+  blynkTimer.setInterval(BLYNK_SEND_FAST_MS, blynkSendFast);
+  blynkTimer.setInterval(BLYNK_SEND_SLOW_MS, blynkSendSlow);
 
-  engMsgf("Setup OK v1.2 — divider %.0f+%.0fkΩ scale=%.3f Vout@5V=%.3fV",
-          R_DIVIDER_SERIES, R_DIVIDER_GND, divider_scale, vout_at_5v);
-
-  xTaskCreatePinnedToCore(blynkTask,  "blynkTask",  8192, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(sensorTask, "sensorTask", 8192, NULL, 1, NULL, 1);
+  engMsg("Setup OK v2.2 — I2S harmonized to i2s_std driver");
+  setupDone = true;
 }
 
-// loop() is intentionally empty — all work runs in FreeRTOS tasks.
-void loop() { vTaskDelete(NULL); }
+// ============================================================================
+// LOOP — Core 1: WiFi + Blynk only
+// All sensor I/O is in sensorTask (Core 0).
+// Blynk.run() in loop() is the critical design decision that prevents
+// the IWDT crash seen in all v1.x versions (where Blynk ran in a FreeRTOS
+// task and Blynk.connect(timeout) spun for 5s blocking interrupt handlers).
+// ============================================================================
+
+void loop()
+{
+  if (WIFI) {
+    if (WiFi.status() == WL_CONNECTED) {
+      Blynk.run();
+      blynkTimer.run();
+      if (xSemaphoreTake(dataMutex,pdMS_TO_TICKS(5))==pdTRUE) {
+        sd.status_flags|=STATUS_WIFI_OK; xSemaphoreGive(dataMutex);
+      }
+    } else {
+      if (xSemaphoreTake(dataMutex,pdMS_TO_TICKS(5))==pdTRUE) {
+        sd.status_flags&=~STATUS_WIFI_OK; xSemaphoreGive(dataMutex);
+      }
+      if (millis()-lastWiFiCheck > WIFI_RECONNECT_MS) {
+        lastWiFiCheck=millis();
+        engMsg("WiFi: reconnect attempt");
+        Blynk.disconnect(); WiFi.disconnect(); delay(500);
+        wifiConnect();
+      }
+    }
+  }
+}
