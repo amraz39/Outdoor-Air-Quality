@@ -1,5 +1,5 @@
 // ============================================================================
-// Outdoor Air Quality Station — ESP32 Production Firmware v2.2
+// Outdoor Air Quality Station — ESP32 Production Firmware v2.3
 // Migrated & rewritten from original Arduino Mega + Esp8266EasyIoT (AM, 2017)
 //
 // ─── HARDWARE v2.0/2.1 ───────────────────────────────────────────────────────
@@ -119,6 +119,89 @@
 //   initINMP441() and readINMP441_dB() changed to use the new driver.
 //   The public behaviour (function signatures, return values, dB output
 //   range, SENSOR_UNAVAILABLE sentinel) is identical.
+//
+// ─── v2.3 CHANGES — GPS PPS + GPS/IMU INERTIAL NAVIGATION (DEAD RECKONING) ──
+//   1) GPS 1PPS (pulse-per-second) output wired to GPIO5 (free since DHT21
+//      was removed in v2.0) via a rising-edge interrupt. PPS gives a hard
+//      diagnostic of whether the GPS has a real timing lock (a GPS can
+//      output stale/repeated NMEA without a genuine fix; a clean ~1.000s
+//      PPS train is a much stronger lock indicator). Reported on Blynk V26.
+//
+//   2) New GY-BMI160 6-DOF IMU (I2C, shares the ENS160/AHT2x bus on
+//      GPIO21/22, address 0x69) driven with a minimal register-level driver
+//      (no external library dependency — BMI160 registers are simple and
+//      well documented, and a hand-rolled driver avoids adding another
+//      library that could collide with the ADC/I2S drivers the way v2.1/2.2
+//      had to work around). Provides raw gyro (dps) and accel (g) samples.
+//
+//   3) New function inertialNav() fuses GPS position (and, when available,
+//      GPS-derived speed+course from RMC/VTG) with BMI160 gyro/accel using
+//      a compact 4-state Extended Kalman Filter (state = East, North,
+//      Speed, Heading — a standard "2D ground-vehicle EKF" pattern widely
+//      used for exactly this GPS+MEMS-gyro dead-reckoning problem on
+//      resource-constrained MCUs). Design rationale, taken from common
+//      embedded GNSS/INS fusion practice:
+//        • Position is NOT double-integrated from the accelerometer.
+//          Double-integrating cheap MEMS accelerometer noise/bias is a
+//          well-known way to get position error that grows with t^2 —
+//          essentially unusable within seconds. Instead, velocity is
+//          treated as a slowly-varying state that is corrected directly
+//          by GPS (position deltas AND, when moving fast enough, GPS
+//          Doppler speed) and held constant between fixes.
+//        • Heading is propagated by integrating BMI160 gyro Z between GPS
+//          fixes (classic gyro dead-reckoning) and corrected by GPS course
+//          only when GPS speed exceeds INAV_MIN_COURSE_SPEED_MPS, because
+//          GPS course-over-ground is meaningless / noisy near zero speed.
+//        • Gyro bias is NOT estimated inside the main filter (that would
+//          need it to be observable, which a position/speed/heading-only
+//          GPS update does not cleanly provide). Instead it is calibrated
+//          separately using a Zero-velocity Update (ZUPT): whenever the
+//          accelerometer magnitude reads ~1g and the gyro reads ~0 dps for
+//          a sustained period, the platform is known to be stationary, so
+//          the live gyro Z reading during that window IS the bias — a
+//          textbook robust technique for MEMS gyro bias tracking that is
+//          far simpler and more reliable than trying to make the bias
+//          observable inside the position/velocity/heading EKF.
+//        • ZUPT also forces the velocity state back toward zero via a
+//          tiny-variance pseudo-measurement, preventing the classic
+//          "GPS jitter looks like slow drift" creep while parked.
+//      All matrix operations are hand-written fixed-size (4x4 max) loops —
+//      no dynamic allocation, no external linear-algebra library — so the
+//      filter is cheap enough to run at the user-configurable output rate
+//      (inav_update_hz, default 10 Hz) on Core 0 alongside every other
+//      sensor read without measurably affecting loop timing.
+//
+//   4) GPS-loss state machine (independent of, and reported alongside, the
+//      existing STATUS_GPS_FAULT bit which is unchanged):
+//        NO_FIX_YET  — no GPS fix has ever been received since boot;
+//                      inertialNav() is idle until an origin can be set.
+//        GPS_FIX     — a fresh GPS fix was just used to correct the filter.
+//        IMU_RECENT  — GPS fix missing, but fewer than inav_stale_after_
+//                      misses "expected" fixes (based on the adaptively
+//                      measured GPS update interval) have been missed.
+//                      Interpolated position is trusted almost as much as
+//                      a real fix.
+//        IMU_STALE   — GPS has been missing longer than that, but still
+//                      within inav_max_loss_minutes. Interpolation
+//                      continues but accuracy is explicitly flagged as
+//                      degrading.
+//        LOST        — GPS missing beyond inav_max_loss_minutes.
+//                      Interpolation is HALTED (position held, not
+//                      advanced further) until GPS reacquires, exactly as
+//                      requested, to avoid reporting arbitrarily-drifted
+//                      dead-reckoned position after a long outage.
+//      Engineering messages are emitted only on state TRANSITIONS (never
+//      every loop) so they don't drown out other diagnostics.
+//
+//   5) New Blynk virtual pins (all additive — no existing pin renumbered):
+//      V26 PPS locked (0/1)         V27 INAV state (0-4, see enum above)
+//      V28 INAV latitude            V29 INAV longitude
+//      V30 INAV altitude (m, held from last valid GPS fix — BMI160 has no
+//          barometer, so altitude is intentionally NOT dead-reckoned)
+//      V31 INAV speed (m/s)         V32 INAV heading (deg, 0=N, clockwise)
+//      These are entirely separate from the existing raw-GPS V12/V13 —
+//      V12/V13 still report exactly what they did before (raw GPS lat/lng,
+//      snapped to 0 or offset when no fix, as originally implemented).
 // ============================================================================
 
 #define BLYNK_HEARTBEAT 60
@@ -161,8 +244,15 @@
 #define IMUsensorThere true
 #define ENSsensorThere true    // ENS160 + AHT2x combo board
 #define INMPsensorThere true   // INMP441 I2S microphone
+#define BMI160sensorThere true // GY-BMI160 6-DOF IMU for inertial dead-reckoning (v2.3)
+#define PPSsensorThere    true // GPS 1PPS lock-status interrupt (v2.3)
 
 bool ten_mins_autoreset = false;
+
+// ─── INERTIAL NAVIGATION — user configurable (v2.3) ─────────────────────────
+float inav_update_hz          = 10.0f; // interpolation output frequency (Hz)
+int   inav_stale_after_misses = 3;     // consecutive missed GPS fixes before "stale" state
+int   inav_max_loss_minutes   = 5;     // stop interpolating after this many minutes without GPS
 
 #define SENSOR_UNAVAILABLE (-999.0f)
 
@@ -234,10 +324,79 @@ i2s_chan_handle_t inmp441_rx_handle = NULL;
 #define buzzPin    19    // Passive buzzer
 #define dustLED    18    // Sharp GP2Y1010 IR LED (active LOW)
 #define CO_PWM_PIN  4    // CO heater D2 PWM (direct to NPN base via 1kΩ on board)
+#define PPS_PIN     5    // GPS 1PPS output → ESP32 GPIO5 (free since DHT21 removed in v2.0)
+                          // 3.3V push-pull, direct wire, no divider needed
+
+// ─── PPS ISR state (v2.3) ────────────────────────────────────────────────────
+// Single-word volatiles are atomic on Xtensa — no critical section needed for
+// the simple diagnostic reads in ppsIsLocked().
+volatile unsigned long ppsLastMicros  = 0;
+volatile unsigned long ppsIntervalUs  = 0;
+volatile uint32_t      ppsPulseCount  = 0;
+
+void IRAM_ATTR ppsISR()
+{
+  unsigned long now = micros();
+  if (ppsLastMicros != 0) ppsIntervalUs = now - ppsLastMicros;
+  ppsLastMicros = now;
+  ppsPulseCount++;
+}
+
+// Locked = a pulse arrived within the last 2s AND its interval was within
+// ±10% of the expected 1.000s. Tolerant enough for jitter, tight enough to
+// reject a GPS that is powered but not yet timing-locked.
+bool ppsIsLocked()
+{
+  if (ppsLastMicros == 0) return false;
+  unsigned long sinceLast = micros() - ppsLastMicros;  // unsigned sub handles wrap
+  if (sinceLast > 2000000UL) return false;
+  unsigned long iv = ppsIntervalUs;
+  if (iv < 900000UL || iv > 1100000UL) return false;
+  return true;
+}
 
 // ─── LEDC ────────────────────────────────────────────────────────────────────
 #define LEDC_FREQ_CO 5000
 #define LEDC_RES_CO  8
+
+// ─── GY-BMI160 6-DOF IMU — I2C, shares bus with ENS160/AHT2x (v2.3) ─────────
+// Minimal register-level driver — no external library, avoids adding another
+// dependency that could collide with the ADC/I2S driver families (see v2.1/
+// v2.2 notes above for why that risk is taken seriously in this project).
+#define BMI160_ADDR         0x69   // SDO/SA0 pulled HIGH on the GY-BMI160 board
+#define BMI160_REG_CHIPID   0x00
+#define BMI160_REG_DATA     0x0C   // GYR_X_L .. ACC_Z_H, 12 bytes contiguous
+#define BMI160_REG_ACC_CONF  0x40
+#define BMI160_REG_ACC_RANGE 0x41
+#define BMI160_REG_GYR_CONF  0x42
+#define BMI160_REG_GYR_RANGE 0x43
+#define BMI160_REG_CMD       0x7E
+#define BMI160_CMD_SOFTRESET   0xB6
+#define BMI160_CMD_ACC_NORMAL  0x11
+#define BMI160_CMD_GYR_NORMAL  0x15
+#define BMI160_CHIPID_EXPECTED 0xD1
+#define BMI160_ACC_RANGE_G     4.0f    // ±4g   (ACC_RANGE=0x05)
+#define BMI160_GYR_RANGE_DPS   500.0f  // ±500dps (GYR_RANGE=0x02)
+
+// ─── INERTIAL NAV — EKF tuning constants (v2.3) ─────────────────────────────
+// State x = [E(m), N(m), v(m/s), heading(rad, 0=North, clockwise+)]
+#define EARTH_RADIUS_M         6371000.0f
+#define INAV_R_POS             25.0f     // GPS position meas. variance (m^2), ~5m std
+#define INAV_R_SPEED           0.25f     // GPS speed meas. variance (m/s)^2, ~0.5 m/s std
+#define INAV_R_HEADING         0.00762f  // GPS course meas. variance (rad^2), ~5deg std
+#define INAV_Q_POS             0.02f     // process noise, position (m^2/predict step)
+#define INAV_Q_SPEED           0.05f     // process noise, speed ((m/s)^2/predict step)
+#define INAV_Q_HEADING         0.000306f // process noise, heading (rad^2/step), ~1deg std
+#define INAV_ZUPT_ACCEL_TOL_G  0.03f     // |accel_mag - 1g| under this = "not accelerating"
+#define INAV_ZUPT_GYRO_TOL_DPS 2.0f      // |gyro| under this = "not rotating"
+#define INAV_ZUPT_DURATION_MS  500       // sustained stillness before ZUPT fires
+#define INAV_ZUPT_R_V          0.01f     // tight variance on the zero-velocity pseudo-measurement
+#define INAV_MIN_COURSE_SPEED_MPS 0.5f   // below this, GPS course is unreliable — skip heading update
+#define INAV_STATE_GPS_FIX     0
+#define INAV_STATE_IMU_RECENT  1
+#define INAV_STATE_IMU_STALE   2
+#define INAV_STATE_LOST        3
+#define INAV_STATE_NO_FIX_YET  4
 
 // ─── TIMEOUTS & INTERVALS ────────────────────────────────────────────────────
 #define GPS_TIMEOUT_MS        15000
@@ -301,6 +460,12 @@ struct SensorData {
   uint32_t status_flags;
   char     eng_msg[128];
   int      rand_num;
+  // v2.3 additions — additive only, nothing above this line changed
+  bool     pps_locked;
+  int      inav_state;                          // see INAV_STATE_* defines
+  double   inav_lat, inav_lng;                   // EKF-fused position
+  float    inav_alt;                             // held from last valid GPS fix (no baro on BMI160)
+  float    inav_speed_mps, inav_heading_deg;     // EKF-fused speed/heading
 };
 
 SensorData        sd;
@@ -337,6 +502,14 @@ unsigned long lastWiFiCheck = 0;
 long          countReset    = 0;
 bool          prevZeroVal   = false;
 float         SatGPS = 0, HDOP = 0;
+
+// ─── INERTIAL NAV — EKF state (v2.3) ────────────────────────────────────────
+float         inavX[4]    = {0,0,0,0};  // [E(m), N(m), v(m/s), heading(rad)]
+float         inavP[4][4] = {{0}};      // covariance, initialised on first GPS fix
+float         inavGyroBiasDps = 0.0f;   // gyro Z bias, calibrated via ZUPT
+unsigned long zuptStartMillis = 0;
+float         inavLastAlt = SENSOR_UNAVAILABLE;
+bool          bmi160Ready = false;
 
 BlynkTimer blynkTimer;
 
@@ -744,6 +917,383 @@ void readIMU()
 }
 
 // ============================================================================
+// GY-BMI160 6-DOF IMU — minimal I2C register-level driver (v2.3)
+// Used exclusively as the inertial source for inertialNav() below. The
+// existing JY-901 (UART, pre-fused Roll/Pitch/Yaw) is untouched and keeps
+// feeding V8-V11 exactly as before.
+// ============================================================================
+
+bool bmi160WriteReg(uint8_t reg, uint8_t val)
+{
+  Wire.beginTransmission(BMI160_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return (Wire.endTransmission() == 0);
+}
+
+bool bmi160ReadRegs(uint8_t reg, uint8_t* buf, uint8_t len)
+{
+  Wire.beginTransmission(BMI160_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;   // repeated start
+  uint8_t got = Wire.requestFrom((int)BMI160_ADDR, (int)len);
+  if (got != len) return false;
+  for (uint8_t i = 0; i < len; i++) buf[i] = Wire.read();
+  return true;
+}
+
+bool initBMI160()
+{
+  uint8_t chipId = 0;
+  if (!bmi160ReadRegs(BMI160_REG_CHIPID, &chipId, 1) || chipId != BMI160_CHIPID_EXPECTED) {
+    engMsgf("BMI160: chip ID 0x%02X (expected 0x%02X) — check wiring/address",
+            chipId, BMI160_CHIPID_EXPECTED);
+    return false;
+  }
+  bmi160WriteReg(BMI160_REG_CMD, BMI160_CMD_SOFTRESET);
+  delay(50);
+  // ODR=100Hz (0x08) | bandwidth=normal (0x02<<4=0x20) = 0x28, for both acc & gyro
+  bmi160WriteReg(BMI160_REG_ACC_CONF, 0x28);
+  bmi160WriteReg(BMI160_REG_ACC_RANGE, 0x05);   // ±4g
+  bmi160WriteReg(BMI160_REG_GYR_CONF, 0x28);
+  bmi160WriteReg(BMI160_REG_GYR_RANGE, 0x02);   // ±500 dps
+  bmi160WriteReg(BMI160_REG_CMD, BMI160_CMD_ACC_NORMAL);
+  delay(50);
+  bmi160WriteReg(BMI160_REG_CMD, BMI160_CMD_GYR_NORMAL);
+  delay(100);
+  engMsg("BMI160: init OK (±4g, ±500dps, 100Hz)");
+  return true;
+}
+
+// Returns physical units: gx/gy/gz in dps, ax/ay/az in g.
+bool bmi160ReadRaw(float& gx, float& gy, float& gz, float& ax, float& ay, float& az)
+{
+  uint8_t buf[12];
+  if (!bmi160ReadRegs(BMI160_REG_DATA, buf, 12)) return false;
+  int16_t rgx = (int16_t)((buf[1]<<8)|buf[0]);
+  int16_t rgy = (int16_t)((buf[3]<<8)|buf[2]);
+  int16_t rgz = (int16_t)((buf[5]<<8)|buf[4]);
+  int16_t rax = (int16_t)((buf[7]<<8)|buf[6]);
+  int16_t ray = (int16_t)((buf[9]<<8)|buf[8]);
+  int16_t raz = (int16_t)((buf[11]<<8)|buf[10]);
+  gx = rgx / 32768.0f * BMI160_GYR_RANGE_DPS;
+  gy = rgy / 32768.0f * BMI160_GYR_RANGE_DPS;
+  gz = rgz / 32768.0f * BMI160_GYR_RANGE_DPS;
+  ax = rax / 32768.0f * BMI160_ACC_RANGE_G;
+  ay = ray / 32768.0f * BMI160_ACC_RANGE_G;
+  az = raz / 32768.0f * BMI160_ACC_RANGE_G;
+  return true;
+}
+
+// ============================================================================
+// INERTIAL NAVIGATION — GPS + BMI160 4-state EKF (v2.3)
+// See the v2.3 CHANGES header comment block at the top of this file for the
+// full design rationale (why velocity isn't double-integrated from the
+// accelerometer, why heading uses gyro dead-reckoning + GPS-course
+// correction only above INAV_MIN_COURSE_SPEED_MPS, and why gyro bias is
+// calibrated via ZUPT instead of being a filter state).
+// ============================================================================
+
+float inavWrapAngle(float a)
+{
+  while (a >  (float)M_PI) a -= 2.0f*(float)M_PI;
+  while (a < -(float)M_PI) a += 2.0f*(float)M_PI;
+  return a;
+}
+
+// General 4x4 matrix inverse via Gauss-Jordan with partial pivoting.
+// Only used by the "full" GPS update (position+speed+heading, H=Identity),
+// which fires at most a few times per second — cost is negligible.
+bool mat4Inverse(const float M[4][4], float Inv[4][4])
+{
+  float A[4][8];
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < 4; j++) A[i][j] = M[i][j];
+    for (int j = 0; j < 4; j++) A[i][4+j] = (i==j) ? 1.0f : 0.0f;
+  }
+  for (int col = 0; col < 4; col++) {
+    int piv = col;
+    float maxAbs = fabsf(A[col][col]);
+    for (int r = col+1; r < 4; r++) {
+      if (fabsf(A[r][col]) > maxAbs) { maxAbs = fabsf(A[r][col]); piv = r; }
+    }
+    if (maxAbs < 1e-9f) return false;   // singular — caller should skip this update
+    if (piv != col) {
+      for (int k = 0; k < 8; k++) { float tmp=A[col][k]; A[col][k]=A[piv][k]; A[piv][k]=tmp; }
+    }
+    float d = A[col][col];
+    for (int k = 0; k < 8; k++) A[col][k] /= d;
+    for (int r = 0; r < 4; r++) {
+      if (r == col) continue;
+      float f = A[r][col];
+      if (f == 0.0f) continue;
+      for (int k = 0; k < 8; k++) A[r][k] -= f*A[col][k];
+    }
+  }
+  for (int i = 0; i < 4; i++)
+    for (int j = 0; j < 4; j++)
+      Inv[i][j] = A[i][4+j];
+  return true;
+}
+
+// Prediction step — nonlinear unicycle model, linearised via Jacobian F.
+// dt in seconds. gyroZ_dps is the RAW BMI160 gyro Z reading; bias is
+// subtracted here using the ZUPT-calibrated inavGyroBiasDps.
+void inavPredict(float dt, float gyroZ_dps)
+{
+  float yawRate = (gyroZ_dps - inavGyroBiasDps) * DEG_TO_RAD;  // rad/s
+  float psi = inavX[3];
+  float v   = inavX[2];
+  float s = sinf(psi), c = cosf(psi);
+
+  inavX[0] += v * s * dt;
+  inavX[1] += v * c * dt;
+  inavX[3]  = inavWrapAngle(psi + yawRate * dt);
+  // v (inavX[2]) held constant here — corrected only by GPS or ZUPT.
+
+  float F[4][4] = {
+    {1, 0,  s*dt,   v*c*dt},
+    {0, 1,  c*dt,  -v*s*dt},
+    {0, 0,  1,      0     },
+    {0, 0,  0,      1     }
+  };
+
+  float FP[4][4];
+  for (int i=0;i<4;i++) for (int j=0;j<4;j++) {
+    float acc=0; for (int k=0;k<4;k++) acc += F[i][k]*inavP[k][j];
+    FP[i][j]=acc;
+  }
+  float FPFt[4][4];
+  for (int i=0;i<4;i++) for (int j=0;j<4;j++) {
+    float acc=0; for (int k=0;k<4;k++) acc += FP[i][k]*F[j][k];  // F^T[k][j]=F[j][k]
+    FPFt[i][j]=acc;
+  }
+  static const float Q[4] = {INAV_Q_POS, INAV_Q_POS, INAV_Q_SPEED, INAV_Q_HEADING};
+  for (int i=0;i<4;i++) for (int j=0;j<4;j++)
+    inavP[i][j] = FPFt[i][j] + ((i==j) ? Q[i] : 0.0f);
+}
+
+// GPS update — position only (H = [[1,0,0,0],[0,1,0,0]]). Hand-expanded
+// 2-row special case instead of a generic H matrix — cheaper and clearer.
+void inavKalmanUpdatePos(float zE, float zN, float rPos)
+{
+  float yE = zE - inavX[0];
+  float yN = zN - inavX[1];
+  float S00 = inavP[0][0] + rPos, S01 = inavP[0][1];
+  float S10 = inavP[1][0],        S11 = inavP[1][1] + rPos;
+  float det = S00*S11 - S01*S10;
+  if (fabsf(det) < 1e-9f) return;   // singular — skip this update
+  float invDet = 1.0f/det;
+  float Si00 =  S11*invDet, Si01 = -S01*invDet;
+  float Si10 = -S10*invDet, Si11 =  S00*invDet;
+
+  float K[4][2];
+  for (int i=0;i<4;i++) {
+    float PHt0 = inavP[i][0], PHt1 = inavP[i][1];
+    K[i][0] = PHt0*Si00 + PHt1*Si10;
+    K[i][1] = PHt0*Si01 + PHt1*Si11;
+  }
+  for (int i=0;i<4;i++) inavX[i] += K[i][0]*yE + K[i][1]*yN;
+  inavX[3] = inavWrapAngle(inavX[3]);
+
+  float HP0[4], HP1[4];
+  for (int j=0;j<4;j++) { HP0[j]=inavP[0][j]; HP1[j]=inavP[1][j]; }
+  for (int i=0;i<4;i++) for (int j=0;j<4;j++)
+    inavP[i][j] -= K[i][0]*HP0[j] + K[i][1]*HP1[j];
+}
+
+// GPS update — full observation (H = Identity4), used only when GPS speed
+// and course are both valid AND speed exceeds INAV_MIN_COURSE_SPEED_MPS.
+void inavKalmanUpdateFull(float zE, float zN, float zSpeed, float zHeadingRad,
+                           float rPos, float rSpeed, float rHeading)
+{
+  float y[4] = { zE - inavX[0], zN - inavX[1], zSpeed - inavX[2],
+                 inavWrapAngle(zHeadingRad - inavX[3]) };
+  float S[4][4];
+  for (int i=0;i<4;i++) for (int j=0;j<4;j++) S[i][j] = inavP[i][j];
+  S[0][0]+=rPos; S[1][1]+=rPos; S[2][2]+=rSpeed; S[3][3]+=rHeading;
+
+  float Sinv[4][4];
+  if (!mat4Inverse(S, Sinv)) return;   // singular — skip this update
+
+  float K[4][4];
+  for (int i=0;i<4;i++) for (int j=0;j<4;j++) {
+    float acc=0; for (int k=0;k<4;k++) acc += inavP[i][k]*Sinv[k][j];
+    K[i][j]=acc;
+  }
+  for (int i=0;i<4;i++) {
+    float dx=0; for (int j=0;j<4;j++) dx += K[i][j]*y[j];
+    inavX[i] += dx;
+  }
+  inavX[3] = inavWrapAngle(inavX[3]);
+
+  float KP[4][4];
+  for (int i=0;i<4;i++) for (int j=0;j<4;j++) {
+    float acc=0; for (int k=0;k<4;k++) acc += K[i][k]*inavP[k][j];
+    KP[i][j]=acc;
+  }
+  for (int i=0;i<4;i++) for (int j=0;j<4;j++) inavP[i][j] -= KP[i][j];
+}
+
+// Zero-velocity update (ZUPT) — the standard robust technique for keeping a
+// dead-reckoning filter from drifting while stationary, and for calibrating
+// gyro bias without needing it to be a filter state (see header rationale).
+void inavZUPT(float ax_g, float ay_g, float az_g, float gyroZ_dps)
+{
+  float accelMag = sqrtf(ax_g*ax_g + ay_g*ay_g + az_g*az_g);
+  bool stationary = (fabsf(accelMag - 1.0f) < INAV_ZUPT_ACCEL_TOL_G) &&
+                     (fabsf(gyroZ_dps) < INAV_ZUPT_GYRO_TOL_DPS);
+  unsigned long now = millis();
+  if (!stationary) { zuptStartMillis = 0; return; }
+  if (zuptStartMillis == 0) { zuptStartMillis = now; return; }
+  if (now - zuptStartMillis < INAV_ZUPT_DURATION_MS) return;
+
+  // Gyro bias: slow EMA toward the current (true-rate-is-zero) reading.
+  inavGyroBiasDps = 0.98f*inavGyroBiasDps + 0.02f*gyroZ_dps;
+
+  // Zero-velocity pseudo-measurement — 1-D Kalman update on state[2] only.
+  float y = 0.0f - inavX[2];
+  float S = inavP[2][2] + INAV_ZUPT_R_V;
+  if (S <= 1e-9f) return;
+  float K[4];
+  for (int i=0;i<4;i++) K[i] = inavP[i][2]/S;
+  for (int i=0;i<4;i++) inavX[i] += K[i]*y;
+  float P2row[4]; for (int j=0;j<4;j++) P2row[j]=inavP[2][j];
+  for (int i=0;i<4;i++) for (int j=0;j<4;j++) inavP[i][j] -= K[i]*P2row[j];
+}
+
+// Master entry point — called once per sensorTask loop iteration. Internally
+// rate-limits its own prediction step to inav_update_hz; GPS updates run
+// whenever TinyGPS++ reports a fresh location this cycle (no rate limiting
+// needed there — GPS naturally updates at its own, much lower, rate).
+void inertialNav()
+{
+  static bool          originSet            = false;
+  static double        lat0 = 0, lon0 = 0;
+  static float         cosLat0              = 1.0f;
+  static int           lastInavState        = -1;
+  static unsigned long lastGoodFixMillis    = 0;
+  static unsigned long gpsFixIntervalMsLoc  = 1000;  // adaptive nominal GPS interval
+  static unsigned long lastPredictMillis    = 0;
+  static unsigned long lastBmiRetryMillis   = 0;
+
+  if (!bmi160Ready) {
+    if (millis() - lastBmiRetryMillis > 10000) {
+      lastBmiRetryMillis = millis();
+      bmi160Ready = initBMI160();
+    }
+    if (!bmi160Ready) return;   // no inertial source this cycle — try again later
+  }
+
+  float gx,gy,gz,ax,ay,az;
+  if (!bmi160ReadRaw(gx,gy,gz,ax,ay,az)) return;   // I2C hiccup — skip this cycle
+
+  inavZUPT(ax,ay,az,gz);
+
+  bool newFix = gps.location.isUpdated();   // consumes TinyGPS++'s own flag
+  int state;
+
+  if (newFix && gps.location.isValid()) {
+    double glat = gps.location.lat();
+    double glon = gps.location.lng();
+
+    if (!originSet) {
+      lat0 = glat; lon0 = glon; cosLat0 = cosf((float)lat0 * DEG_TO_RAD);
+      inavX[0]=0; inavX[1]=0; inavX[2]=0; inavX[3]=0;
+      memset(inavP, 0, sizeof(inavP));
+      inavP[0][0]=inavP[1][1]=100.0f;      // ~10m initial position uncertainty
+      inavP[2][2]=4.0f;                     // ~2 m/s initial speed uncertainty
+      inavP[3][3]=(float)(M_PI*M_PI);       // heading fully unknown initially
+      originSet = true;
+      engMsg("INAV: origin set from first GPS fix");
+    }
+
+    if (lastGoodFixMillis > 0) {
+      unsigned long dtFix = millis() - lastGoodFixMillis;
+      if (dtFix > 50 && dtFix < 10000)
+        gpsFixIntervalMsLoc = (unsigned long)(0.7f*gpsFixIntervalMsLoc + 0.3f*dtFix);
+    }
+    lastGoodFixMillis = millis();
+
+    float zE = (float)((glon - lon0) * DEG_TO_RAD * cosLat0 * EARTH_RADIUS_M);
+    float zN = (float)((glat - lat0) * DEG_TO_RAD * EARTH_RADIUS_M);
+
+    bool haveSpeedCourse = gps.speed.isValid() && gps.course.isValid();
+    float gpsSpeedMps = haveSpeedCourse ? (float)gps.speed.mps() : 0.0f;
+
+    if (haveSpeedCourse && gpsSpeedMps > INAV_MIN_COURSE_SPEED_MPS) {
+      float zHeading = (float)gps.course.deg() * DEG_TO_RAD;
+      inavKalmanUpdateFull(zE, zN, gpsSpeedMps, zHeading,
+                            INAV_R_POS, INAV_R_SPEED, INAV_R_HEADING);
+    } else {
+      inavKalmanUpdatePos(zE, zN, INAV_R_POS);
+    }
+    state = INAV_STATE_GPS_FIX;
+  }
+  else if (!originSet) {
+    state = INAV_STATE_NO_FIX_YET;
+  }
+  else {
+    unsigned long sinceFix = millis() - lastGoodFixMillis;
+    unsigned long missedEq = sinceFix / gpsFixIntervalMsLoc;
+    unsigned long maxLossMs = (unsigned long)inav_max_loss_minutes * 60000UL;
+    if      (sinceFix >= maxLossMs)                    state = INAV_STATE_LOST;
+    else if ((int)missedEq >= inav_stale_after_misses) state = INAV_STATE_IMU_STALE;
+    else                                                state = INAV_STATE_IMU_RECENT;
+  }
+
+  // Prediction — rate-limited to the user-configured inav_update_hz. Frozen
+  // entirely once LOST, exactly as requested: no further advancement of the
+  // dead-reckoned position after the max-loss timeout.
+  if (originSet && state != INAV_STATE_LOST) {
+    unsigned long now = millis();
+    unsigned long periodMs = (unsigned long)(1000.0f / max(1.0f, inav_update_hz));
+    if (lastPredictMillis == 0) lastPredictMillis = now;
+    if (now - lastPredictMillis >= periodMs) {
+      float dt = (now - lastPredictMillis) / 1000.0f;
+      inavPredict(dt, gz);
+      lastPredictMillis = now;
+    }
+  }
+
+  if (state != lastInavState) {
+    switch (state) {
+      case INAV_STATE_NO_FIX_YET: engMsg("INAV: waiting for first GPS fix"); break;
+      case INAV_STATE_GPS_FIX:    engMsg("INAV: position acquired by GPS"); break;
+      case INAV_STATE_IMU_RECENT: engMsg("INAV: GPS gap — interpolating from recent GPS+IMU"); break;
+      case INAV_STATE_IMU_STALE:  engMsgf("INAV: GPS lost >=%d fixes — interpolating (stale baseline)",
+                                           inav_stale_after_misses); break;
+      case INAV_STATE_LOST:       engMsgf("INAV: GPS lost >%d min — interpolation stopped, holding position",
+                                           inav_max_loss_minutes); break;
+    }
+    lastInavState = state;
+  }
+
+  double outLat = lat0, outLon = lon0;
+  float  outAlt = SENSOR_UNAVAILABLE, outSpeed = 0, outHeadingDeg = 0;
+  if (originSet) {
+    outLat = lat0 + (inavX[1] / EARTH_RADIUS_M) * RAD_TO_DEG;
+    outLon = lon0 + (inavX[0] / (EARTH_RADIUS_M * cosLat0)) * RAD_TO_DEG;
+    outSpeed = inavX[2];
+    outHeadingDeg = inavX[3] * RAD_TO_DEG;
+    if (outHeadingDeg < 0) outHeadingDeg += 360.0f;
+    if (gps.altitude.isValid()) inavLastAlt = (float)gps.altitude.meters();
+    outAlt = inavLastAlt;   // held from last valid GPS fix — no IMU altitude dead-reckoning
+  }
+
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    sd.pps_locked      = ppsIsLocked();
+    sd.inav_state      = state;
+    sd.inav_lat        = outLat;
+    sd.inav_lng        = outLon;
+    sd.inav_alt        = outAlt;
+    sd.inav_speed_mps  = outSpeed;
+    sd.inav_heading_deg= outHeadingDeg;
+    xSemaphoreGive(dataMutex);
+  }
+}
+
+// ============================================================================
 // SENSOR TASK — Core 0 (pro_cpu)
 // All blocking sensor I/O lives here, away from Blynk on Core 1.
 // Uses vTaskDelay for all waits so FreeRTOS tick ISR is never starved.
@@ -845,6 +1395,11 @@ void sensorTask(void* pvParam)
       }
     }
 
+    // ── Inertial navigation — GPS + BMI160 EKF (v2.3) ────────────────────────
+    // Runs independently of JY-901 above; writes sd.inav_* and sd.pps_locked
+    // under its own short mutex hold (same pattern as tickCO()/readIMU()).
+    if (BMI160sensorThere) inertialNav();
+
     // ── LED control ──────────────────────────────────────────────────────────
     float cppm = last_CO_ppm;
     digitalWrite(ledPin11, (cppm>=0 && cppm<=10) ? HIGH : LOW);
@@ -937,6 +1492,14 @@ void blynkSendFast()
   safeWriteI(V20, (int)snap.status_flags);
   safeWriteI(V21, snap.rssi);
   safeWriteI(V22, (int)snap.wifi_qual);
+  // v2.3: PPS lock + inertial-nav fused position/speed/heading
+  safeWriteI(V26, snap.pps_locked ? 1 : 0);
+  safeWriteI(V27, snap.inav_state);
+  safeWrite (V28, snap.inav_lat);
+  safeWrite (V29, snap.inav_lng);
+  safeWrite (V30, snap.inav_alt);
+  safeWrite (V31, snap.inav_speed_mps);
+  safeWrite (V32, snap.inav_heading_deg);
 }
 
 void blynkSendSlow()
@@ -1002,7 +1565,7 @@ bool wifiConnect()
 void setup()
 {
   Serial.begin(115200);
-  Serial.println("\n[INIT] Air Quality Station ESP32 v2.2");
+  Serial.println("\n[INIT] Air Quality Station ESP32 v2.3");
   Serial.printf("[INIT] ten_mins_autoreset = %s\n", ten_mins_autoreset ? "ON":"OFF");
 
   uint8_t mac[6];
@@ -1024,6 +1587,11 @@ void setup()
   sd.uvi=sd.sound_db=sd.dust_mg=SENSOR_UNAVAILABLE;
   sd.temp=sd.hum=SENSOR_UNAVAILABLE;
   sd.angle[0]=sd.angle[1]=sd.angle[2]=sd.imu_temp=SENSOR_UNAVAILABLE;
+  // v2.3: pre-fill inertial-nav fields until origin is set from first GPS fix
+  sd.pps_locked = false;
+  sd.inav_state = INAV_STATE_NO_FIX_YET;
+  sd.inav_lat = sd.inav_lng = SENSOR_UNAVAILABLE;
+  sd.inav_alt = sd.inav_speed_mps = sd.inav_heading_deg = SENSOR_UNAVAILABLE;
 
   // ── GPIO setup ───────────────────────────────────────────────────────────
   pinMode(ledPin11,OUTPUT); digitalWrite(ledPin11,LOW);
@@ -1064,6 +1632,20 @@ void setup()
   if (ENSsensorThere) {
     ensReady = initENS();
     if (!ensReady) Serial.println("[WARN] ENS160/AHT2x not detected — will retry in sensorTask");
+  }
+
+  // ── GY-BMI160 init (v2.3) — shares I2C bus with ENS160/AHT2x ─────────────
+  // If absent at boot, inertialNav() retries every 10s from sensorTask.
+  if (BMI160sensorThere) {
+    bmi160Ready = initBMI160();
+    if (!bmi160Ready) Serial.println("[WARN] BMI160 not detected — will retry in sensorTask");
+  }
+
+  // ── GPS 1PPS interrupt (v2.3) ─────────────────────────────────────────────
+  if (PPSsensorThere) {
+    pinMode(PPS_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(PPS_PIN), ppsISR, RISING);
+    Serial.println("[INIT] GPS PPS interrupt attached (GPIO5)");
   }
 
   // ── CO LEDC PWM ──────────────────────────────────────────────────────────
@@ -1127,7 +1709,7 @@ void setup()
   blynkTimer.setInterval(BLYNK_SEND_FAST_MS, blynkSendFast);
   blynkTimer.setInterval(BLYNK_SEND_SLOW_MS, blynkSendSlow);
 
-  engMsg("Setup OK v2.2 — I2S harmonized to i2s_std driver");
+  engMsg("Setup OK v2.3 — PPS + BMI160 inertial nav added");
   setupDone = true;
 }
 
