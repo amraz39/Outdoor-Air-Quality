@@ -23,3 +23,4 @@ blynk_history_*.csv
 blynk_history_*.txt
 MQ-7*.txt
 HOW_TO_*.txt
+.theia/

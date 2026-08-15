@@ -206,7 +206,7 @@
 
 #define BLYNK_HEARTBEAT 60
 
-#include "secrets.h"
+#include "secrets.h"  // cannot use <> which is for installed libraries
 // secrets.h: #define WIFI_SSID / WIFI_PASS / BLYNK_AUTH / BLYNK_SERVER / BLYNK_PORT
 #define BLYNK_PRINT Serial
 #include <WiFi.h>
@@ -216,7 +216,8 @@
 #include <Wire.h>
 // ENS160: use ScioSense_ENS160 library (NOT Adafruit_ENS160 which does not exist)
 // Install: https://github.com/sciosense/ENS160_driver  or via Library Manager
-#include "ScioSense_ENS160.h"
+// This library is deprecated and no longer maintained. Kindly refer to its successor: ens16x-arduino.
+#include <ScioSense_ENS160.h>
 #include <Adafruit_AHTX0.h>      // AHT20/AHT21 temp+hum — install: Adafruit AHTX0
 #include <Adafruit_SSD1306.h>
 #include <driver/i2s_std.h>      // ESP32 NEW standard I2S driver for INMP441 (v2.2)
@@ -237,7 +238,7 @@
 //   uses the new driver and can be initialised in ANY order relative to ADC.
 
 // ─── FEATURE SWITCHES ────────────────────────────────────────────────────────
-#define DEBUGON        false
+#define DEBUGON        false    // Default = false
 #define DISPLAYON      false
 #define WIFI           true
 #define COsensorThere  true
@@ -572,7 +573,7 @@ void buzzerTone(uint16_t frequency, uint16_t durationMs)
   ledcDetach(buzzPin);
 }
 
-void safeWrite(int vpin, float val)        { Blynk.virtualWrite(vpin, val); delay(VWRITE_GAP_MS); }
+void safeWrite(int vpin, double val)       { Blynk.virtualWrite(vpin, val); delay(VWRITE_GAP_MS); }
 void safeWriteI(int vpin, int val)         { Blynk.virtualWrite(vpin, val); delay(VWRITE_GAP_MS); }
 void safeWriteS(int vpin, const char* val) { Blynk.virtualWrite(vpin, val); delay(VWRITE_GAP_MS); }
 
@@ -595,6 +596,27 @@ void feedGPS()
   while (millis() - t < GPS_FEED_MS) {
     while (gps_serial.available()) gps.encode(gps_serial.read());
     taskYIELD();
+  }
+
+  // GPS DEBUG ONLY — no effect on GPS processing or normal operation.
+  if (DEBUGON) {
+    static unsigned long lastGPSDebug = 0;
+    if (millis() - lastGPSDebug >= 5000) {
+      lastGPSDebug = millis();
+      Serial.printf("[GPS DEBUG] chars=%lu sats=%lu hdop=%.2f location=%s age=%lu ms\n",
+                    gps.charsProcessed(),
+                    gps.satellites.value(),
+                    gps.hdop.value()/100.0f,
+                    gps.location.isValid() ? "VALID" : "INVALID",
+                    gps.location.age());
+      Serial.printf("[GPS DEBUG] lat=%.6f lng=%.6f fix=%s PPS=%d\n",
+                    gps.location.isValid() ? gps.location.lat() : 0.0,
+                    gps.location.isValid() ? gps.location.lng() : 0.0,
+                    (gps.location.isValid() &&
+                     gps.location.age() < GPS_TIMEOUT_MS &&
+                     gps.satellites.value() >= 4) ? "VALID" : "INVALID",
+                    ppsIsLocked() ? 1 : 0);
+    }
   }
 }
 
