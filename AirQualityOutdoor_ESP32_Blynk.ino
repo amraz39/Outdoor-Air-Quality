@@ -1,5 +1,5 @@
 // ============================================================================
-// Outdoor Air Quality Station — ESP32 Production Firmware v2.3
+// Outdoor Air Quality Station — ESP32 Production Firmware v2.4
 // Migrated & rewritten from original Arduino Mega + Esp8266EasyIoT (AM, 2017)
 //
 // ─── HARDWARE v2.0/2.1 ───────────────────────────────────────────────────────
@@ -38,8 +38,8 @@
 //   GPIO22    — I2C SCL (ENS160+AHT2x)
 //   GPIO13    — GPS UART1 RX ← ATGM336H TX  [moved from 22 to free I2C SCL]
 //   GPIO23    — GPS UART1 TX → ATGM336H RX
-//   GPIO16    — IMU UART2 RX ← JY-901 TX
-//   GPIO17    — IMU UART2 TX → JY-901 RX
+//   GPIO16    — [SUPERSEDED v2.4] was JY-901 UART2 RX — now free/unused
+//   GPIO17    — [SUPERSEDED v2.4] was JY-901 UART2 TX — now free/unused
 //   GPIO25    — INMP441 I2S SCK (BCLK)
 //   GPIO26    — INMP441 I2S WS  (LRCLK)  [ADC2 output only — no WiFi ADC conflict]
 //   GPIO33    — INMP441 I2S SD  (data in) [freed from NO2 analogue]
@@ -202,11 +202,41 @@
 //      These are entirely separate from the existing raw-GPS V12/V13 —
 //      V12/V13 still report exactly what they did before (raw GPS lat/lng,
 //      snapped to 0 or offset when no fix, as originally implemented).
+//
+// ─── v2.4 CHANGES — BMI160 REPLACES JY-901 ENTIRELY [SUPERSEDES v2.3] ───────
+//   JY-901/WT901 (UART2, GPIO16/17) has been removed completely. All earlier
+//   references to it in this file (the v2.0 "KEPT" list, the v2.3 changelog
+//   text saying "existing JY-901 ... is untouched", the old PIN MAP entries
+//   for GPIO16/17) are now historical — BMI160 is the only IMU in the system.
+//   GPIO16/GPIO17 are free again (no longer used for anything).
+//
+//   BMI160 now does double duty:
+//     1) Still the sole inertial source for inertialNav() (unchanged EKF).
+//     2) ALSO now feeds V8 Roll / V9 Pitch / V10 Yaw / V11 IMU temperature —
+//        the job JY-901's onboard fusion used to do — via a lightweight
+//        complementary filter computed right here, since raw BMI160 has no
+//        onboard sensor fusion of its own:
+//          • Roll/Pitch: classic 98/2 complementary filter — gyro-integrated
+//            angle corrected toward the gravity-vector accelerometer angle
+//            each cycle. Gravity gives an absolute, non-drifting reference
+//            for these two axes, which is why a simple complementary filter
+//            (rather than a full AHRS) is sufficient and cheap here.
+//          • Yaw: BMI160 has no magnetometer, so gyro-only yaw would drift
+//            unboundedly. Rather than duplicate a second yaw estimator,
+//            V10 simply reports the SAME heading state (inavX[3]) already
+//            being maintained and GPS-corrected inside inertialNav() — one
+//            state, two consumers, no drift, no extra code.
+//          • IMU temperature: read from BMI160's internal die-temperature
+//            registers (0x20/0x21) — informational only, expect it to read
+//            a few degrees above ambient due to self-heating.
+//     STATUS_IMU_OK / STATUS_IMU_STUCK now reflect BMI160 I2C read health
+//     (a failed/absent BMI160 read) instead of JY-901 UART frame timeout —
+//     same two status bits, same meaning to anything consuming V20.
 // ============================================================================
 
 #define BLYNK_HEARTBEAT 60
 
-#include "secrets.h"  // cannot use <> which is for installed libraries
+#include "secrets.h"
 // secrets.h: #define WIFI_SSID / WIFI_PASS / BLYNK_AUTH / BLYNK_SERVER / BLYNK_PORT
 #define BLYNK_PRINT Serial
 #include <WiFi.h>
@@ -216,8 +246,7 @@
 #include <Wire.h>
 // ENS160: use ScioSense_ENS160 library (NOT Adafruit_ENS160 which does not exist)
 // Install: https://github.com/sciosense/ENS160_driver  or via Library Manager
-// This library is deprecated and no longer maintained. Kindly refer to its successor: ens16x-arduino.
-#include <ScioSense_ENS160.h>
+#include "ScioSense_ENS160.h"
 #include <Adafruit_AHTX0.h>      // AHT20/AHT21 temp+hum — install: Adafruit AHTX0
 #include <Adafruit_SSD1306.h>
 #include <driver/i2s_std.h>      // ESP32 NEW standard I2S driver for INMP441 (v2.2)
@@ -238,11 +267,13 @@
 //   uses the new driver and can be initialised in ANY order relative to ADC.
 
 // ─── FEATURE SWITCHES ────────────────────────────────────────────────────────
-#define DEBUGON        false    // Default = false
+#define DEBUGON        false
 #define DISPLAYON      false
 #define WIFI           true
 #define COsensorThere  true
-#define IMUsensorThere true
+// [SUPERSEDED v2.4] IMUsensorThere (JY-901 UART) removed. BMI160sensorThere
+// below now gates the ONLY IMU in the system — both inertial nav AND the
+// Roll/Pitch/Yaw/temp feeding V8-V11.
 #define ENSsensorThere true    // ENS160 + AHT2x combo board
 #define INMPsensorThere true   // INMP441 I2S microphone
 #define BMI160sensorThere true // GY-BMI160 6-DOF IMU for inertial dead-reckoning (v2.3)
@@ -278,10 +309,9 @@ Adafruit_SSD1306 display(128, 64, &Wire, OLED_RESET);
 HardwareSerial gps_serial(1);
 TinyGPSPlus    gps;
 
-// ─── IMU — JY-901 UART2 GPIO16(RX)/GPIO17(TX) ───────────────────────────────
-#define IMU_RX_PIN 16
-#define IMU_TX_PIN 17
-HardwareSerial imu_serial(2);
+// [SUPERSEDED v2.4] JY-901 UART2 (GPIO16/17) removed entirely — BMI160 (I2C,
+// declared below near the ENS160/AHT2x section) is now the only IMU.
+// GPIO16/GPIO17 are free.
 
 // ─── ENS160 + AHT2x — I2C GPIO21(SDA)/GPIO22(SCL) ──────────────────────────
 // ScioSense_ENS160 API:
@@ -367,6 +397,7 @@ bool ppsIsLocked()
 #define BMI160_ADDR         0x69   // SDO/SA0 pulled HIGH on the GY-BMI160 board
 #define BMI160_REG_CHIPID   0x00
 #define BMI160_REG_DATA     0x0C   // GYR_X_L .. ACC_Z_H, 12 bytes contiguous
+#define BMI160_REG_TEMP     0x20   // die temperature, 2 bytes (v2.4, feeds V11)
 #define BMI160_REG_ACC_CONF  0x40
 #define BMI160_REG_ACC_RANGE 0x41
 #define BMI160_REG_GYR_CONF  0x42
@@ -482,13 +513,14 @@ byte          co_duty           = 255; // closed-loop duty output
 float         sensor_base_resistance_kOhm;
 float         sensor_100ppm_CO_resistance_kOhm;
 
-// ─── IMU ─────────────────────────────────────────────────────────────────────
-unsigned char Re_buf[12];
-int           imu_counter  = 0;
-unsigned long lastIMUframe = 0;
-float         angle[3]     = {0,0,0};
-float         imuT         = 0;
-const float   tempComp     = -7.2f;
+// ─── IMU — BMI160 fusion state (v2.4, replaces JY-901) ──────────────────────
+// angle[3] = Roll, Pitch, Yaw (deg). Roll/Pitch from complementary filter,
+// Yaw mirrors the EKF heading state (inavX[3]) — see inertialNav().
+// imuT = BMI160 die temperature (°C).
+float         angle[3]         = {0,0,0};
+float         imuT             = 0;
+unsigned long lastBmiOkMillis  = 0;   // last successful BMI160 read, for stuck detection
+unsigned long lastFusionMillis = 0;   // for complementary filter dt
 
 // ─── ENS160 / AHT2x state ────────────────────────────────────────────────────
 int           ens_fail_count = 0;
@@ -890,58 +922,11 @@ void tickCO()
 }
 
 // ============================================================================
-// IMU — JY-901 (unchanged 0x55 framed protocol)
-// ============================================================================
-
-bool pollIMU()
-{
-  while (imu_serial.available()) {
-    unsigned char b = (unsigned char)imu_serial.read();
-    if (imu_counter == 0 && b != 0x55) continue;
-    Re_buf[imu_counter++] = b;
-    if (imu_counter == 11) {
-      imu_counter = 0;
-      if (Re_buf[0]==0x55 && Re_buf[1]==0x53) {
-        angle[0] = (short((Re_buf[3]<<8)|Re_buf[2])) / 32768.0f * 180.0f;
-        angle[1] = (short((Re_buf[5]<<8)|Re_buf[4])) / 32768.0f * 180.0f;
-        angle[2] = (short((Re_buf[7]<<8)|Re_buf[6])) / 32768.0f * 180.0f;
-        imuT = ((short((Re_buf[9]<<8)|Re_buf[8])) / 340.0f + 36.25f) + tempComp;
-        lastIMUframe = millis();
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-void readIMU()
-{
-  unsigned long start = millis();
-  bool got = false;
-  while (millis() - start < IMU_POLL_MS) { if (pollIMU()) { got=true; break; } taskYIELD(); }
-  bool stuck = (lastIMUframe > 0 && millis()-lastIMUframe > IMU_TIMEOUT_MS);
-  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-    if (got) {
-      sd.angle[0]=angle[0]; sd.angle[1]=angle[1]; sd.angle[2]=angle[2];
-      sd.imu_temp=imuT; sd.imu_ok=true;
-      sd.status_flags |= STATUS_IMU_OK;
-      sd.status_flags &= ~STATUS_IMU_STUCK;
-    }
-    if (stuck) {
-      sd.angle[0]=sd.angle[1]=sd.angle[2]=sd.imu_temp=SENSOR_UNAVAILABLE;
-      sd.imu_ok=false;
-      sd.status_flags &= ~STATUS_IMU_OK;
-      sd.status_flags |= STATUS_IMU_STUCK;
-    }
-    xSemaphoreGive(dataMutex);
-  }
-  if (stuck) engMsgf("IMU STUCK: no frame for %lus", (millis()-lastIMUframe)/1000);
-}
-
-// ============================================================================
-// GY-BMI160 6-DOF IMU — minimal I2C register-level driver (v2.3)
-// Used exclusively as the inertial source for inertialNav() below. The
-// existing JY-901 (UART, pre-fused Roll/Pitch/Yaw) is untouched and keeps
+// GY-BMI160 6-DOF IMU — minimal I2C register-level driver
+// [SUPERSEDED v2.4] JY-901 (UART, pre-fused Roll/Pitch/Yaw) has been removed
+// entirely. BMI160 is now the ONLY IMU — its raw gyro/accel feed both
+// inertialNav() (EKF dead-reckoning) AND, via a complementary filter inside
+// inertialNav() itself, the Roll/Pitch/Yaw/temp values sent to V8-V11.
 // feeding V8-V11 exactly as before.
 // ============================================================================
 
@@ -1198,19 +1183,53 @@ void inertialNav()
   static unsigned long gpsFixIntervalMsLoc  = 1000;  // adaptive nominal GPS interval
   static unsigned long lastPredictMillis    = 0;
   static unsigned long lastBmiRetryMillis   = 0;
+  static bool          firstBmiAttempt      = true;   // bypass the 10s gate on the very first call
 
   if (!bmi160Ready) {
-    if (millis() - lastBmiRetryMillis > 10000) {
+    if (firstBmiAttempt || millis() - lastBmiRetryMillis > 10000) {
+      firstBmiAttempt = false;
       lastBmiRetryMillis = millis();
       bmi160Ready = initBMI160();
     }
-    if (!bmi160Ready) return;   // no inertial source this cycle — try again later
+    if (!bmi160Ready) return;   // device fully absent — nothing to do this cycle
   }
 
-  float gx,gy,gz,ax,ay,az;
-  if (!bmi160ReadRaw(gx,gy,gz,ax,ay,az)) return;   // I2C hiccup — skip this cycle
+  float gx=0,gy=0,gz=0,ax=0,ay=0,az=0;
+  bool bmiOk = bmi160ReadRaw(gx,gy,gz,ax,ay,az);
+  if (bmiOk) lastBmiOkMillis = millis();
+  // Unlike a hard I2C absence, a single failed read no longer aborts the whole
+  // cycle — GPS/EKF processing below still runs (gz=0 is a safe one-cycle
+  // fallback for the predict step). "Stuck" means sustained failure.
+  bool imuStuck = (lastBmiOkMillis > 0 && millis() - lastBmiOkMillis > IMU_TIMEOUT_MS);
 
-  inavZUPT(ax,ay,az,gz);
+  if (bmiOk) {
+    inavZUPT(ax,ay,az,gz);
+
+    // ── Roll/Pitch complementary filter (v2.4, replaces JY-901 fusion) ──────
+    // Gravity-vector accel angle blended with gyro-integrated angle at 98/2.
+    // Gravity gives an absolute, non-drifting reference for these two axes,
+    // so a simple complementary filter (not a full AHRS) is sufficient here.
+    unsigned long nowFusion = millis();
+    float dtFusion = (lastFusionMillis == 0) ? 0.0f
+                    : constrain((nowFusion - lastFusionMillis) / 1000.0f, 0.0f, 0.5f);
+    lastFusionMillis = nowFusion;
+
+    float rollAcc  = atan2f(ay, az) * RAD_TO_DEG;
+    float pitchAcc = atan2f(-ax, sqrtf(ay*ay + az*az)) * RAD_TO_DEG;
+    const float ALPHA = 0.98f;
+    angle[0] = ALPHA * (angle[0] + gx*dtFusion) + (1.0f-ALPHA) * rollAcc;   // Roll
+    angle[1] = ALPHA * (angle[1] + gy*dtFusion) + (1.0f-ALPHA) * pitchAcc;  // Pitch
+    // angle[2] (Yaw) is set further below, from the EKF heading state —
+    // BMI160 has no magnetometer, so free-integrating yaw here would drift
+    // unboundedly; the EKF heading is already GPS-corrected, so we reuse it.
+
+    // BMI160 die temperature (registers 0x20/0x21) — informational, feeds V11
+    uint8_t tbuf[2];
+    if (bmi160ReadRegs(BMI160_REG_TEMP, tbuf, 2)) {
+      int16_t rawT = (int16_t)((tbuf[1]<<8) | tbuf[0]);
+      imuT = (rawT == (int16_t)0x8000) ? SENSOR_UNAVAILABLE : (23.0f + rawT/512.0f);
+    }
+  }
 
   bool newFix = gps.location.isUpdated();   // consumes TinyGPS++'s own flag
   int state;
@@ -1299,20 +1318,38 @@ void inertialNav()
     outSpeed = inavX[2];
     outHeadingDeg = inavX[3] * RAD_TO_DEG;
     if (outHeadingDeg < 0) outHeadingDeg += 360.0f;
+    angle[2] = outHeadingDeg;   // Yaw for V10 mirrors the EKF heading — no separate drift source
     if (gps.altitude.isValid()) inavLastAlt = (float)gps.altitude.meters();
     outAlt = inavLastAlt;   // held from last valid GPS fix — no IMU altitude dead-reckoning
   }
 
   if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-    sd.pps_locked      = ppsIsLocked();
+    // sd.pps_locked is NOT written here anymore — it's updated unconditionally
+    // in sensorTask's main mutex block, since PPS is independent of BMI160
+    // and this function returns early whenever BMI160 isn't ready.
     sd.inav_state      = state;
     sd.inav_lat        = outLat;
     sd.inav_lng        = outLon;
     sd.inav_alt        = outAlt;
     sd.inav_speed_mps  = outSpeed;
     sd.inav_heading_deg= outHeadingDeg;
+    // v2.4: BMI160 also feeds V8-V11 (Roll/Pitch/Yaw/temp), replacing JY-901.
+    if (bmiOk && !imuStuck) {
+      sd.angle[0] = angle[0]; sd.angle[1] = angle[1]; sd.angle[2] = angle[2];
+      sd.imu_temp = imuT;
+      sd.imu_ok = true;
+      sd.status_flags |= STATUS_IMU_OK;
+      sd.status_flags &= ~STATUS_IMU_STUCK;
+    }
+    if (imuStuck) {
+      sd.angle[0]=sd.angle[1]=sd.angle[2]=sd.imu_temp=SENSOR_UNAVAILABLE;
+      sd.imu_ok = false;
+      sd.status_flags &= ~STATUS_IMU_OK;
+      sd.status_flags |= STATUS_IMU_STUCK;
+    }
     xSemaphoreGive(dataMutex);
   }
+  if (imuStuck) engMsgf("IMU STUCK: BMI160 no good read for %lus", (millis()-lastBmiOkMillis)/1000);
 }
 
 // ============================================================================
@@ -1408,19 +1445,16 @@ void sensorTask(void* pvParam)
     if (lastGPSdata>0 && millis()-lastGPSdata>GPS_TIMEOUT_MS)
       engMsgf("GPS FAULT: no data >%ds", GPS_TIMEOUT_MS/1000);
 
-    // ── IMU — JY-901 UART2 ───────────────────────────────────────────────────
-    if (IMUsensorThere) readIMU();
-    else {
-      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        sd.angle[0]=sd.angle[1]=sd.angle[2]=sd.imu_temp=SENSOR_UNAVAILABLE;
-        xSemaphoreGive(dataMutex);
-      }
-    }
-
-    // ── Inertial navigation — GPS + BMI160 EKF (v2.3) ────────────────────────
-    // Runs independently of JY-901 above; writes sd.inav_* and sd.pps_locked
-    // under its own short mutex hold (same pattern as tickCO()/readIMU()).
+    // ── Inertial navigation — GPS + BMI160 EKF (v2.4) ────────────────────────
+    // BMI160 is now the ONLY IMU. This one call handles everything: EKF
+    // dead-reckoning, PPS/lat/lng/speed/heading, AND (via the complementary
+    // filter inside inertialNav()) Roll/Pitch/Yaw/temp for sd.angle[]/
+    // sd.imu_temp — the job JY-901's readIMU() used to do, now gone.
     if (BMI160sensorThere) inertialNav();
+    else if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      sd.angle[0]=sd.angle[1]=sd.angle[2]=sd.imu_temp=SENSOR_UNAVAILABLE;
+      xSemaphoreGive(dataMutex);
+    }
 
     // ── LED control ──────────────────────────────────────────────────────────
     float cppm = last_CO_ppm;
@@ -1435,7 +1469,7 @@ void sensorTask(void* pvParam)
       display.printf("T:%.1fC H:%.0f%%\n", t, h);
       display.printf("TVOC:%.0fppb CO2:%.0f\n", tvoc, eco2);
       display.printf("%.6f\n%.6f\n", lat, lng);
-      if (IMUsensorThere && sd.imu_ok)
+      if (BMI160sensorThere && sd.imu_ok)
         display.printf("R/P/Y:%.0f/%.0f/%.0f\n", angle[0],angle[1],angle[2]);
       display.display();
     }
@@ -1455,6 +1489,11 @@ void sensorTask(void* pvParam)
       sd.temp=t; sd.hum=h; sd.ens_fault=(ens_fail_count>=ENS_MAX_FAILS);
       sd.lat=lat; sd.lng=lng; sd.hdop=HDOP; sd.sats=SatGPS; sd.gps_fix=gpsFix;
       sd.rand_num=random(1,10);
+      // BUGFIX: sd.pps_locked was previously only ever written inside
+      // inertialNav(), which returns early (before reaching that line)
+      // whenever BMI160 isn't ready. PPS hardware has nothing to do with
+      // BMI160, so it must be updated here unconditionally instead.
+      sd.pps_locked = ppsIsLocked();
       // Preserve WiFi/CO/IMU flags already set by their own functions; merge sensor flags
       sd.status_flags = (sd.status_flags &
         (STATUS_WIFI_OK|STATUS_IMU_OK|STATUS_IMU_STUCK|
@@ -1587,7 +1626,7 @@ bool wifiConnect()
 void setup()
 {
   Serial.begin(115200);
-  Serial.println("\n[INIT] Air Quality Station ESP32 v2.3");
+  Serial.println("\n[INIT] Air Quality Station ESP32 v2.4");
   Serial.printf("[INIT] ten_mins_autoreset = %s\n", ten_mins_autoreset ? "ON":"OFF");
 
   uint8_t mac[6];
@@ -1647,21 +1686,31 @@ void setup()
   analogSetPinAttenuation(DUST_ADC_PIN, ADC_11db);
   Serial.println("[INIT] ADC configured (12-bit, per-pin 11dB — no driver_ng conflict)");
 
-  // ── I2C for ENS160+AHT2x ─────────────────────────────────────────────────
+  // ── I2C for ENS160+AHT2x+BMI160 ──────────────────────────────────────────
   Wire.begin(21, 22);  // SDA=GPIO21, SCL=GPIO22
+  // CRITICAL: without a bounded timeout, Wire.requestFrom()/endTransmission()
+  // can block indefinitely if a device doesn't ACK (e.g. BMI160 not yet
+  // wired, floating SDA/SCL, bad joint). 50ms bounds every Wire call for the
+  // rest of the sketch — belt-and-suspenders alongside the fix below.
+  Wire.setTimeOut(50);
 
-  // ── ENS160+AHT2x init ────────────────────────────────────────────────────
-  if (ENSsensorThere) {
-    ensReady = initENS();
-    if (!ensReady) Serial.println("[WARN] ENS160/AHT2x not detected — will retry in sensorTask");
-  }
-
-  // ── GY-BMI160 init (v2.3) — shares I2C bus with ENS160/AHT2x ─────────────
-  // If absent at boot, inertialNav() retries every 10s from sensorTask.
-  if (BMI160sensorThere) {
-    bmi160Ready = initBMI160();
-    if (!bmi160Ready) Serial.println("[WARN] BMI160 not detected — will retry in sensorTask");
-  }
+  // ── ENS160+AHT2x / BMI160 init — DELIBERATELY NOT DONE HERE ──────────────
+  // Earlier versions called initENS()/initBMI160() directly in setup(), which
+  // runs entirely on Core 1 BEFORE wifiConnect() below. If either device
+  // failed to ACK on the bus (not yet wired, floating SDA/SCL, bad joint),
+  // the I2C call could block long enough for the ESP32's own system
+  // watchdog (TG0WDT — separate from the app-level task/interrupt
+  // watchdogs discussed elsewhere in this file) to fire, producing an
+  // endless "rst:0x7 (TG0WDT_SYS_RESET)" boot loop that never reached WiFi.
+  // The Wire.setTimeOut(50) above bounds that specific hang, but the more
+  // fundamental fix is architectural: I2C sensor init now happens EXCLUSIVELY
+  // inside sensorTask (Core 0) — see the ENS160 block in sensorTask and the
+  // BMI160 lazy-init block at the top of inertialNav(), both of which already
+  // attempt initialisation on their very first call and retry periodically
+  // thereafter if the device is absent. This guarantees WiFi on Core 1 can
+  // NEVER be blocked by I2C, no matter what is or isn't wired to the bus —
+  // matching the same principle already used for the CO sensor: nothing that
+  // can stall waiting on hardware runs before WiFi starts.
 
   // ── GPS 1PPS interrupt (v2.3) ─────────────────────────────────────────────
   if (PPSsensorThere) {
@@ -1676,11 +1725,8 @@ void setup()
     ledcWrite(CO_PWM_PIN, 0);
   }
 
-  // ── IMU UART2 ────────────────────────────────────────────────────────────
-  if (IMUsensorThere) {
-    imu_serial.begin(115200, SERIAL_8N1, IMU_RX_PIN, IMU_TX_PIN);
-    Serial.println("[INIT] IMU UART2 started (GPIO16/17)");
-  }
+  // [SUPERSEDED v2.4] JY-901 UART2 init removed — GPIO16/17 are free. BMI160
+  // (the only IMU now) is initialised in the ENS160/BMI160 block below.
 
   // ── GPS — ATGM336H NMEA only, 9600 baud ──────────────────────────────────
   initGPS();
@@ -1731,7 +1777,7 @@ void setup()
   blynkTimer.setInterval(BLYNK_SEND_FAST_MS, blynkSendFast);
   blynkTimer.setInterval(BLYNK_SEND_SLOW_MS, blynkSendSlow);
 
-  engMsg("Setup OK v2.3 — PPS + BMI160 inertial nav added");
+  engMsg("Setup OK v2.4 — I2C sensor init moved off Core 1, WiFi can't be blocked by it");
   setupDone = true;
 }
 
