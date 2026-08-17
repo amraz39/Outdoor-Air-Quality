@@ -1,5 +1,5 @@
 // ============================================================================
-// Outdoor Air Quality Station — ESP32 Production Firmware v2.4
+// Outdoor Air Quality Station — ESP32 Production Firmware v2.6
 // Migrated & rewritten from original Arduino Mega + Esp8266EasyIoT (AM, 2017)
 //
 // ─── HARDWARE v2.0/2.1 ───────────────────────────────────────────────────────
@@ -29,8 +29,8 @@
 //   Measurement phase: target A1 = 1.4V  → duty adjusted via closed loop
 //
 // ─── PIN MAP v2.0 ────────────────────────────────────────────────────────────
-//   GPIO36 VP — CO sense AO (10k+10k divider from board A0)
-//   GPIO39 VN — CO heater feedback A1 (10k+10k divider from board A1)
+//   GPIO36 VP — CO sense AO (10k+10k divider from board A0) - Suitable for reading analog signals
+//   GPIO39 VN — CO heater feedback A1 (10k+10k divider from board A1) - Suitable for reading analog signals
 //   GPIO34    — UV OUT (ML8511, direct 3.3V)
 //   GPIO35    — UV REF (ML8511, direct 3.3V)
 //   GPIO32    — Dust AO (GP2Y1010, 10k+10k divider)
@@ -440,6 +440,9 @@ bool ppsIsLocked()
 #define ENG_MSG_INTERVAL      15000
 #define BLYNK_SEND_FAST_MS     5000
 #define BLYNK_SEND_SLOW_MS    10000
+#define MAP_SEND_INTERVAL_MS  30000  // V33 Map widget point rate — deliberately slower
+                                      // than FAST/SLOW telemetry to avoid flooding the
+                                      // Blynk Map widget with a marker every few seconds
 #define SENSOR_TASK_PERIOD_MS     25
 #define GPS_FEED_MS               50
 #define IMU_POLL_MS               50
@@ -487,6 +490,8 @@ struct SensorData {
   double   lat, lng;
   float    hdop, sats;
   bool     gps_fix;
+  long     gps_unix_time;    // v2.5: UNIX epoch seconds from GPS UTC date/time, used as
+                              // the Blynk Map (V33) point index — 0 if GPS date/time invalid
   int32_t  rssi;
   uint8_t  wifi_qual;
   uint32_t status_flags;
@@ -650,6 +655,39 @@ void feedGPS()
                     ppsIsLocked() ? 1 : 0);
     }
   }
+}
+
+// v2.5: Convert GPS UTC date+time (from NMEA RMC/GGA, already parsed by
+// TinyGPS++) to a UNIX epoch timestamp — used as the point index for the
+// Blynk Map widget on V33. Standard proleptic-Gregorian "days_from_civil"
+// calendar math (Howard Hinnant's well-known constexpr algorithm); no RTC,
+// no NTP, no external library needed — the GPS module is already an
+// accurate UTC time source once it has a fix.
+//
+// IMPORTANT: this reads the global `gps` (TinyGPSPlus) object directly, so
+// it must ONLY ever be called from sensorTask on Core 0 — the same core
+// that owns and writes to `gps` via feedGPS(). Calling it from loop()/Core 1
+// would be an unprotected cross-core access to a non-thread-safe object.
+// The result is cached into sd.gps_unix_time (mutex-protected) so Core 1
+// can read it safely without ever touching `gps` itself.
+long gpsUnixTime()
+{
+  if (!gps.date.isValid() || !gps.time.isValid()) return 0;
+  int y  = gps.date.year();
+  int m  = gps.date.month();
+  int d  = gps.date.day();
+  int hh = gps.time.hour();
+  int mm = gps.time.minute();
+  int ss = gps.time.second();
+  if (y < 2020 || y > 2100) return 0;   // sanity guard against a bad/uninitialised NMEA fix
+
+  y -= (m <= 2) ? 1 : 0;
+  long era = (y >= 0 ? y : y - 399) / 400;
+  long yoe = y - era * 400;
+  long doy = (153*(m + (m > 2 ? -3 : 9)) + 2)/5 + d - 1;
+  long doe = yoe*365 + yoe/4 - yoe/100 + doy;
+  long days = era*146097 + doe - 719468;
+  return days*86400L + (long)hh*3600L + (long)mm*60L + (long)ss;
 }
 
 // ============================================================================
@@ -1445,6 +1483,10 @@ void sensorTask(void* pvParam)
     if (lastGPSdata>0 && millis()-lastGPSdata>GPS_TIMEOUT_MS)
       engMsgf("GPS FAULT: no data >%ds", GPS_TIMEOUT_MS/1000);
 
+    // v2.5: computed here (Core 0, sensorTask) where `gps` is safely owned —
+    // never called from loop()/Core 1. Cached to sd.gps_unix_time below.
+    long gpsUnixT = gpsUnixTime();
+
     // ── Inertial navigation — GPS + BMI160 EKF (v2.4) ────────────────────────
     // BMI160 is now the ONLY IMU. This one call handles everything: EKF
     // dead-reckoning, PPS/lat/lng/speed/heading, AND (via the complementary
@@ -1488,6 +1530,7 @@ void sensorTask(void* pvParam)
       sd.sound_db=soundDb;
       sd.temp=t; sd.hum=h; sd.ens_fault=(ens_fail_count>=ENS_MAX_FAILS);
       sd.lat=lat; sd.lng=lng; sd.hdop=HDOP; sd.sats=SatGPS; sd.gps_fix=gpsFix;
+      sd.gps_unix_time = gpsUnixT;
       sd.rand_num=random(1,10);
       // BUGFIX: sd.pps_locked was previously only ever written inside
       // inertialNav(), which returns early (before reaching that line)
@@ -1586,6 +1629,75 @@ void blynkSendSlow()
   safeWrite (V25, snap.co_heater_v);
 }
 
+// v2.5: Blynk Map widget on V33. The Map widget's virtualWrite convention
+// is Blynk.virtualWrite(vPin, index, lat, lon, value):
+//   • index — identifies/updates a marker; reusing the same index moves an
+//     existing marker, a new index drops a new one. We use the GPS UNIX
+//     timestamp (sd.gps_unix_time, computed on Core 0 from GPS UTC date/time
+//     — see gpsUnixTime()) so every send is naturally a distinct, monotonic,
+//     human-meaningful index, and the map accumulates a trail of points over
+//     the deployment rather than a single marker that keeps moving. Kept as
+//     the GPS timestamp regardless of which position source below is used —
+//     it's the only reliable real-world clock in the system either way.
+//   • lat/lon — v2.6: source is now selected automatically each send:
+//       - If inertial-nav data EXISTS (BMI160 present and inav_state is one
+//         of GPS_FIX / IMU_RECENT / IMU_STALE — i.e. an origin has been set
+//         from a real GPS fix and the EKF hasn't been forced into LOST),
+//         use the fused sd.inav_lat/sd.inav_lng. This keeps the trail going
+//         through brief GPS dropouts via BMI160 dead-reckoning.
+//       - Otherwise (no BMI160 wired, or inav_state is NO_FIX_YET/LOST —
+//         i.e. inertial-nav data does NOT exist/isn't trustworthy right
+//         now), fall back to raw GPS sd.lat/sd.lng, gated on sd.gps_fix,
+//         exactly as before. This is also the behaviour with no IMU wired
+//         at all, since inav_state then never leaves NO_FIX_YET.
+//   • value — a fixed label string identifying this device on the map.
+// Deliberately its own timer tier (MAP_SEND_INTERVAL_MS, default 30s) rather
+// than piggybacking on FAST(5s)/SLOW(10s) — a marker every few seconds would
+// flood the Map widget on any deployment longer than a few minutes.
+void blynkSendMap()
+{
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  bool   gpsFixNow;
+  double gpsLat, gpsLng;
+  int    inavState;
+  double inavLat, inavLng;
+  long   unixT;
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(30)) == pdTRUE) {
+    gpsFixNow = sd.gps_fix;
+    gpsLat    = sd.lat;
+    gpsLng    = sd.lng;
+    inavState = sd.inav_state;
+    inavLat   = sd.inav_lat;
+    inavLng   = sd.inav_lng;
+    unixT     = sd.gps_unix_time;
+    xSemaphoreGive(dataMutex);
+  } else { engMsg("BLYNK MAP: mutex timeout"); return; }
+
+  if (unixT <= 0) return;   // no valid GPS time yet — skip this cycle, try again later
+
+  // Does inertial-nav data exist and can it be trusted right now?
+  bool inavExists = (inavState == INAV_STATE_GPS_FIX ||
+                      inavState == INAV_STATE_IMU_RECENT ||
+                      inavState == INAV_STATE_IMU_STALE);
+
+  double lat, lng;
+  const char* src;
+  if (inavExists) {
+    lat = inavLat; lng = inavLng; src = "INAV";
+  } else if (gpsFixNow) {
+    lat = gpsLat; lng = gpsLng; src = "GPS";
+  } else {
+    return;   // neither source is trustworthy this cycle — skip, try again later
+  }
+
+  Blynk.virtualWrite(V33, unixT, lat, lng, "AOQ-ESP32");
+  delay(VWRITE_GAP_MS);
+
+  if (DEBUGON)
+    Serial.printf("[BLYNK MAP] idx=%ld lat=%.6f lng=%.6f src=%s\n", unixT, lat, lng, src);
+}
+
 // ============================================================================
 // WiFi CONNECT
 // ============================================================================
@@ -1626,7 +1738,7 @@ bool wifiConnect()
 void setup()
 {
   Serial.begin(115200);
-  Serial.println("\n[INIT] Air Quality Station ESP32 v2.4");
+  Serial.println("\n[INIT] Air Quality Station ESP32 v2.6");
   Serial.printf("[INIT] ten_mins_autoreset = %s\n", ten_mins_autoreset ? "ON":"OFF");
 
   uint8_t mac[6];
@@ -1644,6 +1756,7 @@ void setup()
   strncpy(sd.eng_msg, "Booting...", sizeof(sd.eng_msg));
   // Pre-fill all sensor fields with UNAVAILABLE until first valid reads
   sd.co_ppm=sd.co_raw=sd.co_heater_v=SENSOR_UNAVAILABLE;
+  sd.gps_unix_time = 0;
   sd.tvoc_ppb=sd.eco2_ppm=sd.aqi=SENSOR_UNAVAILABLE;
   sd.uvi=sd.sound_db=sd.dust_mg=SENSOR_UNAVAILABLE;
   sd.temp=sd.hum=SENSOR_UNAVAILABLE;
@@ -1776,8 +1889,9 @@ void setup()
   // ── BlynkTimer intervals ──────────────────────────────────────────────────
   blynkTimer.setInterval(BLYNK_SEND_FAST_MS, blynkSendFast);
   blynkTimer.setInterval(BLYNK_SEND_SLOW_MS, blynkSendSlow);
+  blynkTimer.setInterval(MAP_SEND_INTERVAL_MS, blynkSendMap);
 
-  engMsg("Setup OK v2.4 — I2C sensor init moved off Core 1, WiFi can't be blocked by it");
+  engMsg("Setup OK v2.6 — Map V33 auto-switches GPS/INAV position source");
   setupDone = true;
 }
 
