@@ -25,6 +25,7 @@
 13. [Required libraries](#required-libraries)
 14. [Air quality mapping](#air-quality-mapping)
 15. [Known limitations and future work](#known-limitations-and-future-work)
+16. [System Health Diagnostics](#system-health-diagnostics)
 
 ---
 
@@ -605,3 +606,11 @@ continuous use without incident, this may no longer be necessary.
 ---
 
 *Firmware: `AirQuality_ESP32_Blynk.ino` v1.1 · Credentials: `secrets.h` · Backend: Blynk 0.6.1 local server, Java 21*
+
+---
+
+## System Health Diagnostics
+
+Click on the link below to view the system health diagnostics:
+
+[System Health Diagnostics](README_System_Health_Diagnostics.md)

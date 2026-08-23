@@ -233,8 +233,31 @@
 //     (a failed/absent BMI160 read) instead of JY-901 UART frame timeout —
 //     same two status bits, same meaning to anything consuming V20.
 // ============================================================================
+// v2.7 LONG-TERM RELIABILITY IMPROVEMENTS — additive, existing behaviour kept
+//   • GPS PPS ISR now records only timing/event state; D2 LED control runs in
+//     sensorTask so the LED reflects the normal application context as well as
+//     PPS activity. Atomic event exchange prevents PPS events being lost.
+//   • WiFi reconnect was changed to a non-blocking 20s association state
+//     machine; the original blocking wifiConnect() helper remains available.
+//   • sensorTask heartbeat + ESP task-watchdog subscription provide an actual
+//     recovery path for a stalled sensor task. The existing optional 10-minute
+//     auto-reset remains intact and disabled by default.
+//   • Periodic heap/minimum-heap/largest-free-block health telemetry is emitted
+//     once per minute for long-duration burn-in and memory-fragmentation checks.
+//   • Existing sensor, GPS, INAV, CO, Blynk, map, display, buzzer, and status
+//     logic is preserved; changes are limited to reliability/monitoring paths.
+// ============================================================================
 
 #define BLYNK_HEARTBEAT 60
+
+// v3.3 long-term reliability: Blynk v0.6.1 uses BLYNK_TIMEOUT_MS for the
+// underlying WiFiClient read timeout.  The library performs blocking reads
+// inside Blynk.run(), so the historical 6s default is too close to the ESP32
+// task/interrupt watchdog window for an unattended device.  Keep the timeout
+// at the library-supported minimum.  A handshake may therefore require more
+// than one Blynk.run() call, but each individual call remains bounded and the
+// Core 1 idle task can continue to be serviced between calls.
+#define BLYNK_TIMEOUT_MS 1000UL
 
 #include "secrets.h"
 // secrets.h: #define WIFI_SSID / WIFI_PASS / BLYNK_AUTH / BLYNK_SERVER / BLYNK_PORT
@@ -242,6 +265,8 @@
 #include <WiFi.h>
 #include <BlynkSimpleEsp32.h>
 #include <esp_mac.h>
+#include <esp_task_wdt.h>
+#include <esp_heap_caps.h>
 #include <TinyGPS++.h>
 #include <Wire.h>
 // ENS160: use ScioSense_ENS160 library (NOT Adafruit_ENS160 which does not exist)
@@ -309,6 +334,12 @@ Adafruit_SSD1306 display(128, 64, &Wire, OLED_RESET);
 HardwareSerial gps_serial(1);
 TinyGPSPlus    gps;
 
+// v3.5: Capture TinyGPS++ location-update state before any normal GPS
+// latitude/longitude access below. TinyGPS++ clears location.isUpdated()
+// when lat()/lng() are read, so the raw-GPS reporting path must not consume
+// the update flag before inertialNav() gets a chance to use the same fix.
+bool gpsLocationUpdatedThisCycle = false;
+
 // [SUPERSEDED v2.4] JY-901 UART2 (GPIO16/17) removed entirely — BMI160 (I2C,
 // declared below near the ENS160/AHT2x section) is now the only IMU.
 // GPIO16/GPIO17 are free.
@@ -357,6 +388,11 @@ i2s_chan_handle_t inmp441_rx_handle = NULL;
 #define CO_PWM_PIN  4    // CO heater D2 PWM (direct to NPN base via 1kΩ on board)
 #define PPS_PIN     5    // GPS 1PPS output → ESP32 GPIO5 (free since DHT21 removed in v2.0)
                           // 3.3V push-pull, direct wire, no divider needed
+#define PPS_LED_PIN 2     // ESP-32 board D2 LED — flashes for 250ms on each GPS PPS
+// Some ESP32 boards wire the onboard D2/GPIO2 LED active-LOW. The current
+// station board uses that polarity, so LOW means LED ON and HIGH means OFF.
+// Change to true only if your particular board has an active-HIGH D2 LED.
+#define PPS_LED_ACTIVE_HIGH true
 
 // ─── PPS ISR state (v2.3) ────────────────────────────────────────────────────
 // Single-word volatiles are atomic on Xtensa — no critical section needed for
@@ -364,6 +400,28 @@ i2s_chan_handle_t inmp441_rx_handle = NULL;
 volatile unsigned long ppsLastMicros  = 0;
 volatile unsigned long ppsIntervalUs  = 0;
 volatile uint32_t      ppsPulseCount  = 0;
+// PPS LED requests are handled by sensorTask, not directly by the ISR.
+// This keeps the ISR limited to timestamp/counter/event work and also means
+// the LED is a useful indication that the normal sensor application is alive.
+volatile uint32_t      ppsLedPending = 0;
+portMUX_TYPE ppsLedMux = portMUX_INITIALIZER_UNLOCKED;
+
+// PPS LED timing is owned by sensorTask (Core 0).  No cross-core LED state is
+// modified by the ISR beyond the atomic pending-event counter above.
+// The LED uses an absolute OFF deadline so each PPS creates one fixed 250ms
+// pulse and a later PPS cannot accidentally extend an already active pulse.
+unsigned long ppsLedOffMillis = 0;
+bool ppsLedIsOn = false;
+
+// Keep the LED polarity in one place. GPIO2/D2 is a board LED output, and
+// different ESP32 boards wire that LED with different polarities.
+// Using a helper prevents the PPS state machine from accidentally assuming
+// HIGH=ON when the physical LED is active-LOW.
+void setPpsLed(bool on)
+{
+  digitalWrite(PPS_LED_PIN, PPS_LED_ACTIVE_HIGH ? (on ? HIGH : LOW)
+                                                 : (on ? LOW : HIGH));
+}
 
 void IRAM_ATTR ppsISR()
 {
@@ -371,6 +429,11 @@ void IRAM_ATTR ppsISR()
   if (ppsLastMicros != 0) ppsIntervalUs = now - ppsLastMicros;
   ppsLastMicros = now;
   ppsPulseCount++;
+  // Do NOT call digitalWrite() here. The ISR only records the PPS event;
+  // sensorTask performs the LED operation in normal application context.
+  portENTER_CRITICAL_ISR(&ppsLedMux);
+  ppsLedPending++;
+  portEXIT_CRITICAL_ISR(&ppsLedMux);
 }
 
 // Locked = a pulse arrived within the last 2s AND its interval was within
@@ -394,7 +457,7 @@ bool ppsIsLocked()
 // Minimal register-level driver — no external library, avoids adding another
 // dependency that could collide with the ADC/I2S driver families (see v2.1/
 // v2.2 notes above for why that risk is taken seriously in this project).
-#define BMI160_ADDR         0x69   // SDO/SA0 pulled HIGH on the GY-BMI160 board
+#define BMI160_ADDR         0x69   // 0x69 --- SDO/SA0 pulled HIGH on the GY-BMI160 board
 #define BMI160_REG_CHIPID   0x00
 #define BMI160_REG_DATA     0x0C   // GYR_X_L .. ACC_Z_H, 12 bytes contiguous
 #define BMI160_REG_TEMP     0x20   // die temperature, 2 bytes (v2.4, feeds V11)
@@ -440,7 +503,7 @@ bool ppsIsLocked()
 #define ENG_MSG_INTERVAL      15000
 #define BLYNK_SEND_FAST_MS     5000
 #define BLYNK_SEND_SLOW_MS    10000
-#define MAP_SEND_INTERVAL_MS  30000  // V33 Map widget point rate — deliberately slower
+#define MAP_SEND_INTERVAL_MS  30000   // V33 Map widget point rate — deliberately slower
                                       // than FAST/SLOW telemetry to avoid flooding the
                                       // Blynk Map widget with a marker every few seconds
 #define SENSOR_TASK_PERIOD_MS     25
@@ -490,7 +553,7 @@ struct SensorData {
   double   lat, lng;
   float    hdop, sats;
   bool     gps_fix;
-  long     gps_unix_time;    // v2.5: UNIX epoch seconds from GPS UTC date/time, used as
+  long     gps_unix_time;     // v2.5: UNIX epoch seconds from GPS UTC date/time, used as
                               // the Blynk Map (V33) point index — 0 if GPS date/time invalid
   int32_t  rssi;
   uint8_t  wifi_qual;
@@ -499,7 +562,7 @@ struct SensorData {
   int      rand_num;
   // v2.3 additions — additive only, nothing above this line changed
   bool     pps_locked;
-  int      inav_state;                          // see INAV_STATE_* defines
+  int      inav_state;                           // see INAV_STATE_* defines
   double   inav_lat, inav_lng;                   // EKF-fused position
   float    inav_alt;                             // held from last valid GPS fix (no baro on BMI160)
   float    inav_speed_mps, inav_heading_deg;     // EKF-fused speed/heading
@@ -540,6 +603,18 @@ unsigned long lastWiFiCheck = 0;
 long          countReset    = 0;
 bool          prevZeroVal   = false;
 float         SatGPS = 0, HDOP = 0;
+
+// ─── LONG-TERM HEALTH MONITORING ─────────────────────────────────────────────
+// Sensor-task heartbeat is updated once per completed sensor cycle.  The
+// application watchdog below uses it as an additional diagnostic, while the
+// ESP task watchdog protects against a genuinely stuck sensor task.
+volatile uint32_t sensorTaskHeartbeat = 0;
+unsigned long lastHealthReport = 0;
+unsigned long lastHeartbeatChangeMillis = 0;
+uint32_t lastHealthHeartbeat = 0;
+
+#define SENSOR_TASK_HEALTH_TIMEOUT_MS  30000UL
+#define HEALTH_REPORT_INTERVAL_MS      60000UL
 
 // ─── INERTIAL NAV — EKF state (v2.3) ────────────────────────────────────────
 float         inavX[4]    = {0,0,0,0};  // [E(m), N(m), v(m/s), heading(rad)]
@@ -1027,6 +1102,21 @@ bool bmi160ReadRaw(float& gx, float& gy, float& gz, float& ax, float& ay, float&
   ax = rax / 32768.0f * BMI160_ACC_RANGE_G;
   ay = ray / 32768.0f * BMI160_ACC_RANGE_G;
   az = raz / 32768.0f * BMI160_ACC_RANGE_G;
+
+  if (DEBUGON) {
+    static unsigned long lastGPSDebug = 0;
+    if (millis() - lastGPSDebug >= 5000) {
+      lastGPSDebug = millis();
+      Serial.printf("[IMU DEBUG] gx=%.1f gy=%.1f gz=%.1f | ax=%.1f ay=%.1f az=%.1f \n",
+                      gx,
+                      gy,
+                      gz,
+                      ax,
+                      ay,
+                      az);
+    }
+  }
+
   return true;
 }
 
@@ -1269,7 +1359,10 @@ void inertialNav()
     }
   }
 
-  bool newFix = gps.location.isUpdated();   // consumes TinyGPS++'s own flag
+  // v3.5: feedGPS/raw-GPS processing may already have read lat()/lng(),
+  // which clears TinyGPS++'s location.isUpdated() flag. Use the snapshot
+  // captured immediately after feedGPS() so INAV never misses a fresh fix.
+  bool newFix = gpsLocationUpdatedThisCycle;
   int state;
 
   if (newFix && gps.location.isValid()) {
@@ -1408,12 +1501,51 @@ void sensorTask(void* pvParam)
 {
   while (!setupDone) vTaskDelay(pdMS_TO_TICKS(10));
 
+  // Subscribe the sensor task to the ESP task watchdog. The task feeds it only
+  // after a complete sensor cycle, so a genuinely stuck sensor/I2C operation
+  // can no longer leave the station silently wedged for an unlimited time.
+  esp_err_t wdtResult = esp_task_wdt_add(NULL);
+  if (wdtResult != ESP_OK && wdtResult != ESP_ERR_INVALID_STATE) {
+    Serial.printf("[WATCHDOG] sensorTask registration failed: %d\n", (int)wdtResult);
+  }
+
   // ADC config already done in setup() — do NOT call analogReadResolution()
   // or analogSetAttenuation() here. That would trigger the driver conflict.
 
   while (true)
   {
     unsigned long loopStart = millis();
+
+    // ── GPS PPS LED — keep the ESP-32 board D2 LED on for exactly 250ms ───────
+    // Historical implementation note retained from v2.6:
+    // The PPS ISR turns the LED on immediately; this task turns it off after
+    // the requested 0.25 second pulse. PPS timing itself remains ISR-driven.
+    // In v2.7 the ISR no longer drives the LED directly; it only records the
+    // event, and this task performs both the ON and OFF operations.
+    // The PPS ISR only records the event. This task performs the actual LED
+    // operation, so the LED now also proves that the normal sensor application
+    // is running rather than merely proving that the interrupt still fires.
+    // A counter is used instead of a boolean so closely spaced/queued events
+    // cannot be silently lost; normal GPS PPS is one event per second.
+    uint32_t pendingPps;
+    portENTER_CRITICAL(&ppsLedMux);
+    pendingPps = ppsLedPending;
+    ppsLedPending = 0;
+    portEXIT_CRITICAL(&ppsLedMux);
+    // First finish any active PPS pulse.  The unsigned subtraction is rollover-safe.
+    if (ppsLedIsOn && (long)(millis() - ppsLedOffMillis) >= 0) {
+      setPpsLed(false);
+      ppsLedIsOn = false;
+    }
+
+    // A PPS event requests one simple 250ms blink.  Do not restart/extend the
+    // pulse if another event is already being displayed.  Normal GPS PPS is
+    // one event per second, so this produces a clean 250ms ON / ~750ms OFF pattern.
+    if (pendingPps != 0 && !ppsLedIsOn) {
+      setPpsLed(true);                           // GPS PPS registered — LED ON
+      ppsLedOffMillis = millis() + 250UL;       // fixed 250ms pulse deadline
+      ppsLedIsOn = true;
+    }
 
     // ── UV (ML8511 3.3V ratiometric, direct — no divider) ───────────────────
     int uvRaw = averageAnalogRead(UV_OUT_PIN);
@@ -1462,6 +1594,10 @@ void sensorTask(void* pvParam)
 
     // ── GPS (ATGM336H NMEA, 9600 baud) ───────────────────────────────────────
     feedGPS();
+    // v3.5: Snapshot this BEFORE gps.location.lat()/lng() are read below.
+    // TinyGPS++ clears location.isUpdated() when lat()/lng() are accessed,
+    // and INAV needs to know that this cycle contains a fresh GPS position.
+    gpsLocationUpdatedThisCycle = gps.location.isUpdated();
     SatGPS = (float)gps.satellites.value();
     HDOP   = (SatGPS >= 1) ? gps.hdop.value()/100.0f : 99.9f;
     bool gpsFix = (gps.location.isValid() &&
@@ -1559,6 +1695,15 @@ void sensorTask(void* pvParam)
       buzzerTone(1000, 200);
       countReset=0; ESP.restart();
     }
+
+    // Sensor-task health heartbeat. Updated only after the complete cycle
+    // finishes, so a blocked sensor operation cannot falsely report health.
+    sensorTaskHeartbeat++;
+
+    // Feed the ESP task watchdog after a successful full sensor cycle. If the
+    // task becomes stuck in an I2C/sensor operation beyond the watchdog window,
+    // the hardware/software watchdog infrastructure can recover the ESP32.
+    esp_task_wdt_reset();
 
     unsigned long elapsed = millis()-loopStart;
     vTaskDelay(pdMS_TO_TICKS(elapsed < SENSOR_TASK_PERIOD_MS
@@ -1698,10 +1843,107 @@ void blynkSendMap()
     Serial.printf("[BLYNK MAP] idx=%ld lat=%.6f lng=%.6f src=%s\n", unixT, lat, lng, src);
 }
 
+// ─── NON-BLOCKING WiFi recovery state ───────────────────────────────────────
+bool wifiConnectInProgress = false;
+unsigned long wifiConnectStarted = 0;
+unsigned long wifiFailureAlertAt = 0;
+// Blynk connection is deliberately managed separately from WiFi.
+// Blynk.run() must NEVER be allowed to initiate an unbounded connection
+// attempt on Core 1, because that can starve the ESP32 interrupt watchdog
+// when the Blynk server is unreachable.  We therefore make a bounded TCP
+// probe first, use the library-supported 1s Blynk I/O timeout, and service
+// the same handshake incrementally until it completes.
+bool blynkConfigured = false;
+unsigned long lastBlynkConnectAttempt = 0;
+// Initial Blynk handshake state.  Once the TCP probe succeeds, keep servicing
+// Blynk.run() on every loop pass until the handshake completes instead of
+// waiting for the next 10s connection-attempt interval.
+bool blynkHandshakeActive = false;
+unsigned long blynkHandshakeStarted = 0;
+#define BLYNK_CONNECT_RETRY_MS 10000UL
+#define BLYNK_CONNECT_TIMEOUT_S 5UL
+#define BLYNK_HANDSHAKE_TIMEOUT_MS 10000UL
+#define BLYNK_SERVER_PROBE_TIMEOUT_MS 250UL
+
+void wifiStartConnect()
+{
+  Serial.printf("[WiFi] Connecting to %s...\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  wifiConnectStarted = millis();
+  wifiConnectInProgress = true;
+}
+
+void wifiMarkConnected()
+{
+  wifiConnectInProgress = false;
+  Serial.printf("\n[WiFi] Connected — IP=%s RSSI=%ddBm MAC=%s\n",
+                WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.macAddress().c_str());
+  // Blynk.config() sets server address only — does NOT block or spin.
+  // IMPORTANT: do NOT rely on the first Blynk.run() to establish the server
+  // connection. With Blynk v0.6.1, Blynk.run() can invoke the default connection
+  // timeout when the server is not reachable. That can hold Core 1 long enough
+  // to trigger the ESP32 Interrupt WDT. We explicitly probe the server first,
+  // then allow Blynk.run() to advance the handshake in bounded increments.
+  Blynk.config(BLYNK_AUTH, BLYNK_SERVER, BLYNK_PORT);
+  blynkConfigured = true;
+  blynkHandshakeActive = false;
+  blynkHandshakeStarted = 0;
+  lastBlynkConnectAttempt = millis() - BLYNK_CONNECT_RETRY_MS;
+  if (xSemaphoreTake(dataMutex,pdMS_TO_TICKS(10))==pdTRUE) {
+    sd.status_flags|=STATUS_WIFI_OK; xSemaphoreGive(dataMutex);
+  }
+  engMsgf("WiFi OK — Blynk configured %s:%d", BLYNK_SERVER, BLYNK_PORT);
+  buzzerTone(5000, 100);
+}
+
+void wifiService()
+{
+  if (!WIFI) return;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (wifiConnectInProgress) wifiMarkConnected();
+    return;
+  }
+
+  if (xSemaphoreTake(dataMutex,pdMS_TO_TICKS(5))==pdTRUE) {
+    sd.status_flags&=~STATUS_WIFI_OK; xSemaphoreGive(dataMutex);
+  }
+
+  unsigned long now = millis();
+  if (wifiConnectInProgress) {
+    // Do not block Core 1 while the WiFi driver performs its association.
+    // If it takes too long, abandon this attempt and allow a later retry.
+    if (now - wifiConnectStarted >= 20000UL) {
+      wifiConnectInProgress = false;
+      WiFi.disconnect();
+      Serial.println("\n[WiFi] FAILED (20s timeout)");
+      engMsg("WiFi FAILED: offline");
+      // Preserve the original audible failure indication. It is emitted only
+      // once per failed connection attempt; the connection process itself is
+      // still non-blocking for the full 20-second association window.
+      wifiFailureAlertAt = now;
+      buzzerTone(1000,600); delay(200); buzzerTone(1000,600); delay(200); buzzerTone(1000,600);
+    }
+    return;
+  }
+
+  if (now - lastWiFiCheck >= WIFI_RECONNECT_MS) {
+    lastWiFiCheck = now;
+    engMsg("WiFi: reconnect attempt");
+    Blynk.disconnect();
+    WiFi.disconnect();
+    wifiStartConnect();
+  }
+}
+
 // ============================================================================
 // WiFi CONNECT
 // ============================================================================
 
+// Kept as the original blocking helper for compatibility with the existing
+// firmware interface. Normal operation now uses wifiStartConnect()/wifiService()
+// so Core 1 is never held in a 20-second connection loop.
 bool wifiConnect()
 {
   Serial.printf("[WiFi] Connecting to %s...\n", WIFI_SSID);
@@ -1738,7 +1980,7 @@ bool wifiConnect()
 void setup()
 {
   Serial.begin(115200);
-  Serial.println("\n[INIT] Air Quality Station ESP32 v2.6");
+  Serial.println("\n[INIT] Air Quality Station ESP32 v3.5");
   Serial.printf("[INIT] ten_mins_autoreset = %s\n", ten_mins_autoreset ? "ON":"OFF");
 
   uint8_t mac[6];
@@ -1771,6 +2013,7 @@ void setup()
   pinMode(ledPin11,OUTPUT); digitalWrite(ledPin11,LOW);
   pinMode(ledPin12,OUTPUT); digitalWrite(ledPin12,LOW);
   pinMode(ledPin13,OUTPUT); digitalWrite(ledPin13,LOW);
+  pinMode(PPS_LED_PIN, OUTPUT); setPpsLed(false);
   pinMode(dustLED, OUTPUT); digitalWrite(dustLED, HIGH);
   pinMode(buzzPin, OUTPUT);
   pinMode(CO_ADC_PIN,   INPUT);
@@ -1868,7 +2111,13 @@ void setup()
   xTaskCreatePinnedToCore(sensorTask, "sensorTask", 8192, NULL, 1, NULL, 0);
 
   // ── WiFi + Blynk config ──────────────────────────────────────────────────
-  if (WIFI) wifiConnect();
+  // Start WiFi asynchronously. The previous wifiConnect() helper remains
+  // available, but normal operation uses the non-blocking state machine so
+  // Core 1 remains responsive while the station associates with the AP.
+  if (WIFI) {
+    lastWiFiCheck = millis() - WIFI_RECONNECT_MS;
+    wifiStartConnect();
+  }
 
   // ── CO sensor startup ────────────────────────────────────────────────────
   if (COsensorThere) {
@@ -1891,7 +2140,7 @@ void setup()
   blynkTimer.setInterval(BLYNK_SEND_SLOW_MS, blynkSendSlow);
   blynkTimer.setInterval(MAP_SEND_INTERVAL_MS, blynkSendMap);
 
-  engMsg("Setup OK v2.6 — Map V33 auto-switches GPS/INAV position source");
+  engMsg("Setup OK v3.5 — long-term reliability monitoring enabled");
   setupDone = true;
 }
 
@@ -1906,22 +2155,128 @@ void setup()
 void loop()
 {
   if (WIFI) {
+    wifiService();
+
     if (WiFi.status() == WL_CONNECTED) {
-      Blynk.run();
-      blynkTimer.run();
+      // Blynk v0.6.1 may attempt a long server connection from inside
+      // Blynk.run() when the configured server is not yet connected. Do not
+      // call Blynk.run() while the server is completely unreachable. Once the
+      // bounded TCP probe succeeds, however, keep calling Blynk.run() on every
+      // loop pass until the existing handshake finishes. This is important: the
+      // first Blynk.run() starts the handshake, but it may return before the
+      // handshake is complete. The previous code waited for the next retry
+      // interval, which is why your second handshake was always ~7-10 seconds
+      // later. No second handshake is needed — the same Blynk session is simply
+      // serviced again until it reaches Blynk.connected().
+      unsigned long nowBlynk = millis();
+
+      if (blynkConfigured && !Blynk.connected() && !blynkHandshakeActive &&
+          nowBlynk - lastBlynkConnectAttempt >= BLYNK_CONNECT_RETRY_MS) {
+        lastBlynkConnectAttempt = nowBlynk;
+
+        // IMPORTANT: Blynk v0.6.1 Blynk.connect(timeout) is a blocking loop.
+        // Even a nominal 1-second timeout can monopolize Core 1 long enough
+        // to trigger the ESP32 Interrupt WDT when the TCP connection is not
+        // immediately usable. Probe the local Blynk TCP port first with a
+        // bounded WiFiClient timeout; only start Blynk.run() when the server
+        // has actually accepted a TCP connection. This avoids the failure mode
+        // where an unavailable/half-open Blynk server causes the CPU1 IWDT.
+        WiFiClient blynkProbe;
+        blynkProbe.setTimeout(BLYNK_SERVER_PROBE_TIMEOUT_MS);
+        bool serverReachable = blynkProbe.connect(BLYNK_SERVER, BLYNK_PORT);
+        blynkProbe.stop();
+
+        if (!serverReachable) {
+          Serial.println("[Blynk] Server TCP probe failed — retry later");
+        } else {
+          // IMPORTANT:
+          // Do NOT call Blynk.connect(timeout) here. Blynk v0.6.1 implements
+          // connect() as a blocking loop and it has proved unreliable with this
+          // local server even when the TCP port is reachable.
+          //
+          // The original firmware successfully established the Blynk session
+          // through Blynk.run(). We preserve that behavior, but only allow
+          // Blynk.run() to start the initial handshake after the bounded TCP
+          // probe above has confirmed that the server is accepting connections.
+          //
+          // Once started, the handshake is NOT restarted every 10 seconds.
+          // Blynk.run() is serviced on each loop pass until Blynk.connected()
+          // becomes true. This is the normal way to advance the same Blynk
+          // protocol session after its initial connection attempt.
+          blynkHandshakeActive = true;
+          blynkHandshakeStarted = millis();
+          Serial.println("[Blynk] TCP port open — starting Blynk.run() handshake");
+        }
+      }
+
+      if (blynkHandshakeActive && !Blynk.connected()) {
+        // v3.3: Blynk v0.6.1 performs blocking socket reads inside Blynk.run().
+        // BLYNK_TIMEOUT_MS is deliberately limited to 1s above, so one call
+        // cannot monopolise Core 1 long enough to trip the ESP32 idle/interrupt
+        // watchdog. If the server needs more time, the SAME Blynk session is
+        // serviced again on the next loop pass — this is not a new handshake.
+        // The short delay/yield below also gives the Arduino/ESP32 system tasks
+        // a scheduling opportunity between successive protocol steps.
+        Blynk.run();
+        yield();
+
+        if (Blynk.connected()) {
+          blynkHandshakeActive = false;
+          Serial.println("[Blynk] Connected");
+        } else if (millis() - blynkHandshakeStarted >= BLYNK_HANDSHAKE_TIMEOUT_MS) {
+          // The TCP probe succeeded, but the Blynk protocol handshake did not
+          // finish in a bounded period. Stop servicing the failed session and
+          // return to the normal retry state. This prevents an indefinitely
+          // stuck connection attempt while still giving the working server
+          // enough time to complete its handshake.
+          blynkHandshakeActive = false;
+          Blynk.disconnect();
+          Serial.println("[Blynk] Handshake timeout — retry later");
+        }
+      }
+
+      if (Blynk.connected()) {
+        // Normal connected-state servicing. BLYNK_TIMEOUT_MS=1s also bounds
+        // any waiting read if the server disappears between loop iterations.
+        Blynk.run();
+        yield();
+        blynkTimer.run();
+      }
+
       if (xSemaphoreTake(dataMutex,pdMS_TO_TICKS(5))==pdTRUE) {
         sd.status_flags|=STATUS_WIFI_OK; xSemaphoreGive(dataMutex);
       }
-    } else {
-      if (xSemaphoreTake(dataMutex,pdMS_TO_TICKS(5))==pdTRUE) {
-        sd.status_flags&=~STATUS_WIFI_OK; xSemaphoreGive(dataMutex);
-      }
-      if (millis()-lastWiFiCheck > WIFI_RECONNECT_MS) {
-        lastWiFiCheck=millis();
-        engMsg("WiFi: reconnect attempt");
-        Blynk.disconnect(); WiFi.disconnect(); delay(500);
-        wifiConnect();
-      }
     }
+  }
+
+  // ── Application health monitor ───────────────────────────────────────────
+  // This does not replace the task watchdog. It provides a second, visible
+  // diagnostic path and catches a sensor task that is alive but no longer
+  // completing its normal work cycle.
+  uint32_t hb = sensorTaskHeartbeat;
+  unsigned long now = millis();
+  if (hb != lastHealthHeartbeat) {
+    lastHealthHeartbeat = hb;
+    lastHeartbeatChangeMillis = now;
+  } else if (setupDone && lastHeartbeatChangeMillis != 0 &&
+             now - lastHeartbeatChangeMillis >= SENSOR_TASK_HEALTH_TIMEOUT_MS) {
+    // Only report/recover once per timeout window. The task watchdog is the
+    // primary recovery mechanism; this is a belt-and-suspenders safeguard.
+    Serial.println("[HEALTH] sensorTask heartbeat stalled — requesting restart");
+    engMsg("HEALTH FAULT: sensor task stalled");
+    lastHeartbeatChangeMillis = now;
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP.restart();
+  }
+
+  if (now - lastHealthReport >= HEALTH_REPORT_INTERVAL_MS) {
+    lastHealthReport = now;
+    Serial.printf("[HEALTH] heap=%u minHeap=%u largest=%u sensorHB=%lu WiFi=%s Blynk=%s PPS=%d\n",
+                  ESP.getFreeHeap(), ESP.getMinFreeHeap(),
+                  heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                  (unsigned long)sensorTaskHeartbeat,
+                  WiFi.status() == WL_CONNECTED ? "OK" : "OFF",
+                  Blynk.connected() ? "OK" : "OFF",
+                  ppsIsLocked() ? 1 : 0);
   }
 }
