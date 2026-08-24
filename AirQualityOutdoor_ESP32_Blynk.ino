@@ -66,6 +66,7 @@
 //               V5  TVOC ppb    V8  Roll         V9  Pitch
 //               V10 Yaw         V11 IMU temp     V18 Dust mg/m³
 //               V23 eCO2 ppm    V24 AQI          V25 Heater V (A1 feedback)
+//               V34 ESP reset reason (diagnostic)
 //
 // ─── ARCHITECTURE ────────────────────────────────────────────────────────────
 //   Core 1 (app_cpu) — Arduino loop(): WiFi, Blynk.run(), BlynkTimer
@@ -266,6 +267,7 @@
 #include <BlynkSimpleEsp32.h>
 #include <esp_mac.h>
 #include <esp_task_wdt.h>
+#include <esp_system.h>
 #include <esp_heap_caps.h>
 #include <TinyGPS++.h>
 #include <Wire.h>
@@ -413,6 +415,12 @@ portMUX_TYPE ppsLedMux = portMUX_INITIALIZER_UNLOCKED;
 unsigned long ppsLedOffMillis = 0;
 bool ppsLedIsOn = false;
 
+// v3.6: PPS LED service runs in its own small FreeRTOS task.
+// This keeps the 250ms LED pulse independent of the sensorTask timing.
+// A slow I2C/sensor cycle can therefore never turn a 250ms PPS pulse into
+// a continuously illuminated LED.
+TaskHandle_t ppsLedTaskHandle = NULL;
+
 // Keep the LED polarity in one place. GPIO2/D2 is a board LED output, and
 // different ESP32 boards wire that LED with different polarities.
 // Using a helper prevents the PPS state machine from accidentally assuming
@@ -429,11 +437,68 @@ void IRAM_ATTR ppsISR()
   if (ppsLastMicros != 0) ppsIntervalUs = now - ppsLastMicros;
   ppsLastMicros = now;
   ppsPulseCount++;
-  // Do NOT call digitalWrite() here. The ISR only records the PPS event;
-  // sensorTask performs the LED operation in normal application context.
+
+  // Do NOT call digitalWrite() here. The ISR only records the PPS event and
+  // wakes the dedicated LED task. The LED operation itself remains in normal
+  // application context.
   portENTER_CRITICAL_ISR(&ppsLedMux);
   ppsLedPending++;
   portEXIT_CRITICAL_ISR(&ppsLedMux);
+
+  if (ppsLedTaskHandle != NULL) {
+    BaseType_t higherPriorityTaskWoken = pdFALSE;
+    vTaskNotifyGiveFromISR(ppsLedTaskHandle, &higherPriorityTaskWoken);
+    if (higherPriorityTaskWoken) portYIELD_FROM_ISR();
+  }
+}
+
+// v3.6: Dedicated PPS LED task. Every electrical PPS event received on GPIO5
+// produces one fixed 250ms LED pulse. The LED is OFF at all other times.
+// This is intentionally independent of sensorTask so slow sensor/I2C work
+// cannot stretch the LED pulse or make it appear continuously ON.
+void ppsLedTask(void *parameter)
+{
+  (void)parameter;
+
+  for (;;) {
+    // Sleep until the GPIO5 PPS ISR reports an event.
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    uint32_t pendingPps;
+    portENTER_CRITICAL(&ppsLedMux);
+    pendingPps = ppsLedPending;
+    ppsLedPending = 0;
+    portEXIT_CRITICAL(&ppsLedMux);
+
+    if (pendingPps == 0) continue;
+
+    // One PPS event = one 250ms ON pulse.
+    setPpsLed(true);
+    ppsLedIsOn = true;
+    ppsLedOffMillis = millis() + 250UL;
+
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    // Always switch OFF after the fixed pulse, regardless of PPS lock state.
+    setPpsLed(false);
+    ppsLedIsOn = false;
+
+    // If multiple PPS events accumulated while the 250ms pulse was active,
+    // service them one-by-one. Normal GPS PPS is one event per second, so
+    // under normal operation this path is not normally used.
+    while (pendingPps > 1) {
+      pendingPps--;
+
+      setPpsLed(true);
+      ppsLedIsOn = true;
+      ppsLedOffMillis = millis() + 250UL;
+
+      vTaskDelay(pdMS_TO_TICKS(250));
+
+      setPpsLed(false);
+      ppsLedIsOn = false;
+    }
+  }
 }
 
 // Locked = a pulse arrived within the last 2s AND its interval was within
@@ -604,6 +669,60 @@ long          countReset    = 0;
 bool          prevZeroVal   = false;
 float         SatGPS = 0, HDOP = 0;
 
+// ─── RESET-CAUSE DIAGNOSTICS ────────────────────────────────────────────────
+// Additive diagnostic only: records why the ESP32 last restarted.
+esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
+const char* bootResetReasonText = "UNKNOWN";
+
+// ─── SENSOR HEALTH DIAGNOSTICS — additive reliability layer ───────────────────
+// These counters only detect persistent invalid/no-data conditions. They never
+// stop sensorTask and never prevent the other sensors from being serviced.
+// Existing sensor-specific fault/retry logic remains unchanged.
+unsigned int inmpFaultCount = 0;
+unsigned int uvFaultCount   = 0;
+unsigned int dustFaultCount = 0;
+bool inmpFaultReported = false;
+bool uvFaultReported   = false;
+bool dustFaultReported = false;
+bool inmpLastReadHadData = false;
+unsigned long lastInmpHealthMsg = 0;
+unsigned long lastUvHealthMsg   = 0;
+unsigned long lastDustHealthMsg = 0;
+
+#define SENSOR_HEALTH_FAIL_LIMIT 5
+#define SENSOR_HEALTH_MSG_INTERVAL 60000UL
+
+// Report a persistent fault without ever stopping the sensor task. The existing
+// engineering-message path (Blynk V19) is deliberately reused so no new Blynk
+// data channel is required and no existing virtual-pin mapping changes.
+void sensorHealthMsg(const char* sensor, const char* reason, unsigned long& lastMsg)
+{
+  unsigned long now = millis();
+  if (now - lastMsg >= SENSOR_HEALTH_MSG_INTERVAL || lastMsg == 0) {
+    lastMsg = now;
+    engMsgf("%s FAULT: %s — other sensors continue", sensor, reason);
+  }
+}
+
+// ─── ASYNCHRONOUS BUZZER STATE ───────────────────────────────────────────────
+// Additive reliability change: buzzerTone() starts a tone and returns immediately.
+// buzzerService() advances the tone without blocking either FreeRTOS task.
+volatile bool buzzerActive = false;
+volatile uint16_t buzzerActiveFrequency = 0;
+volatile unsigned long buzzerStopMillis = 0;
+
+#define BUZZER_PATTERN_MAX_STEPS 3
+struct BuzzerPatternStep {
+  uint16_t frequency;
+  uint16_t durationMs;
+  uint16_t pauseMs;
+};
+BuzzerPatternStep buzzerPattern[BUZZER_PATTERN_MAX_STEPS];
+volatile uint8_t buzzerPatternCount = 0;
+volatile uint8_t buzzerPatternIndex = 0;
+volatile bool buzzerPatternRunning = false;
+volatile unsigned long buzzerPatternNextMillis = 0;
+
 // ─── LONG-TERM HEALTH MONITORING ─────────────────────────────────────────────
 // Sensor-task heartbeat is updated once per completed sensor cycle.  The
 // application watchdog below uses it as an additional diagnostic, while the
@@ -675,14 +794,80 @@ void engMsgf(const char* fmt, ...)
   engMsg(buf);
 }
 
+const char* resetReasonToString(esp_reset_reason_t reason)
+{
+  switch (reason) {
+    case ESP_RST_UNKNOWN:   return "UNKNOWN";
+    case ESP_RST_POWERON:   return "POWERON";
+    case ESP_RST_EXT:       return "EXTERNAL";
+    case ESP_RST_SW:        return "SOFTWARE";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_WDT:       return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "OTHER";
+  }
+}
+
 void buzzerTone(uint16_t frequency, uint16_t durationMs)
 {
-  if (!frequency) return;
+  if (!frequency || !durationMs) return;
+  // Non-blocking: only schedule the tone. buzzerService() performs the actual
+  // LEDC stop later, so no sensor/Blynk task is held up by a beep.
+  buzzerPatternRunning = false;
+  buzzerPatternCount = 0;
+  buzzerPatternIndex = 0;
   ledcAttach(buzzPin, frequency, 8);
   ledcWrite(buzzPin, 128);
-  vTaskDelay(pdMS_TO_TICKS(durationMs));
-  ledcWrite(buzzPin, 0);
-  ledcDetach(buzzPin);
+  buzzerActiveFrequency = frequency;
+  buzzerActive = true;
+  buzzerStopMillis = millis() + durationMs;
+}
+
+void buzzerPattern3(uint16_t frequency, uint16_t durationMs, uint16_t pauseMs)
+{
+  if (!frequency || !durationMs) return;
+  buzzerPattern[0] = {frequency, durationMs, pauseMs};
+  buzzerPattern[1] = {frequency, durationMs, pauseMs};
+  buzzerPattern[2] = {frequency, durationMs, 0};
+  buzzerPatternCount = 3;
+  buzzerPatternIndex = 0;
+  buzzerPatternRunning = true;
+  buzzerActive = false;
+  buzzerPatternNextMillis = millis();
+}
+
+void buzzerService()
+{
+  unsigned long now = millis();
+
+  if (buzzerActive) {
+    if ((long)(now - buzzerStopMillis) >= 0) {
+      ledcWrite(buzzPin, 0);
+      ledcDetach(buzzPin);
+      buzzerActive = false;
+      if (buzzerPatternRunning) {
+        buzzerPatternNextMillis = now + buzzerPattern[buzzerPatternIndex].pauseMs;
+      }
+    }
+    return;
+  }
+
+  if (buzzerPatternRunning && (long)(now - buzzerPatternNextMillis) >= 0) {
+    BuzzerPatternStep step = buzzerPattern[buzzerPatternIndex];
+    ledcAttach(buzzPin, step.frequency, 8);
+    ledcWrite(buzzPin, 128);
+    buzzerActiveFrequency = step.frequency;
+    buzzerActive = true;
+    buzzerStopMillis = now + step.durationMs;
+    buzzerPatternIndex++;
+    if (buzzerPatternIndex >= buzzerPatternCount) {
+      buzzerPatternRunning = false;
+    }
+  }
 }
 
 void safeWrite(int vpin, double val)       { Blynk.virtualWrite(vpin, val); delay(VWRITE_GAP_MS); }
@@ -884,11 +1069,13 @@ float readINMP441_dB()
 {
   int32_t samples[I2S_BUF_SAMPLES];
   size_t  bytes_read = 0;
+  inmpLastReadHadData = false;
   // v2.2: i2s_channel_read() replaces legacy i2s_read(I2S_PORT, ...).
   // Same blocking-with-timeout semantics as the legacy call.
   i2s_channel_read(inmp441_rx_handle, &samples, sizeof(samples), &bytes_read, pdMS_TO_TICKS(50));
   int count = bytes_read / sizeof(int32_t);
   if (count == 0) return SENSOR_UNAVAILABLE;
+  inmpLastReadHadData = true;
 
   double sum_sq = 0;
   for (int i = 0; i < count; i++) {
@@ -1514,6 +1701,7 @@ void sensorTask(void* pvParam)
 
   while (true)
   {
+    buzzerService();
     unsigned long loopStart = millis();
 
     // ── GPS PPS LED — keep the ESP-32 board D2 LED on for exactly 250ms ───────
@@ -1527,25 +1715,14 @@ void sensorTask(void* pvParam)
     // is running rather than merely proving that the interrupt still fires.
     // A counter is used instead of a boolean so closely spaced/queued events
     // cannot be silently lost; normal GPS PPS is one event per second.
-    uint32_t pendingPps;
-    portENTER_CRITICAL(&ppsLedMux);
-    pendingPps = ppsLedPending;
-    ppsLedPending = 0;
-    portEXIT_CRITICAL(&ppsLedMux);
-    // First finish any active PPS pulse.  The unsigned subtraction is rollover-safe.
-    if (ppsLedIsOn && (long)(millis() - ppsLedOffMillis) >= 0) {
-      setPpsLed(false);
-      ppsLedIsOn = false;
-    }
-
-    // A PPS event requests one simple 250ms blink.  Do not restart/extend the
-    // pulse if another event is already being displayed.  Normal GPS PPS is
-    // one event per second, so this produces a clean 250ms ON / ~750ms OFF pattern.
-    if (pendingPps != 0 && !ppsLedIsOn) {
-      setPpsLed(true);                           // GPS PPS registered — LED ON
-      ppsLedOffMillis = millis() + 250UL;       // fixed 250ms pulse deadline
-      ppsLedIsOn = true;
-    }
+    // ── GPS PPS LED ───────────────────────────────────────────────────────────
+    // v3.6: LED timing is no longer serviced by sensorTask. A dedicated PPS LED
+    // task is woken by the GPIO5 PPS interrupt and generates the exact 250ms
+    // pulse. This prevents slow sensor/I2C processing from stretching the pulse.
+    // The LED is strictly event-driven: it is ON only for the fixed 250ms PPS
+    // indication period, and is never held ON merely because PPS remains locked.
+    // PPS lock state is deliberately NOT used here: every physical PPS event
+    // produces one LED pulse, while loss of PPS naturally leaves the LED OFF.
 
     // ── UV (ML8511 3.3V ratiometric, direct — no divider) ───────────────────
     int uvRaw = averageAnalogRead(UV_OUT_PIN);
@@ -1564,6 +1741,49 @@ void sensorTask(void* pvParam)
     delayMicroseconds(40);
     digitalWrite(dustLED, HIGH);
     float dustDens = max(0.0f, 0.17f * adcToSensorVoltage(voMeas) - 0.1f);
+
+    // ── Additive sensor-health diagnostics ────────────────────────────────────
+    // Persistent rail/no-data conditions are reported, but the corresponding
+    // sensor value remains SENSOR_UNAVAILABLE and all other sensors continue.
+    // A single bad sample is deliberately ignored to avoid false alarms.
+    if (!inmpLastReadHadData) {
+      if (inmpFaultCount < SENSOR_HEALTH_FAIL_LIMIT) inmpFaultCount++;
+    } else {
+      if (inmpFaultReported) engMsg("INMP441: data recovered");
+      inmpFaultCount = 0;
+      inmpFaultReported = false;
+    }
+    if (inmpFaultCount >= SENSOR_HEALTH_FAIL_LIMIT) {
+      inmpFaultReported = true;
+      sensorHealthMsg("INMP441", "no I2S samples", lastInmpHealthMsg);
+    }
+
+    bool uvInvalid = (uvRef <= 50);
+    if (uvInvalid) {
+      if (uvFaultCount < SENSOR_HEALTH_FAIL_LIMIT) uvFaultCount++;
+    } else {
+      if (uvFaultReported) engMsg("UV: sensor data recovered");
+      uvFaultCount = 0;
+      uvFaultReported = false;
+    }
+    if (uvFaultCount >= SENSOR_HEALTH_FAIL_LIMIT) {
+      uvFaultReported = true;
+      sensorHealthMsg("UV", "invalid reference signal", lastUvHealthMsg);
+    }
+
+    bool dustRailFault = (voMeas <= 2 || voMeas >= 4093);
+    if (dustRailFault) {
+      if (dustFaultCount < SENSOR_HEALTH_FAIL_LIMIT) dustFaultCount++;
+    } else {
+      if (dustFaultReported) engMsg("Dust: ADC data recovered");
+      dustFaultCount = 0;
+      dustFaultReported = false;
+    }
+    if (dustFaultCount >= SENSOR_HEALTH_FAIL_LIMIT) {
+      dustFaultReported = true;
+      sensorHealthMsg("Dust", "ADC input at rail", lastDustHealthMsg);
+      dustDens = SENSOR_UNAVAILABLE;
+    }
 
     // ── ENS160 + AHT2x (I2C, ScioSense library) ─────────────────────────────
     float tvoc=SENSOR_UNAVAILABLE, eco2=SENSOR_UNAVAILABLE, aqi=SENSOR_UNAVAILABLE;
@@ -1772,6 +1992,8 @@ void blynkSendSlow()
   safeWrite (V23, snap.eco2_ppm);
   safeWrite (V24, snap.aqi);
   safeWrite (V25, snap.co_heater_v);
+  // Additive diagnostic channel: V34 reports the ESP32 reset cause from boot.
+  safeWriteS(V34, bootResetReasonText);
 }
 
 // v2.5: Blynk Map widget on V33. The Map widget's virtualWrite convention
@@ -1923,7 +2145,7 @@ void wifiService()
       // once per failed connection attempt; the connection process itself is
       // still non-blocking for the full 20-second association window.
       wifiFailureAlertAt = now;
-      buzzerTone(1000,600); delay(200); buzzerTone(1000,600); delay(200); buzzerTone(1000,600);
+      buzzerPattern3(1000, 600, 200);
     }
     return;
   }
@@ -1953,7 +2175,7 @@ bool wifiConnect()
   if (WiFi.status()!=WL_CONNECTED) {
     Serial.println("\n[WiFi] FAILED");
     engMsg("WiFi FAILED: offline");
-    buzzerTone(1000,600); delay(200); buzzerTone(1000,600); delay(200); buzzerTone(1000,600);
+    buzzerPattern3(1000, 600, 200);
     if (xSemaphoreTake(dataMutex,pdMS_TO_TICKS(10))==pdTRUE) {
       sd.status_flags&=~STATUS_WIFI_OK; xSemaphoreGive(dataMutex);
     }
@@ -1980,8 +2202,33 @@ bool wifiConnect()
 void setup()
 {
   Serial.begin(115200);
-  Serial.println("\n[INIT] Air Quality Station ESP32 v3.5");
+  Serial.println("\n[INIT] Air Quality Station ESP32 v3.6");
   Serial.printf("[INIT] ten_mins_autoreset = %s\n", ten_mins_autoreset ? "ON":"OFF");
+
+  // ── ESP reset-cause diagnostic ───────────────────────────────────────────
+  bootResetReason = esp_reset_reason();
+  bootResetReasonText = resetReasonToString(bootResetReason);
+  Serial.printf("[INIT] ESP reset reason: %s (%d)\n",
+                bootResetReasonText, (int)bootResetReason);
+
+  // ── Explicit ESP task-watchdog configuration ─────────────────────────────
+  // Do not rely on the Arduino core's default task-WDT settings. The sensor
+  // task is subscribed below and is expected to feed this watchdog only after
+  // completing a full sensor cycle. A 10s window leaves ample margin for the
+  // existing bounded I2C operations while still recovering a genuinely stuck
+  // sensor task.
+  esp_task_wdt_config_t wdtConfig = {
+    .timeout_ms = 10000,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  esp_err_t wdtConfigResult = esp_task_wdt_reconfigure(&wdtConfig);
+  if (wdtConfigResult == ESP_ERR_INVALID_STATE) {
+    wdtConfigResult = esp_task_wdt_init(&wdtConfig);
+  }
+  Serial.printf("[WATCHDOG] explicit task-WDT config: %s (%d), timeout=%lums\n",
+                wdtConfigResult == ESP_OK ? "OK" : "ERROR",
+                (int)wdtConfigResult, (unsigned long)wdtConfig.timeout_ms);
 
   uint8_t mac[6];
   esp_efuse_mac_get_default(mac);
@@ -1996,6 +2243,9 @@ void setup()
   dataMutex = xSemaphoreCreateMutex();
   memset(&sd, 0, sizeof(sd));
   strncpy(sd.eng_msg, "Booting...", sizeof(sd.eng_msg));
+  // Keep the reset cause in the normal engineering-message path so it is
+  // also visible on the existing Blynk V19 diagnostic channel.
+  engMsgf("ESP reset reason: %s", bootResetReasonText);
   // Pre-fill all sensor fields with UNAVAILABLE until first valid reads
   sd.co_ppm=sd.co_raw=sd.co_heater_v=SENSOR_UNAVAILABLE;
   sd.gps_unix_time = 0;
@@ -2105,6 +2355,12 @@ void setup()
   // Left in this position since it costs nothing and keeps the safe pattern.
   if (INMPsensorThere) initINMP441();
 
+  // ── Launch PPS LED task ───────────────────────────────────────────────────
+  // v3.6: Keep the PPS LED timing independent from sensorTask. The task is
+  // woken directly by the GPIO5 PPS ISR and produces one fixed 250ms pulse.
+  xTaskCreatePinnedToCore(ppsLedTask, "ppsLedTask", 2048, NULL, 2,
+                          &ppsLedTaskHandle, 1);
+
   // ── Launch sensor task on Core 0 ─────────────────────────────────────────
   // WiFi is connected on Core 1 (this setup() function) before CO startup,
   // so the WiFi driver is running during any long CO initialisation.
@@ -2140,7 +2396,7 @@ void setup()
   blynkTimer.setInterval(BLYNK_SEND_SLOW_MS, blynkSendSlow);
   blynkTimer.setInterval(MAP_SEND_INTERVAL_MS, blynkSendMap);
 
-  engMsg("Setup OK v3.5 — long-term reliability monitoring enabled");
+  engMsg("Setup OK v3.6 — long-term reliability monitoring enabled");
   setupDone = true;
 }
 
@@ -2154,6 +2410,8 @@ void setup()
 
 void loop()
 {
+  buzzerService();
+
   if (WIFI) {
     wifiService();
 

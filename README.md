@@ -12,20 +12,21 @@
 
 1. [The story](#the-story)
 2. [Sensor suite](#sensor-suite)
-3. [Why the hardware changed](#why-the-hardware-changed)
-4. [Pin mapping](#pin-mapping)
-5. [Wiring and voltage dividers](#wiring-and-voltage-dividers)
-6. [Firmware architecture](#firmware-architecture)
-7. [CO sensor — calibration and state machine](#co-sensor--calibration-and-state-machine)
-8. [GPS initialisation](#gps-initialisation)
-9. [IMU protocol](#imu-protocol)
-10. [Fault detection and engineering messages](#fault-detection-and-engineering-messages)
-11. [Blynk setup](#blynk-setup)
-12. [Configuration reference](#configuration-reference)
-13. [Required libraries](#required-libraries)
-14. [Air quality mapping](#air-quality-mapping)
-15. [Known limitations and future work](#known-limitations-and-future-work)
-16. [System Health Diagnostics](#system-health-diagnostics)
+3. [Latest update to v3.7](#latest-update-to-v37)
+4. [Why the hardware changed](#why-the-hardware-changed)
+5. [Pin mapping](#pin-mapping)
+6. [Wiring and voltage dividers](#wiring-and-voltage-dividers)
+7. [Firmware architecture](#firmware-architecture)
+8. [CO sensor — calibration and state machine](#co-sensor--calibration-and-state-machine)
+9. [GPS initialisation](#gps-initialisation)
+10. [IMU protocol](#imu-protocol)
+11. [Fault detection and engineering messages](#fault-detection-and-engineering-messages)
+12. [Blynk setup](#blynk-setup)
+13. [Configuration reference](#configuration-reference)
+14. [Required libraries](#required-libraries)
+15. [Air quality mapping](#air-quality-mapping)
+16. [Known limitations and future work](#known-limitations-and-future-work)
+17. [System Health Diagnostics](#system-health-diagnostics)
 
 ---
 
@@ -100,6 +101,26 @@ on local home infrastructure. No data leaves the local network.
 | DHT21 / AM2301 | Temperature · relative humidity | Single-wire | 3.3 V |
 | JY-901 / WT901 | Roll · Pitch · Yaw · IMU temperature | UART 115200 baud | 3.3 V |
 | u-blox GPS module | Position · satellite count · HDOP | UART 9600 → 115200 baud | 3.3 V |
+
+---
+
+## Latest update to v3.7
+
+* Added ESP32 reset-cause diagnostics at startup, including human-readable reset reason reporting.
+* Added Blynk V34 diagnostic output for the ESP32 reset reason.
+* Added explicit ESP32 task-watchdog configuration with a 10-second timeout instead of relying on the Arduino core default.
+* Added explicit watchdog registration and feeding for the sensor task only after a complete sensor cycle.
+* Added sensor-task heartbeat monitoring to detect a task that is alive but no longer completing its work cycle.
+* Added asynchronous non-blocking buzzer control so buzzer tones no longer block sensor processing or Blynk/WiFi operation.
+* Added an asynchronous buzzer pattern state machine for multi-beep alerts without using blocking delays.
+* Added persistent sensor-health monitoring for the INMP441 microphone with fault and recovery reporting.
+* Added persistent sensor-health monitoring for the ML8511 UV sensor with fault and recovery reporting.
+* Added persistent sensor-health monitoring for the GP2Y1010 dust sensor with fault and recovery reporting.
+* Added `SENSOR_UNAVAILABLE` handling for failed INMP441, UV, and dust sensors so invalid sensors do not provide misleading measurements.
+* Added fault persistence thresholds to prevent a single bad sensor reading from generating a false alarm.
+* Added automatic sensor-recovery reporting when a previously failed sensor starts providing valid data again.
+* Ensured sensor-health faults are isolated so a malfunctioning sensor does not stop the sensor task or prevent the remaining sensors from operating.
+* Preserved all existing sensor-specific fault detection, retry, watchdog, GPS, CO, Blynk, WiFi, display, LED, buzzer, and status logic.
 
 ---
 
