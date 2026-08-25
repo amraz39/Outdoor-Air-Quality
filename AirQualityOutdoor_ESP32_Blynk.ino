@@ -248,6 +248,38 @@
 //   • Existing sensor, GPS, INAV, CO, Blynk, map, display, buzzer, and status
 //     logic is preserved; changes are limited to reliability/monitoring paths.
 // ============================================================================
+// v3.7 LONG-TERM RELIABILITY IMPROVEMENTS — additive, existing behaviour kept
+//   • Added ESP32 reset-cause diagnostics at startup, including human-readable 
+//     reset reason reporting.
+//   • Added Blynk V34 diagnostic output for the ESP32 reset reason.
+//   • Added explicit ESP32 task-watchdog configuration with a 10-second timeout 
+//     instead of relying on the Arduino core default.
+//   • Added explicit watchdog registration and feeding for the sensor task only 
+//     after a complete sensor cycle.
+//   • Added sensor-task heartbeat monitoring to detect a task that is alive but 
+//     no longer completing its work cycle.
+//   • Added asynchronous non-blocking buzzer control so buzzer tones no longer 
+//     block sensor processing or Blynk/WiFi operation.
+//   • Added an asynchronous buzzer pattern state machine for multi-beep alerts 
+//     without using blocking delays.
+//   • Added persistent sensor-health monitoring for the INMP441 microphone with 
+//     fault and recovery reporting.
+//   • Added persistent sensor-health monitoring for the ML8511 UV sensor with fault 
+//     and recovery reporting.
+//   • Added persistent sensor-health monitoring for the GP2Y1010 dust sensor with 
+//     fault and recovery reporting.
+//   • Added `SENSOR_UNAVAILABLE` handling for failed INMP441, UV, and dust sensors 
+//     so invalid sensors do not provide misleading measurements.
+//   • Added fault persistence thresholds to prevent a single bad sensor reading 
+//     from generating a false alarm.
+//   • Added automatic sensor-recovery reporting when a previously failed sensor 
+//     starts providing valid data again.
+//   • Ensured sensor-health faults are isolated so a malfunctioning sensor does not 
+//     stop the sensor task or prevent the remaining sensors from operating.
+//   • Preserved all existing sensor-specific fault detection, retry, watchdog, 
+//     GPS, CO, Blynk, WiFi, display, LED, buzzer, and status logic.
+// ============================================================================
+
 
 #define BLYNK_HEARTBEAT 60
 
@@ -2202,7 +2234,7 @@ bool wifiConnect()
 void setup()
 {
   Serial.begin(115200);
-  Serial.println("\n[INIT] Air Quality Station ESP32 v3.6");
+  Serial.println("\n[INIT] Air Quality Station ESP32 v3.7");
   Serial.printf("[INIT] ten_mins_autoreset = %s\n", ten_mins_autoreset ? "ON":"OFF");
 
   // ── ESP reset-cause diagnostic ───────────────────────────────────────────
@@ -2396,7 +2428,7 @@ void setup()
   blynkTimer.setInterval(BLYNK_SEND_SLOW_MS, blynkSendSlow);
   blynkTimer.setInterval(MAP_SEND_INTERVAL_MS, blynkSendMap);
 
-  engMsg("Setup OK v3.6 — long-term reliability monitoring enabled");
+  engMsg("Setup OK v3.7 — long-term reliability monitoring enabled");
   setupDone = true;
 }
 
