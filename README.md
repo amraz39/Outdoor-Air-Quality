@@ -4,7 +4,7 @@
 > sound, temperature, humidity, and orientation — with live GPS coordinates
 > streaming to a self-hosted Blynk dashboard for real-time air-quality mapping.*
 
-**ESP32 · FreeRTOS dual-core · Blynk 0.6.1 local server · u-blox GPS · 8 sensors**
+**ESP32 · FreeRTOS dual-core · Blynk 0.6.1 local server · ATGM336H GPS · 8 sensing subsystems**
 
 ---
 
@@ -91,36 +91,46 @@ on local home infrastructure. No data leaves the local network.
 
 ## Sensor suite
 
-| Sensor | Parameter measured | Interface | Supply voltage |
-|---|---|---|---|
-| MQ-7 (custom heater board) | Carbon monoxide (CO ppm) | Analogue + PWM heater control | 5 V |
-| MICS-2710 | Nitrogen dioxide (NO₂) | Analogue | 5 V |
-| ML8511 | UV index (UVI) | Analogue ratiometric | 3.3 V |
-| Sharp GP2Y1010AU0F | Particulate matter / dust density | Analogue + IR LED control | 5 V |
-| Analogue microphone module | Sound level (peak-to-peak voltage) | Analogue | 3.3 V or 5 V |
-| DHT21 / AM2301 | Temperature · relative humidity | Single-wire | 3.3 V |
-| JY-901 / WT901 | Roll · Pitch · Yaw · IMU temperature | UART 115200 baud | 3.3 V |
-| u-blox GPS module | Position · satellite count · HDOP | UART 9600 → 115200 baud | 3.3 V |
+| Sensor | Parameter measured | Interface | Supply voltage | Firmware role |
+|---|---|---|---|---|
+| MQ-7 (custom heater board) | Carbon monoxide (CO ppm) | Analogue + PWM heater control | 5 V | Closed-loop heater control and CO estimation |
+| ML8511 | UV index (UVI) | Analogue ratiometric | 3.3 V | UV measurement with reference compensation |
+| Sharp GP2Y1010AU0F | Particulate matter / dust density | Analogue + IR LED control | 5 V | Dust-density estimate |
+| ENS160 | TVOC · eCO₂ · AQI | I²C 0x53 | 3.3 V | VOC/equivalent-CO₂/air-quality processing |
+| AHT2x | Temperature · relative humidity | I²C 0x38 | 3.3 V | Ambient data and ENS160 compensation |
+| INMP441 | Sound level estimate | I²S | 3.3 V | 24-bit digital microphone, dBFS estimate |
+| GY-BMI160 | Roll · pitch · yaw/heading · IMU temperature · raw gyro/accel | I²C 0x69 | 3.3 V | IMU health, attitude estimate and INAV |
+| ATGM336H GPS | Position · satellite count · HDOP · UTC time · 1PPS | UART1 + GPIO PPS | 3.3 V | Raw GPS, INAV correction and PPS lock indication |
+
+> The current firmware no longer uses the former MICS-2710, DHT21/AM2301, JY-901/WT901, analogue microphone, or u-blox GPS. Those references in the historical migration sections are retained only to document the project's evolution.
 
 ---
 
 ## Latest update to v3.7
 
-* Added ESP32 reset-cause diagnostics at startup, including human-readable reset reason reporting.
-* Added Blynk V34 diagnostic output for the ESP32 reset reason.
-* Added explicit ESP32 task-watchdog configuration with a 10-second timeout instead of relying on the Arduino core default.
-* Added explicit watchdog registration and feeding for the sensor task only after a complete sensor cycle.
-* Added sensor-task heartbeat monitoring to detect a task that is alive but no longer completing its work cycle.
-* Added asynchronous non-blocking buzzer control so buzzer tones no longer block sensor processing or Blynk/WiFi operation.
-* Added an asynchronous buzzer pattern state machine for multi-beep alerts without using blocking delays.
-* Added persistent sensor-health monitoring for the INMP441 microphone with fault and recovery reporting.
-* Added persistent sensor-health monitoring for the ML8511 UV sensor with fault and recovery reporting.
-* Added persistent sensor-health monitoring for the GP2Y1010 dust sensor with fault and recovery reporting.
-* Added `SENSOR_UNAVAILABLE` handling for failed INMP441, UV, and dust sensors so invalid sensors do not provide misleading measurements.
-* Added fault persistence thresholds to prevent a single bad sensor reading from generating a false alarm.
-* Added automatic sensor-recovery reporting when a previously failed sensor starts providing valid data again.
-* Ensured sensor-health faults are isolated so a malfunctioning sensor does not stop the sensor task or prevent the remaining sensors from operating.
-* Preserved all existing sensor-specific fault detection, retry, watchdog, GPS, CO, Blynk, WiFi, display, LED, buzzer, and status logic.
+The current firmware (`AirQualityOutdoor_ESP32_Blynk(5).ino`) adds the following long-term reliability and diagnostic features while preserving the existing sensor, GPS, INAV, CO, Blynk, WiFi, display, LED, buzzer, and status logic:
+
+* Added ESP32 reset-cause diagnostics at startup using `esp_reset_reason()`.
+* Added **Blynk V34** for the human-readable ESP32 reset reason. V34 is a boot diagnostic, not a live sensor-health value.
+* Added explicit ESP32 task-watchdog configuration with a **10-second timeout**.
+* The sensor task is explicitly registered with the task watchdog and feeds it **only after a complete sensor cycle**.
+* Added a sensor-task heartbeat counter and health monitoring for a task that is alive but stops completing its work cycle.
+* Added asynchronous, non-blocking buzzer tones and a three-step buzzer pattern state machine; the existing buzzer calls remain compatible.
+* Added persistent health monitoring and recovery reporting for INMP441, UV, and dust sensors.
+* Added `SENSOR_UNAVAILABLE` handling for persistent invalid/no-data conditions so failed sensors do not silently produce plausible measurements.
+* Added bounded I²C timeout (`Wire.setTimeOut(50)`) and sensor retry behaviour.
+* Added non-blocking WiFi association/reconnect handling and bounded Blynk server probing/handshake handling.
+* Preserved the GPS PPS interrupt and dedicated PPS LED task: every received PPS event produces a fixed **250 ms** pulse on the ESP32 board's D2/GPIO2 LED.
+* Preserved the BMI160-based INAV EKF and the GPS-loss states `NO_FIX_YET`, `GPS_FIX`, `IMU_RECENT`, `IMU_STALE`, and `LOST`.
+
+### Important diagnostic distinction
+
+* **V4** is the changing application/telemetry diagnostic value.
+* **V19** is the latest human-readable engineering/status message generated during operation.
+* **V20** is the live subsystem-status bitmask.
+* **V26** is GPS PPS lock (`0`/`1`).
+* **V27** is the INAV state (`0`–`4`).
+* **V34** is the ESP32 **reset cause from the most recent boot**.
 
 ---
 
@@ -143,39 +153,35 @@ on local home infrastructure. No data leaves the local network.
 
 ### Analogue inputs — ADC1 only
 
-> The ESP32 WiFi driver disables ADC2 at runtime. Every analogue signal in this
-> project is routed to ADC1 (GPIO 32–36, 34, 35, 39). GPIO 26 and 27 appear in
-> ADC2 but are used as digital outputs only — this is safe.
+| Signal | ESP32 GPIO | Notes |
+|---|---:|---|
+| MQ-7 CO sense A0 | **36 (VP)** | Input-only · 10kΩ + 10kΩ divider |
+| MQ-7 heater feedback A1 | **39 (VN)** | Input-only · 10kΩ + 10kΩ divider |
+| ML8511 UV OUT | **34** | Input-only · direct 3.3 V |
+| ML8511 UV REF | **35** | Input-only · direct 3.3 V |
+| GP2Y1010 dust AO | **32** | 10kΩ + 10kΩ divider |
 
-| Signal | Original Mega pin | ESP32 GPIO | ADC channel | Notes |
-|---|---|---|---|---|
-| CO sensor AO | A0 / A1 | **36 (VP)** | ADC1_CH0 | Input-only · **voltage divider required** |
-| UV output | A2 | **39 (VN)** | ADC1_CH3 | Input-only · direct 3.3 V connection |
-| UV 3.3 V reference | A3 | **34** | ADC1_CH6 | Input-only · direct 3.3 V connection |
-| Dust sensor AO | A4 | **35** | ADC1_CH7 | Input-only · **voltage divider required** |
-| Microphone AO | A5 | **32** | ADC1_CH4 | Divider required only if module runs at 5 V |
-| NO₂ sensor AO | A7 | **33** | ADC1_CH5 | **Voltage divider required** |
+### Digital / peripheral I/O
 
-### Digital I/O
+| Signal | ESP32 GPIO | Direction / notes |
+|---|---:|---|
+| CO heater PWM | **4** | LEDC output |
+| GPS 1PPS | **5** | Rising-edge interrupt input |
+| ESP32 board D2 LED / PPS LED | **2** | Output · 250 ms pulse per PPS event |
+| Dust IR LED | **18** | Active LOW output |
+| CO green LED | **14** | Output |
+| CO orange LED | **27** | Output |
+| CO red LED | **15** | Output |
+| Buzzer | **19** | LEDC output |
+| I²C SDA | **21** | ENS160 + AHT2x + BMI160 |
+| I²C SCL | **22** | ENS160 + AHT2x + BMI160 |
+| GPS UART1 RX | **13** | ATGM336H TX → ESP32 RX |
+| GPS UART1 TX | **23** | ESP32 TX → ATGM336H RX |
+| INMP441 BCLK | **25** | I²S |
+| INMP441 LRCLK/WS | **26** | I²S |
+| INMP441 data | **33** | I²S input |
 
-| Signal | Original Mega pin | ESP32 GPIO | Direction | Notes |
-|---|---|---|---|---|
-| CO heater PWM | D9 | **4** | Output | LEDC channel 0 — avoids all strapping pins |
-| Dust IR LED (active LOW) | D53 | **18** | Output | |
-| DHT21 data | D45 | **5** | Bidirectional | Strapping pin; DHT idle = HIGH → safe at boot |
-| LED green (CO ≤ 10 ppm) | D10 | **14** | Output | |
-| LED orange (CO 10–20 ppm) | D11 | **27** | Output | ADC2 pin used as output — no conflict |
-| LED red (CO > 20 ppm) | D12 | **26** | Output | ADC2 pin used as output — no conflict |
-| Buzzer | D7 | **19** | Output | LEDC channel 1 for tone generation |
-
-### UART
-
-| Bus | Original | ESP32 UART | RX GPIO | TX GPIO | Baud rate | Notes |
-|---|---|---|---|---|---|---|
-| GPS | Serial1 | UART1 | **22** | **23** | 9600 → 115200 | Remapped: default GPIO 9/10 conflict with flash |
-| IMU | Serial2 | UART2 | **16** | **17** | 115200 | Default UART2 pins — no conflict |
-| Debug | USB | UART0 | 3 | 1 | 115200 | Standard USB serial |
-| ~~WiFi (removed)~~ | ~~Serial3~~ | — | — | — | — | Replaced by ESP32 built-in WiFi |
+> GPIO16/GPIO17 are no longer used by the former JY-901. The BMI160 is the only IMU and is connected through I²C.
 
 ---
 
@@ -230,20 +236,21 @@ error is immeasurably small.
 ### Which signals need a divider
 
 | Signal | ESP32 GPIO | Divider | Reason |
-|---|---|---|---|
-| MQ-7 CO analogue out | 36 | 10 kΩ + 15 kΩ or **10 kΩ + (10 kΩ + 10 kΩ)** | Vo is referenced to the 5 V heater supply |
-| MICS-2710 NO₂ analogue out | 33 | 10 kΩ + 15 kΩ or **10 kΩ + (10 kΩ + 10 kΩ)** | 5 V supply — output can reach 5 V |
-| GP2Y1010 dust Vo | 35 | 10 kΩ + 15 kΩ or **10 kΩ + (10 kΩ + 10 kΩ)** | 5 V supply — Vo up to ~3.5 V |
-| Microphone AO | 32 | 10 kΩ + 15 kΩ or **10 kΩ + (10 kΩ + 10 kΩ)** | Only if the module is powered at 5 V |
-| ML8511 UV OUT and REF | 39 / 34 | None — direct connection | 3.3 V ratiometric output |
-| DHT21 DATA | 5 | None — direct + 4.7 kΩ pull-up to 3.3 V | 3.3 V logic, open-drain bus |
-| GPS UART (TX/RX) | 22 / 23 | None — direct connection | 3.3 V module |
-| IMU UART (TX/RX) | 16 / 17 | None — direct connection | 3.3 V module |
+|---|---:|---|---|
+| MQ-7 CO analogue out | **36** | 10 kΩ + 10 kΩ | MQ-7 board can present a 5 V-referenced analogue signal |
+| MQ-7 heater feedback A1 | **39** | 10 kΩ + 10 kΩ | 5 V heater feedback is scaled to the ESP32 ADC |
+| GP2Y1010 dust Vo | **32** | 10 kΩ + 10 kΩ | Sensor is powered from 5 V; analogue output must stay within ESP32 limits |
+| ML8511 UV OUT / REF | **34 / 35** | None | Native 3.3 V ratiometric outputs |
+| ENS160 / AHT2x / BMI160 I²C | **21 / 22** | None | 3.3 V I²C bus |
+| ATGM336H GPS UART | **13 / 23** | None | 3.3 V UART |
+| INMP441 I²S | **25 / 26 / 33** | None | 3.3 V digital interface |
 
-> **Dust density firmware correction** — because the GP2Y1010 Vo is scaled down
-> by the divider (factor 3/5), the firmware multiplies the ADC voltage back up by
-> 5/3 (or in my case **2/3**) before applying the `0.17 × Vo − 0.1` calibration curve. 
-> Without this correction dust density would read approximately 40 % too low.
+> The current firmware no longer uses the former MICS-2710, DHT21, analogue
+> microphone, or JY-901 connections.
+
+> **Dust-density scaling:** the GP2Y1010 analogue voltage is divided before the
+> ESP32 ADC. The firmware applies the configured divider scale before using its
+> `0.17 × Vo − 0.1` estimate.
 
 ---
 
@@ -251,55 +258,34 @@ error is immeasurably small.
 
 ### Dual-core FreeRTOS task split
 
+```text
+Core 0 — sensorTask
+  UV, dust, ENS160/AHT2x, INMP441, CO state machine
+  GPS UART parsing and GPS validity
+  BMI160 reads + complementary attitude filter
+  INAV EKF and GPS-loss state machine
+  Per-sensor health checks
+  Sensor-task heartbeat
+  Explicit task-WDT registration/feed
+
+Core 1 — Arduino loop()
+  WiFi state machine
+  Blynk.run() and BlynkTimer
+  Blynk telemetry writes
+  Bounded Blynk TCP probe/handshake
+  Non-blocking buzzer service
+
+Dedicated PPS task
+  Woken by the GPIO5 PPS ISR
+  Generates exactly one 250 ms D2/GPIO2 LED pulse per PPS event
+
+Shared state
+  SensorData is protected by a FreeRTOS mutex.
 ```
-Core 0 ── blynkTask ──────────────────────────────────────────────────────────
-  WiFi connect on startup; reconnect watchdog every 30 s
-  Blynk.run() + BlynkTimer loop
-  Snapshot SensorData struct under mutex → virtualWrite all 20 pins every 5 s
-  Engineering message flush to V19 every 10 s
 
-Core 1 ── sensorTask ─────────────────────────────────────────────────────────
-  UV, NO₂, sound, dust reads every loop cycle (~25 ms cadence)
-  DHT21 temperature and humidity
-  CO state machine — tickCO() drives the heat/measure cycle
-  GPS serial feed → TinyGPS++ decode → position, HDOP, satellite count
-  IMU frame polling → Roll, Pitch, Yaw, temperature
-  Per-subsystem watchdog checks and status flag updates
-  LED indicator logic and optional OLED update
-  Write all results to shared SensorData struct under mutex
-
-loop() ───────────────────────────────────────────────────────────────────────
-  Immediately calls vTaskDelete(NULL) — frees ~8 KB stack
-  All work is driven by the two named tasks above
-```
-
-A `SemaphoreHandle_t dataMutex` guards the `SensorData` struct. `blynkTask`
-takes a full atomic snapshot copy before writing to Blynk, so neither task ever
-sees a struct that is mid-update.
-
-### Shared data struct
-
-```cpp
-struct SensorData {
-  float    co_ppm, co_raw;           
-  byte     co_phase;   
-  bool     co_fault;
-  float    no2_raw, no2_voltage;
-  float    uvi;
-  float    sound_v;
-  float    dust_mg;
-  float    temp, hum;                
-  bool     dht_fault;
-  float    angle[3], imu_temp;       
-  bool     imu_ok;
-  double   lat, lng;   
-  float    hdop, sats;   
-  bool     gps_fix;
-  uint32_t status_flags;
-  char     eng_msg[128];
-  int      rand_num;
-};
-```
+The sensor task is isolated from Blynk/WiFi activity. A Blynk outage therefore does
+not stop sensor acquisition. Conversely, a failed sensor is isolated and does not
+stop the remaining sensors. I²C operations are bounded by a 50 ms Wire timeout.
 
 ---
 
@@ -357,99 +343,183 @@ sensor — and the exponential moving average is not updated.
 
 ## GPS initialisation
 
-The u-blox module is configured at startup via a `UBLOX_INIT[]` byte array
-transmitted over UART1. The array was fully audited and corrected from the
-original 2017 version:
+The current GPS is an **ATGM336H** using standard NMEA output at **9600 baud**.
+No u-blox UBX configuration sequence is used. TinyGPS++ parses the NMEA stream on
+Core 0.
 
-| Change | Detail |
-|---|---|
-| All checksums verified | Automated byte-level check confirmed all 8 UBX messages are valid |
-| GGA explicitly enabled | `CFG-MSG` for GGA set to rate = 1 before disabling all other sentences |
-| Rate changed from 10 Hz to **5 Hz** | 10 Hz was marginal alongside FreeRTOS task scheduling; 5 Hz is reliable |
-| Stray `CFG-PRT` POLL byte removed | Was sent after the baud-switch command — GPS had already changed speed and ignored it |
-| **15 ms inter-message delay** added | u-blox requires ~10 ms per `CFG-` command; back-to-back transmission risked the baud switch being lost |
+The GPS also supplies a **1PPS signal on GPIO5**. The PPS ISR records timing/event
+state only; a dedicated FreeRTOS task generates a fixed 250 ms pulse on the ESP32
+board's D2/GPIO2 LED. This makes the LED a direct visual indication that GPS PPS
+events are reaching the ESP32.
 
-After the `CFG-PRT` command switches the GPS to 115200 baud, `gps_serial` is
-torn down and restarted at the new speed. `feedGPS(150)` runs once per sensor
-loop, polling the UART for up to 150 ms and passing bytes to TinyGPS++, which
-extracts latitude, longitude, HDOP, and satellite count from `$GPGGA` sentences
-— the only NMEA message left enabled.
+### PPS lock criteria
+
+V26 reports PPS lock as:
+
+```text
+0 = not locked
+1 = locked
+```
+
+A PPS lock requires a pulse within the last 2 seconds and a measured PPS interval
+between **0.900 s and 1.100 s**. The LED is event-driven: it does not remain on
+while PPS is locked.
 
 ---
 
 ## IMU protocol
 
-The JY-901 / WT901 transmits framed 11-byte packets at 115200 baud over UART2:
+The current IMU is the **GY-BMI160** at I²C address `0x69`. It is read directly by
+the firmware; no external BMI160 library is required. The configured ranges are:
 
-```
-Byte  0      0x55  — frame header
-Byte  1      0x53  — angle output packet type
-Bytes 2–3    Roll  as signed int16  →  Roll  = value / 32768 × 180°
-Bytes 4–5    Pitch as signed int16  →  Pitch = value / 32768 × 180°
-Bytes 6–7    Yaw   as signed int16  →  Yaw   = value / 32768 × 180°
-Bytes 8–9    Temperature as int16   →  T     = value / 340 + 36.25 + offset
-Byte  10     Checksum
+```text
+Accelerometer: ±4 g
+Gyroscope:     ±500 dps
+ODR:           100 Hz
 ```
 
-The original `serialEvent2()` ISR (which has no equivalent on the ESP32) is
-replaced by `pollIMU()` — a manual polling function called once per sensor loop
-with a 200 ms timeout. If no valid angle frame arrives within `IMU_TIMEOUT_MS`
-(5 s), `STATUS_IMU_STUCK` is raised and an engineering message is sent.
+The BMI160 supplies raw gyro/accelerometer data for INAV and a lightweight
+complementary filter. Roll and pitch use gyro integration corrected by the
+gravity vector. Yaw is the INAV/GPS-corrected heading state because the BMI160 has
+no magnetometer. The BMI160 die temperature is reported on V11.
+
+A failed individual I²C read does not immediately declare the IMU dead.
+`STATUS_IMU_STUCK` is raised only after no successful BMI160 read has been seen for
+`IMU_TIMEOUT_MS` (5 s).
 
 ---
 
 ## Fault detection and engineering messages
 
-Every subsystem runs an independent watchdog. Faults surface through two
-dedicated Blynk virtual pins:
+The firmware exposes three different diagnostic concepts:
 
-- **V19** — the last engineering message as a human-readable string, updated
-  within 10 s of any event
-- **V20** — the full system status bitmask, updated every 5 s alongside sensor
-  data; build a LED/label widget on this pin to see health at a glance
+- **V19 — Engineering message:** the latest human-readable runtime event.
+- **V20 — System status:** a live bitmask of subsystem health.
+- **V34 — Reset diagnostic:** the human-readable ESP32 reset cause recorded at boot.
 
-### Watchdog table
+### V20 status bitmask — current firmware
 
-| Subsystem | Trigger condition | Timeout | Action taken |
-|---|---|---|---|
-| CO phase | Phase not transitioning normally | `CO_PHASE_MAX_MS` = 3 min | Force transition · raise `STATUS_CO_FAULT` |
-| CO ADC | Reading at rail (< 10 or > 4085 counts) | Immediate | Reject value · skip EMA update · log warning |
-| GPS fix | Valid fix with ≥ 4 satellites not present | `GPS_TIMEOUT_MS` = 15 s | Hold last position + small offset · raise `STATUS_GPS_FAULT` |
-| IMU frame | No valid angle frame received | `IMU_TIMEOUT_MS` = 5 s | Raise `STATUS_IMU_STUCK` · log message |
-| DHT read | Consecutive NaN or out-of-range results | `DHT_MAX_FAILS` = 5 failures | Hold last valid reading · raise `STATUS_DHT_FAULT` |
-| WiFi link | `WL_CONNECTED` state lost | `WIFI_RECONNECT_MS` = 30 s | Call `WiFi.reconnect()` · clear `STATUS_WIFI_OK` |
+| Bit | Value | Flag constant | Meaning |
+|---:|---:|---|---|
+| 0 | `1` | `STATUS_WIFI_OK` | WiFi connected to the local network |
+| 1 | `2` | `STATUS_GPS_OK` | GPS position valid with age < 15 s and at least 4 satellites |
+| 2 | `4` | `STATUS_IMU_OK` | BMI160 has a recent successful read |
+| 3 | `8` | `STATUS_ENS_OK` | ENS160 + AHT2x read succeeded |
+| 4 | `16` | `STATUS_CO_FAULT` | CO phase watchdog/invalid CO condition |
+| 5 | `32` | `STATUS_GPS_FAULT` | No valid GPS data for more than 15 s |
+| 6 | `64` | `STATUS_IMU_STUCK` | No successful BMI160 read for more than 5 s |
+| 7 | `128` | `STATUS_ENS_FAULT` | ENS160/AHT2x failed repeatedly |
+| 8 | `256` | `STATUS_CO_NO_SNS` | MQ-7 sensor not detected at startup |
 
-### Status bitmask — V20
+A normal fully connected system therefore normally has:
 
-| Bit | Flag constant | Meaning |
+```text
+V20 = 15
+```
+
+because `1 + 2 + 4 + 8 = 15`.
+
+### V34 — ESP32 reset reason
+
+V34 is updated every 10 seconds with `bootResetReasonText`, which is captured once
+at startup from `esp_reset_reason()`. It therefore tells you **why the current ESP32
+boot occurred**; it is not a continuously changing health counter.
+
+#### All possible V34 text outputs in the current firmware
+
+| V34 value | Meaning | Typical interpretation |
 |---|---|---|
-| 0 | `STATUS_WIFI_OK` | WiFi connected to local network |
-| 1 | `STATUS_GPS_OK` | GPS fix valid with ≥ 4 satellites |
-| 2 | `STATUS_IMU_OK` | IMU angle frame received recently |
-| 3 | `STATUS_DHT_OK` | DHT21 reading is valid |
-| 4 | `STATUS_CO_FAULT` | CO phase watchdog triggered or ADC at rail |
-| 5 | `STATUS_GPS_FAULT` | No valid GPS data for more than 15 s |
-| 6 | `STATUS_IMU_STUCK` | No IMU frame received for more than 5 s |
-| 7 | `STATUS_DHT_FAULT` | Five or more consecutive DHT read failures |
+| `UNKNOWN` | Reset reason could not be identified | Investigate if unexpected |
+| `POWERON` | Normal power-on reset | Power was applied or the ESP32 restarted from a power-on condition |
+| `EXTERNAL` | External reset | Reset pin/external reset circuit was asserted |
+| `SOFTWARE` | Software-requested reset | Firmware or another software component requested a restart |
+| `PANIC` | ESP32 panic/crash reset | Fatal software exception/panic; investigate Serial output |
+| `INT_WDT` | Interrupt watchdog reset | CPU/interrupt handling was blocked too long |
+| `TASK_WDT` | Task watchdog reset | A subscribed task failed to feed the task watchdog |
+| `WDT` | Other watchdog reset | Watchdog subsystem caused the restart |
+| `DEEPSLEEP` | Deep-sleep wake/reset | Reset associated with deep-sleep operation |
+| `BROWNOUT` | Brownout reset | Supply voltage dropped below the ESP32 brownout threshold |
+| `SDIO` | SDIO reset | Reset caused by the SDIO subsystem |
+| `OTHER` | Unrecognised ESP32 reset code | New/unsupported reset reason for this firmware's mapping |
 
-### Example engineering messages
+### How to use V34 in the field
 
-The following messages appear on Serial and on Blynk V19 during normal operation
-and fault conditions:
+```text
+POWERON / EXTERNAL / SOFTWARE
+    → usually intentional or expected; verify the circumstances.
 
+PANIC / INT_WDT / TASK_WDT / WDT
+    → abnormal; inspect Serial diagnostics and the preceding V19 messages.
+
+BROWNOUT
+    → investigate power supply, wiring, regulator capacity, bulk capacitance,
+      and voltage drops before blaming application software.
+
+UNKNOWN / OTHER
+    → investigate the reset history and ESP32/core version.
 ```
-[ENG] GPS: UBX config sent, running at 115200 baud 5Hz GGA-only
-[ENG] CO-CAL OK: duty=187 V=1.402V
-[ENG] CO: measurement phase (duty=187 ~1.4V)
-[ENG] CO: cycle complete ppm=4.2 raw=618.0
-[ENG] CO WATCHDOG: phase 1 stuck >180s — forcing transition
-[ENG] GPS: fix lost (sats=2 age=16234ms)
-[ENG] GPS FAULT: no valid data for >15s
-[ENG] IMU STUCK: no frame for 6s
-[ENG] DHT FAULT: 5 consecutive read failures
+
+V34 is especially useful for unattended operation: if the station appears to have
+restarted overnight, the next boot reports the previous reset classification rather
+than leaving only a silent reboot.
+
+### Other runtime diagnostic messages
+
+The following are representative messages generated by the current firmware on
+Serial and/or V19. They are event-driven rather than a fixed enumerated V34 list:
+
+```text
+[ENG] ESP reset reason: POWERON
+[ENG] Setup OK v3.7 — long-term reliability monitoring enabled
+[ENG] ENS160+AHT2x: OK
+[ENG] BMI160: init OK (±4g, ±500dps, 100Hz)
+[ENG] INMP441: I2S mic OK (new i2s_std driver, no ADC conflict)
+[ENG] GPS: ATGM336H NMEA 9600 baud — no init needed
+[ENG] INAV: waiting for first GPS fix
+[ENG] INAV: position acquired by GPS
+[ENG] INAV: GPS gap — interpolating from recent GPS+IMU
+[ENG] INAV: GPS lost >=3 fixes — interpolating (stale baseline)
+[ENG] INAV: GPS lost >5 min — interpolation stopped, holding position
+[ENG] GPS: fix lost (...)
+[ENG] GPS FAULT: no data >15s
+[ENG] IMU STUCK: BMI160 no good read for ...s
+[ENG] ENS FAULT: 5 failures — retrying every 10s
+[ENG] INMP441 FAULT: no I2S samples — other sensors continue
+[ENG] UV FAULT: invalid reference signal — other sensors continue
+[ENG] Dust FAULT: ADC input at rail — other sensors continue
+[ENG] INMP441: data recovered
+[ENG] UV: sensor data recovered
+[ENG] Dust: ADC data recovered
 [ENG] WiFi: reconnect attempt
-[ENG] AUTO-RESET: 10-minute watchdog triggered
+[ENG] WiFi FAILED: offline
+[ENG] WiFi OK — Blynk configured ...
+[ENG] BLYNK FAST: mutex timeout
+[ENG] BLYNK SLOW: mutex timeout
+[ENG] BLYNK MAP: mutex timeout
+[ENG] CO WATCHDOG: phase ... stuck >180s heater=...V
+[ENG] CO: sensor absent — check A0 wiring and divider
+[ENG] AUTO-RESET: 10-min watchdog
 ```
+
+> The exact numeric values in messages such as satellite count, elapsed time,
+> heater voltage, or CO concentration vary with the live system state.
+
+### Long-term recovery mechanisms
+
+| Mechanism | Current behaviour |
+|---|---|
+| I²C | `Wire.setTimeOut(50)` bounds I²C operations to 50 ms |
+| ENS160/AHT2x | Retries after repeated failures; sensor task continues |
+| BMI160 | Retries initialization; persistent read loss raises `STATUS_IMU_STUCK` |
+| INMP441 | Five consecutive no-data cycles trigger a persistent diagnostic; recovery is reported |
+| UV | Five consecutive invalid reference readings trigger a diagnostic; recovery is reported |
+| Dust | Five consecutive rail readings trigger a diagnostic and `SENSOR_UNAVAILABLE` |
+| Sensor task | Heartbeat plus explicit task watchdog; watchdog feed occurs after a complete cycle |
+| Task watchdog | Explicit **10 s** timeout with panic/reset recovery enabled |
+| WiFi | Non-blocking 20 s association attempt, then retry |
+| Blynk | Bounded 250 ms TCP server probe and 1 s Blynk I/O timeout; handshake serviced incrementally |
+| Buzzer | Non-blocking tone/pattern state machine |
+| GPS PPS LED | Dedicated task; one fixed 250 ms D2 pulse per PPS event |
 
 ---
 
@@ -489,28 +559,55 @@ same sketch folder. **Never commit this file to version control** — add it to
 
 ### Virtual pin reference
 
-| Pin | Signal | Unit | Notes |
-|---|---|---|---|
-| V1 | Sound level | V peak-to-peak | Converted from 12-bit ADC |
-| V2 | CO concentration | ppm | Updated at the end of each 90 s measurement phase |
-| V3 | UV index | UVI | ML8511 ratiometric calculation |
-| V4 | Diagnostic random number | — | Confirms data pipeline is live |
-| V5 | NO₂ raw ADC | counts 0–4095 | Calibration curve needed for ppb conversion |
-| V6 | CO heater phase | 0 = measuring · 1 = heating | |
-| V7 | CO raw ADC (EMA) | counts | Exponential moving average α = 0.3 |
-| V8 | IMU Roll | ° | |
-| V9 | IMU Pitch | ° | |
-| V10 | IMU Yaw | ° | |
-| V11 | IMU temperature | °C | Onboard IMU sensor |
-| V12 | GPS latitude | decimal degrees | Use with Blynk Map widget for tracking |
-| V13 | GPS longitude | decimal degrees | Use with Blynk Map widget for tracking |
-| V14 | GPS satellites | count | Fix requires ≥ 4 |
-| V15 | Relative humidity | % RH | DHT21 |
-| V16 | Temperature | °C | DHT21 |
-| V17 | GPS HDOP | — | Horizontal dilution of precision; lower = better |
-| V18 | Dust density | mg/m³ | Includes 5/3 voltage correction for divider |
-| V19 | Engineering message | string | Last fault or status event; updated within 10 s |
-| V20 | System status flags | int (bitmask) | See status bitmask table above |
+| Pin | Signal | Unit / values | Update tier | Notes |
+|---|---|---|---|---|
+| V1 | Sound level | dBFS estimate | 10 s | INMP441 |
+| V2 | CO concentration | ppm | 5 s | Last completed CO measurement |
+| V3 | UV index | UVI | 10 s | ML8511 |
+| V4 | Diagnostic | integer 1–9 | 10 s | Random activity value; **changing = application/telemetry path is alive** |
+| V5 | TVOC | ppb | 10 s | ENS160 |
+| V6 | CO heater phase | `0` measuring / `1` heating | 5 s | MQ-7 state machine |
+| V7 | CO raw | ADC/EMA counts | 5 s | MQ-7 raw diagnostic |
+| V8 | Roll | ° | 10 s | BMI160 complementary filter |
+| V9 | Pitch | ° | 10 s | BMI160 complementary filter |
+| V10 | Yaw / heading | ° | 10 s | Mirrors INAV heading |
+| V11 | BMI160 temperature | °C | 10 s | IMU die temperature |
+| V12 | Raw GPS latitude | decimal degrees | 5 s | Raw GPS path |
+| V13 | Raw GPS longitude | decimal degrees | 5 s | Raw GPS path |
+| V14 | GPS satellites | count | 5 s | GPS fix requires ≥ 4 |
+| V15 | Relative humidity | % RH | 5 s | AHT2x |
+| V16 | Temperature | °C | 5 s | AHT2x |
+| V17 | GPS HDOP | — | 5 s | Lower is generally better |
+| V18 | Dust density | mg/m³ | 10 s | GP2Y1010 estimate |
+| V19 | Engineering message | string | 5 s | Latest human-readable event |
+| V20 | System status | integer bitmask | 5 s | See V20 table above |
+| V21 | WiFi RSSI | dBm | 5 s | Signal strength |
+| V22 | WiFi quality | % | 5 s | Derived from RSSI |
+| V23 | eCO₂ | ppm | 10 s | ENS160 equivalent CO₂, not direct NDIR CO₂ |
+| V24 | AQI | `1`–`5` | 10 s | ENS160 gas/VOC air-quality index |
+| V25 | MQ-7 heater voltage | V | 10 s | Actual heater voltage from A1 feedback |
+| V26 | GPS PPS lock | `0` / `1` | 5 s | `1` = recent 1 Hz PPS interval is valid |
+| V27 | INAV state | `0`–`4` | 5 s | See INAV table below |
+| V28 | INAV latitude | decimal degrees | 5 s | GPS/IMU fused position |
+| V29 | INAV longitude | decimal degrees | 5 s | GPS/IMU fused position |
+| V30 | INAV altitude | m | 5 s | Held from last valid GPS altitude; not dead-reckoned |
+| V31 | INAV speed | m/s | 5 s | EKF state |
+| V32 | INAV heading | ° | 5 s | 0° = north, clockwise |
+| V33 | Blynk Map trail | map tuple | 30 s | Uses GPS/INAV position with GPS UTC timestamp |
+| **V34** | **ESP32 reset reason** | string | 10 s | **Boot diagnostic; see complete V34 table above** |
+
+### Quick health interpretation
+
+For a normally operating station:
+
+```text
+V4  → changing
+V20 → 15
+V26 → 1
+V27 → 0
+D2  → blinking once per second when GPS PPS is present
+V34 → normally POWERON after a power-up; other values explain the preceding reset
+```
 
 ---
 
@@ -519,20 +616,40 @@ same sketch folder. **Never commit this file to version control** — add it to
 ### Feature switches
 
 ```cpp
-#define DEBUGON           false  // Verbose Serial output — enable for bench testing
-#define DISPLAYON         false  // SSD1306 OLED — shares SCL/GPIO22 with GPS RX (see note below)
-#define WIFI              true   // Blynk / WiFi connectivity
-#define COsensorThere     true   // MQ-7 CO sensor board is physically connected
-#define IMUsensorThere    true   // JY-901 / WT901 IMU is physically connected
+#define DEBUGON           false   // Verbose Serial output — enable for bench testing
+#define DISPLAYON         false   // SSD1306 OLED, shares the I2C bus
+#define WIFI              true    // Blynk / WiFi connectivity
+#define COsensorThere     true    // MQ-7 CO sensor board is physically connected
+#define ENSsensorThere    true    // ENS160 + AHT2x combo board
+#define INMPsensorThere   true    // INMP441 I2S microphone
+#define BMI160sensorThere true    // GY-BMI160 IMU
+#define PPSsensorThere    true    // GPS 1PPS input on GPIO5
 
-bool ten_mins_autoreset = false; // Set true to call ESP.restart() every ~10 minutes
-                                 // Useful for unattended multi-hour field sessions
+bool ten_mins_autoreset = false; // Optional periodic ESP.restart() backstop
 ```
 
-> **OLED and GPS pin conflict** — the SSD1306 I2C bus uses SCL on GPIO 22 by
-> default on the ESP32. GPS UART1 RX is also remapped to GPIO 22. Keep
-> `DISPLAYON false` (the default) unless you remap `GPS_RX_PIN` to a free GPIO
-> first. GPIO 13 or GPIO 21 are suitable candidates.
+### INAV settings
+
+```cpp
+float inav_update_hz          = 10.0f; // INAV prediction/output rate
+int   inav_stale_after_misses = 3;     // missed expected fixes before IMU_STALE
+int   inav_max_loss_minutes   = 5;     // after this, INAV becomes LOST and holds position
+```
+
+### Reliability settings
+
+| Constant | Default | Purpose |
+|---|---:|---|
+| `BLYNK_TIMEOUT_MS` | 1000 ms | Bounds individual Blynk socket I/O |
+| `BLYNK_SERVER_PROBE_TIMEOUT_MS` | 250 ms | Bounds pre-Blynk TCP reachability probe |
+| `WIFI_RECONNECT_MS` | 30 s | WiFi retry interval |
+| `ENS_RETRY_MS` | 10 s | ENS160/AHT2x retry interval |
+| `SENSOR_HEALTH_FAIL_LIMIT` | 5 | Persistent sensor fault threshold |
+| `IMU_TIMEOUT_MS` | 5 s | Persistent BMI160 read-loss threshold |
+| `SENSOR_TASK_HEALTH_TIMEOUT_MS` | 30 s | Sensor-task heartbeat diagnostic threshold |
+| Task watchdog | **10 s** | Explicit sensor-task watchdog timeout |
+| `Wire.setTimeOut()` | **50 ms** | I²C operation timeout |
+| PPS LED pulse | **250 ms** | D2/GPIO2 indication per PPS event |
 
 ### CO calibration
 
@@ -545,32 +662,39 @@ float sensor_reading_100_ppm_CO = -1;     // Optional: raw ADC at a known 100 pp
 ### Timing constants
 
 | Constant | Default | Purpose |
-|---|---|---|
-| `BLYNK_SEND_MS` | 5 000 ms | How often sensor data is pushed to Blynk |
-| `ENG_MSG_INTERVAL` | 10 000 ms | How often the engineering message is flushed to V19 |
-| `GPS_TIMEOUT_MS` | 15 000 ms | GPS fix age before it is considered stale |
-| `IMU_TIMEOUT_MS` | 5 000 ms | IMU frame silence before the stuck flag is raised |
-| `CO_PHASE_MAX_MS` | 180 000 ms | Maximum single CO phase duration before watchdog fires |
-| `WIFI_RECONNECT_MS` | 30 000 ms | Interval between WiFi reconnect attempts when dropped |
-| `DHT_MAX_FAILS` | 5 | Consecutive bad DHT reads before the fault flag is raised |
-| `SLEEP_TIME` | 25 ms | Minimum sensor loop cadence |
-
----
+|---|---:|---|
+| `BLYNK_SEND_FAST_MS` | 5 000 ms | Critical/navigation telemetry interval |
+| `BLYNK_SEND_SLOW_MS` | 10 000 ms | Environmental/slow telemetry interval |
+| `MAP_SEND_INTERVAL_MS` | 30 000 ms | Blynk Map trail point interval |
+| `GPS_TIMEOUT_MS` | 15 000 ms | GPS validity timeout |
+| `IMU_TIMEOUT_MS` | 5 000 ms | Persistent BMI160 read-loss threshold |
+| `CO_PHASE_MAX_MS` | 180 000 ms | Maximum CO phase duration before watchdog recovery |
+| `WIFI_RECONNECT_MS` | 30 000 ms | WiFi reconnect interval |
+| `ENS_RETRY_MS` | 10 000 ms | ENS160/AHT2x retry interval |
+| `SENSOR_TASK_PERIOD_MS` | 25 ms | Sensor-task target cadence |
+| `SENSOR_TASK_HEALTH_TIMEOUT_MS` | 30 000 ms | Heartbeat health threshold |
+| `BLYNK_TIMEOUT_MS` | 1 000 ms | Individual Blynk I/O timeout |
+| `BLYNK_SERVER_PROBE_TIMEOUT_MS` | 250 ms | Bounded Blynk TCP probe |
+| `Wire.setTimeOut()` | 50 ms | I²C operation timeout |
+| Task watchdog | **10 s** | Explicit sensor-task watchdog timeout |
 
 ## Required libraries
 
-Install all of the following via **Arduino Library Manager** or add them to
-`lib_deps` in `platformio.ini`:
+Install the following libraries compatible with the ESP32 Arduino core used to
+compile the firmware:
 
-| Library | Minimum version | Purpose |
-|---|---|---|
-| `BlynkSimpleEsp32` | 1.3.2 | Blynk 0.6.1 local server client — plain TCP on port 8080 |
-| `TinyGPS++` | 1.0.3 | NMEA sentence parsing for position, HDOP, and satellite count |
-| `DHT sensor library` (Adafruit) | 1.4.4 | DHT21 / AM2301 one-wire driver |
-| `Adafruit SSD1306` | 2.5.7 | OLED display driver — required even when `DISPLAYON false` |
-| `Adafruit GFX Library` | 1.11.9 | Required dependency of SSD1306 |
+| Library | Purpose |
+|---|---|
+| **Blynk** / `BlynkSimpleEsp32` | Self-hosted Blynk 0.6.1 local-server client |
+| **TinyGPS++** | ATGM336H NMEA parsing |
+| **ScioSense_ENS160** | ENS160 TVOC/eCO₂/AQI driver |
+| **Adafruit AHTX0** | AHT20/AHT21 temperature/humidity driver |
+| **Adafruit SSD1306** | Optional OLED display |
+| **Adafruit GFX Library** | SSD1306 dependency |
 
----
+The BMI160 driver and INMP441 I²S implementation are handled directly in the
+firmware using the ESP32 IDF/Arduino interfaces; no separate BMI160 library is
+required.
 
 ## Air quality mapping
 
@@ -591,47 +715,73 @@ For deeper offline analysis, export the Blynk data CSV and import it into:
 ## Known limitations and future work
 
 **MQ-7 humidity sensitivity**
-The MQ-7 resistance drifts with ambient humidity. The DHT21 readings are available
-in firmware; a humidity-compensated correction factor applied to the ppm
-calculation would meaningfully improve accuracy in wet or seasonal conditions.
+The MQ-7 resistance changes with ambient humidity and temperature. AHT2x data is
+available in firmware, but the current CO ppm calculation does not apply a full
+humidity/temperature compensation model. Treat CO ppm as an indicative estimate
+unless calibrated against a suitable reference.
 
-**NO₂ in raw ADC counts only**
-Mapping the MICS-2710 output to ppb requires characterising the sensor's
-resistance-concentration curve against a certified reference source, or applying
-the full datasheet correction with temperature compensation. The firmware currently
-logs the raw ADC reading and the back-calculated sensor voltage; ppb conversion is
-left for post-processing.
+**ENS160 eCO₂ is equivalent CO₂**
+ENS160 `eCO2` is an equivalent-CO₂ estimate derived from the gas/VOC response; it
+is not a direct NDIR CO₂ measurement. ENS160 AQI is likewise a gas/VOC-oriented
+index, not a PM2.5/PM10 regulatory AQI.
+
+**ENS160 gas cross-sensitivity**
+TVOC, eCO₂ and AQI are processed gas-sensor outputs. Individual gas estimates
+should not be interpreted as laboratory-grade concentrations without appropriate
+calibration and environmental control.
 
 **GPS cold-start latency**
-A cold u-blox module can take 30–90 seconds outdoors to acquire its first fix.
-During this window the firmware holds the last known position with a small
-coordinate offset to signal staleness, rather than logging a null point at
-0° N, 0° E.
+The ATGM336H may need tens of seconds to acquire its first outdoor fix. Until a
+valid fix exists, INAV remains `NO_FIX_YET`.
 
-**CO sensor burn-in requirement**
-A brand-new MQ-7 element needs 24–48 hours of continuous operation before
-readings stabilise. Do not run the clean-air calibration (`sensor_reading_clean_air`)
-on a sensor that has not completed burn-in.
+**INAV dead reckoning**
+INAV is deliberately conservative. It stops advancing the estimated position after
+`inav_max_loss_minutes` and enters `LOST`, holding the last position rather than
+allowing unbounded drift.
 
-**OLED and GPS cannot run simultaneously**
-GPIO 22 is shared between the I2C SCL line (OLED) and UART1 RX (GPS). Resolving
-this requires remapping `GPS_RX_PIN` to GPIO 13 or GPIO 21 and updating the
-`initGPS()` call accordingly.
+**Reset cause is historical, not a live alarm**
+V34 reports the reset reason captured at boot. If the device has not rebooted, V34
+continues to show the same value. Use V19/V20/V26/V27 for current operating health.
+
+**Power integrity remains critical**
+Firmware watchdogs can recover many software/sensor stalls, but they cannot prevent
+brownouts caused by an inadequate regulator, wiring, connectors, WiFi current
+spikes, MQ-7 heater transients, or insufficient bulk capacitance. A `BROWNOUT` value
+on V34 should therefore trigger a hardware power investigation first.
 
 **10-minute auto-reset is optional**
-`ten_mins_autoreset` defaults to `false`. Enable it for unattended multi-hour
-field sessions where a periodic clean reinitialisation of GPS and IMU improves
-long-run stability. Once the firmware has been validated over several days of
-continuous use without incident, this may no longer be necessary.
+`ten_mins_autoreset` defaults to `false`. The explicit task watchdog and sensor-task
+heartbeat provide fault recovery without requiring periodic scheduled reboots.
 
 ---
 
-*Firmware: `AirQuality_ESP32_Blynk.ino` v1.1 · Credentials: `secrets.h` · Backend: Blynk 0.6.1 local server, Java 21*
+*Firmware: `AirQualityOutdoor_ESP32_Blynk(5).ino` v3.7 · Credentials: `secrets.h` · Backend: self-hosted Blynk 0.6.1 local server*
 
 ---
 
 ## System Health Diagnostics
 
-Click on the link below to view the system health diagnostics:
+The most useful unattended-operation indicators are:
 
-[System Health Diagnostics](README_System_Health_Diagnostics.md)
+| Indicator | Normal value / behaviour | Meaning |
+|---|---|---|
+| **V4** | Changes over time | Application/telemetry path is alive |
+| **V20** | `15` | WiFi + GPS + BMI160 + ENS160/AHT2x healthy |
+| **V26** | `1` | GPS 1PPS is locked |
+| **V27** | `0` | INAV currently has a GPS fix |
+| **D2 LED** | One 250 ms flash per second | Physical GPS PPS events are reaching the ESP32 |
+| **V34** | Reset-cause text | Explains the reset that produced the current boot |
+
+### V4 vs V34
+
+These two diagnostics answer different questions:
+
+- **V4 changing:** *Is the application/telemetry path still running?*
+- **V34 value:** *Why did the ESP32 last boot/restart?*
+
+V34 is therefore expected to remain unchanged during normal continuous operation.
+It changes only after the ESP32 boots again.
+
+For the complete V34 reset-cause table and runtime diagnostic messages, see the
+[System Health Diagnostics](README_System_Health_Diagnostics.md) reference if it is
+kept alongside this README.
