@@ -131,6 +131,7 @@ The current firmware (`AirQualityOutdoor_ESP32_Blynk(5).ino`) adds the following
 * **V26** is GPS PPS lock (`0`/`1`).
 * **V27** is the INAV state (`0`–`4`).
 * **V34** is the ESP32 **reset cause from the most recent boot**.
+* **V35–V50** are performance/I²C diagnostics (PPS count/age, retained-max timings, last I²C device/operation, I²C error count) for tracking down stalls.
 
 ---
 
@@ -396,6 +397,7 @@ The firmware exposes three different diagnostic concepts:
 - **V19 — Engineering message:** the latest human-readable runtime event.
 - **V20 — System status:** a live bitmask of subsystem health.
 - **V34 — Reset diagnostic:** the human-readable ESP32 reset cause recorded at boot.
+- **V35–V50 — Performance/I²C diagnostics:** PPS count/age, retained-maximum timings for the loop, sensor task, `Blynk.run()`, GPS feed, I²C sensor path, FAST/SLOW telemetry sends, and PPS→LED response, plus last-I²C-device/operation and a cumulative I²C error count. Counters run continuously; publication to Blynk (and a matching `[PERF]` Serial line) is rate-limited — see the [System Health Diagnostics](README_System_Health_Diagnostics.md) reference for the full pin table.
 
 ### V20 status bitmask — current firmware
 
@@ -595,6 +597,24 @@ same sketch folder. **Never commit this file to version control** — add it to
 | V32 | INAV heading | ° | 5 s | 0° = north, clockwise |
 | V33 | Blynk Map trail | map tuple | 30 s | Uses GPS/INAV position with GPS UTC timestamp |
 | **V34** | **ESP32 reset reason** | string | 10 s | **Boot diagnostic; see complete V34 table above** |
+| V35 | PPS event count | integer | 10 s | Cumulative GPS 1PPS pulses since boot |
+| V36 | Time since last PPS | ms | 10 s | Large value + V26=0 indicates PPS loss |
+| V37 | Max `loop()` gap | ms | 10 s | Retained max since boot; Core 1 |
+| V38 | Max sensor-task cycle | ms | 10 s | Retained max since boot; Core 0 |
+| V39 | Max `Blynk.run()` duration | ms | 10 s | Retained max since boot |
+| V40 | Max GPS feed duration | ms | 10 s | Retained max since boot |
+| V41 | Max I²C sensor-path duration | ms | 10 s | Retained max since boot; ENS160+AHT2x+BMI160 combined |
+| V42 | Max FAST telemetry duration | ms | 10 s | Retained max since boot |
+| V43 | Max SLOW telemetry duration | ms | 10 s | Retained max since boot |
+| V44 | Max PPS→LED response | ms | 10 s | Retained max since boot |
+| V45 | Last I²C device | `0`–`3` | 10 s | `0`=none, `1`=ENS160, `2`=AHT21, `3`=BMI160 |
+| V46 | Last I²C operation | `0`–`3` | 10 s | `0`=none, `1`=read, `2`=measurement/command, `3`=configuration |
+| V47 | Cumulative I²C error count | integer | 10 s | Retained count since boot |
+| V48 | Max AHT21 read duration | ms | 10 s | Retained max since boot |
+| V49 | Max ENS160 operation duration | ms | 10 s | Retained max since boot |
+| V50 | Max BMI160 raw-read duration | ms | 10 s | Retained max since boot |
+
+> V35–V50 counters run continuously; their Blynk publication (and a matching `[PERF]` Serial line) is rate-limited to every 10 s so the diagnostic channel stays low-overhead. Full detail and a worked stall-diagnosis example are in [System Health Diagnostics](README_System_Health_Diagnostics.md).
 
 ### Quick health interpretation
 
@@ -771,6 +791,7 @@ The most useful unattended-operation indicators are:
 | **V27** | `0` | INAV currently has a GPS fix |
 | **D2 LED** | One 250 ms flash per second | Physical GPS PPS events are reaching the ESP32 |
 | **V34** | Reset-cause text | Explains the reset that produced the current boot |
+| **V35–V50** | Retained-max timings, PPS count, I²C error count | Detailed performance/I²C diagnostics for tracking down stalls |
 
 ### V4 vs V34
 
@@ -782,6 +803,7 @@ These two diagnostics answer different questions:
 V34 is therefore expected to remain unchanged during normal continuous operation.
 It changes only after the ESP32 boots again.
 
-For the complete V34 reset-cause table and runtime diagnostic messages, see the
-[System Health Diagnostics](README_System_Health_Diagnostics.md) reference if it is
-kept alongside this README.
+For the complete V34 reset-cause table, the V35–V50 performance/I²C diagnostics
+(including a worked stall-diagnosis example and the periodic `[PERF]` Serial
+report), see the [System Health Diagnostics](README_System_Health_Diagnostics.md)
+reference if it is kept alongside this README.

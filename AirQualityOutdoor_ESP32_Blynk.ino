@@ -309,6 +309,49 @@
 #include <Adafruit_AHTX0.h>      // AHT20/AHT21 temp+hum — install: Adafruit AHTX0
 #include <Adafruit_SSD1306.h>
 #include <driver/i2s_std.h>      // ESP32 NEW standard I2S driver for INMP441 (v2.2)
+
+// ─── PERFORMANCE / I2C DIAGNOSTICS — declarations must precede PPS ISR ───
+// Internal counters/timers run continuously; V34-V50 are published only
+// by the 10-second diagnostic pathway.
+volatile uint32_t perfPpsLastUs = 0;
+volatile uint32_t perfMaxLoopGapMs = 0;
+volatile uint32_t perfMaxSensorCycleMs = 0;
+volatile uint32_t perfMaxBlynkRunMs = 0;
+volatile uint32_t perfMaxGpsFeedMs = 0;
+volatile uint32_t perfMaxI2cPathMs = 0;
+volatile uint32_t perfMaxFastSendMs = 0;
+volatile uint32_t perfMaxSlowSendMs = 0;
+volatile uint32_t perfMaxPpsLedResponseMs = 0;
+volatile uint32_t perfLastI2cDevice = 0;
+volatile uint32_t perfLastI2cOperation = 0;
+volatile uint32_t perfI2cTimeoutCount = 0;
+volatile uint32_t perfMaxEns160Ms = 0;
+volatile uint32_t perfMaxAht21Ms = 0;
+volatile uint32_t perfMaxBmi160Ms = 0;
+
+static inline void perfRecordMax(volatile uint32_t& dst, uint32_t value)
+{
+  if (value > dst) dst = value;
+}
+
+static inline uint32_t perfPpsAgeMs()
+{
+  uint32_t lastUs = perfPpsLastUs;
+  if (lastUs == 0) return 0;
+  return (uint32_t)((micros() - lastUs) / 1000UL);
+}
+
+static inline void perfI2cBegin(uint32_t device, uint32_t operation)
+{
+  perfLastI2cDevice = device;
+  perfLastI2cOperation = operation;
+}
+
+static inline void perfI2cTimeout()
+{
+  perfI2cTimeoutCount++;
+}
+
 // v2.1 previously used the legacy <driver/i2s.h> here. That header put the
 // firmware at risk of the "ADC: CONFLICT driver_ng" abort because the legacy
 // I2S driver and the driver_ng ADC API used by analogRead() cannot safely
@@ -463,12 +506,18 @@ void setPpsLed(bool on)
                                                  : (on ? LOW : HIGH));
 }
 
+// Forward declarations for performance diagnostics used by the PPS path.
+static inline void perfRecordMax(volatile uint32_t& dst, uint32_t value);
+static inline uint32_t perfPpsAgeMs();
+
 void IRAM_ATTR ppsISR()
 {
   unsigned long now = micros();
   if (ppsLastMicros != 0) ppsIntervalUs = now - ppsLastMicros;
   ppsLastMicros = now;
   ppsPulseCount++;
+  // Performance diagnostic: timestamp the actual PPS ISR event.
+  perfPpsLastUs = now;
 
   // Do NOT call digitalWrite() here. The ISR only records the PPS event and
   // wakes the dedicated LED task. The LED operation itself remains in normal
@@ -503,6 +552,14 @@ void ppsLedTask(void *parameter)
     portEXIT_CRITICAL(&ppsLedMux);
 
     if (pendingPps == 0) continue;
+
+    // Performance diagnostic: measure scheduling latency from the PPS ISR
+    // to the dedicated LED task. This does not affect the LED state machine.
+    uint32_t perfPpsLedResponseStartUs = micros();
+    uint32_t perfPpsEventUs = perfPpsLastUs;
+    if (perfPpsEventUs != 0)
+      perfRecordMax(perfMaxPpsLedResponseMs,
+                    (uint32_t)((perfPpsLedResponseStartUs - perfPpsEventUs) / 1000UL));
 
     // One PPS event = one 250ms ON pulse.
     setPpsLed(true);
@@ -608,6 +665,26 @@ bool ppsIsLocked()
 #define IMU_POLL_MS               50
 #define BUZZER_GPS_INTERVAL     5000
 #define VWRITE_GAP_MS            10
+
+// ─── PERFORMANCE DIAGNOSTIC VIRTUAL PINS ───────────────────────────────────
+// Internal timing/counters run continuously; these pins are published
+// only once every 10 seconds by blynkSendDiagnostics().
+#define V35 35  // PPS event count
+#define V36 36  // milliseconds since last PPS
+#define V37 37  // maximum Arduino loop gap (ms)
+#define V38 38  // maximum sensor-task cycle duration (ms)
+#define V39 39  // maximum Blynk.run() duration (ms)
+#define V40 40  // maximum GPS feed duration (ms)
+#define V41 41  // maximum I2C sensor-path duration (ms)
+#define V42 42  // maximum FAST telemetry duration (ms)
+#define V43 43  // maximum SLOW telemetry duration (ms)
+#define V44 44  // maximum PPS ISR-to-LED-task response (ms)
+#define V45 45  // last I2C device ID (0=none, 1=ENS160, 2=AHT21, 3=BMI160)
+#define V46 46  // last I2C operation ID (0=none, 1=read, 2=measurement/command, 3=configuration)
+#define V47 47  // cumulative I2C transaction error count
+#define V48 48  // maximum AHT21 read duration (ms)
+#define V49 49  // maximum ENS160 operation/read duration (ms)
+#define V50 50  // maximum BMI160 raw-read duration (ms)
 
 // ─── CO CLOSED-LOOP HEATER TARGETS ───────────────────────────────────────────
 // A1 feedback divider scales 5V→2.5V at ADC. We target the ADC-side voltage.
@@ -763,6 +840,51 @@ volatile uint32_t sensorTaskHeartbeat = 0;
 unsigned long lastHealthReport = 0;
 unsigned long lastHeartbeatChangeMillis = 0;
 uint32_t lastHealthHeartbeat = 0;
+
+// ─── PERFORMANCE DIAGNOSTICS — internal counters/timers ─────────────────────
+// These values run continuously but are published to Blynk only every 10s.
+// They are diagnostic-only and never trigger a reset or alter normal control.
+// ─── ADDITIONAL I2C DIAGNOSTICS — internal state ────────────────────────────
+// These values run continuously. V45-V50 are published only by the existing
+// 10-second diagnostic pathway, so the diagnostic channel remains low-overhead.
+// Device IDs: 0=none, 1=ENS160, 2=AHT21, 3=BMI160.
+// Operation IDs: 0=none, 1=read, 2=measurement/command, 3=configuration.
+volatile uint32_t perfI2cErrorCount = 0;
+
+static inline void perfI2cError()
+{
+  perfI2cErrorCount++;
+}
+
+
+
+
+void perfReport()
+{
+  Serial.printf(
+    "[PERF] PPS=%lu age=%lums loopMax=%lums sensorMax=%lums "
+    "BlynkRunMax=%lums GPSmax=%lums I2Cmax=%lums FASTmax=%lums "
+    "SLOWmax=%lums PPSledMax=%lums I2Cdev=%lu I2Cop=%lu "
+    "I2Cerrors=%lu AHTmax=%lums ENSmax=%lums BMImax=%lums\n",
+    (unsigned long)ppsPulseCount,
+    (unsigned long)perfPpsAgeMs(),
+    (unsigned long)perfMaxLoopGapMs,
+    (unsigned long)perfMaxSensorCycleMs,
+    (unsigned long)perfMaxBlynkRunMs,
+    (unsigned long)perfMaxGpsFeedMs,
+    (unsigned long)perfMaxI2cPathMs,
+    (unsigned long)perfMaxFastSendMs,
+    (unsigned long)perfMaxSlowSendMs,
+    (unsigned long)perfMaxPpsLedResponseMs,
+    (unsigned long)perfLastI2cDevice,
+    (unsigned long)perfLastI2cOperation,
+    (unsigned long)perfI2cErrorCount,
+    (unsigned long)perfMaxAht21Ms,
+    (unsigned long)perfMaxEns160Ms,
+    (unsigned long)perfMaxBmi160Ms
+  );
+}
+
 
 #define SENSOR_TASK_HEALTH_TIMEOUT_MS  30000UL
 #define HEALTH_REPORT_INTERVAL_MS      60000UL
@@ -921,6 +1043,8 @@ void initGPS()
 
 void feedGPS()
 {
+  uint32_t perfGpsStartUs = micros();
+
   unsigned long t = millis();
   while (millis() - t < GPS_FEED_MS) {
     while (gps_serial.available()) gps.encode(gps_serial.read());
@@ -947,6 +1071,9 @@ void feedGPS()
                     ppsIsLocked() ? 1 : 0);
     }
   }
+
+  perfRecordMax(perfMaxGpsFeedMs,
+                (uint32_t)((micros() - perfGpsStartUs) / 1000UL));
 }
 
 // v2.5: Convert GPS UTC date+time (from NMEA RMC/GGA, already parsed by
@@ -1014,24 +1141,47 @@ bool initENS()
 // ScioSense API uses integer temp (°C) and humidity (%) for set_envdata().
 bool readENS(float& tvoc, float& eco2, float& aqi_out, float& temp_out, float& hum_out)
 {
+  uint32_t perfEnsStartUs = micros();
+
   // Read AHT2x first — provides compensation values for ENS160
   sensors_event_t humEvent, tempEvent;
-  if (!aht.getEvent(&humEvent, &tempEvent)) return false;
+  uint32_t perfAht21StartUs = micros();
+  perfI2cBegin(2, 1);
+  bool perfAht21Ok = aht.getEvent(&humEvent, &tempEvent);
+  perfRecordMax(perfMaxAht21Ms,
+                (uint32_t)((micros() - perfAht21StartUs) / 1000UL));
+  if (!perfAht21Ok) {
+    perfRecordMax(perfMaxI2cPathMs,
+                  (uint32_t)((micros() - perfEnsStartUs) / 1000UL));
+    return false;
+  }
   temp_out = tempEvent.temperature;
   hum_out  = humEvent.relative_humidity;
 
   // Provide integer temp/humidity compensation to ENS160 for improved accuracy
   // ScioSense set_envdata() takes int (°C) and int (%) — cast from float
+  uint32_t perfEns160OnlyStartUs = micros();
+  perfI2cBegin(1, 3);
   ens160.set_envdata((int)temp_out, (int)hum_out);
 
   // Trigger measurement
+  perfI2cBegin(1, 2);
   ens160.measure(true);
   ens160.measureRaw(true);
 
   // Read results — always available after measure()
+  perfI2cBegin(1, 1);
   tvoc    = (float)ens160.getTVOC();   // ppb
   eco2    = (float)ens160.geteCO2();   // ppm equivalent CO2
   aqi_out = (float)ens160.getAQI();    // 1–5 index
+  perfRecordMax(perfMaxEns160Ms,
+                (uint32_t)((micros() - perfEns160OnlyStartUs) / 1000UL));
+
+  perfRecordMax(perfMaxI2cPathMs,
+
+
+                (uint32_t)((micros() - perfEnsStartUs) / 1000UL));
+
 
   return true;
 }
@@ -1267,16 +1417,18 @@ bool bmi160WriteReg(uint8_t reg, uint8_t val)
   Wire.beginTransmission(BMI160_ADDR);
   Wire.write(reg);
   Wire.write(val);
-  return (Wire.endTransmission() == 0);
+  uint8_t err = Wire.endTransmission();
+  if (err != 0) perfI2cError();
+  return (err == 0);
 }
 
 bool bmi160ReadRegs(uint8_t reg, uint8_t* buf, uint8_t len)
 {
   Wire.beginTransmission(BMI160_ADDR);
   Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) return false;   // repeated start
+  if (Wire.endTransmission(false) != 0) { perfI2cError(); return false; }   // repeated start
   uint8_t got = Wire.requestFrom((int)BMI160_ADDR, (int)len);
-  if (got != len) return false;
+  if (got != len) { perfI2cError(); return false; }
   for (uint8_t i = 0; i < len; i++) buf[i] = Wire.read();
   return true;
 }
@@ -1307,8 +1459,15 @@ bool initBMI160()
 // Returns physical units: gx/gy/gz in dps, ax/ay/az in g.
 bool bmi160ReadRaw(float& gx, float& gy, float& gz, float& ax, float& ay, float& az)
 {
+  uint32_t perfBmi160RawStartUs = micros();
+  perfI2cBegin(3, 1);
   uint8_t buf[12];
-  if (!bmi160ReadRegs(BMI160_REG_DATA, buf, 12)) return false;
+  if (!bmi160ReadRegs(BMI160_REG_DATA, buf, 12)) {
+    perfI2cError();
+    perfRecordMax(perfMaxBmi160Ms,
+                  (uint32_t)((micros() - perfBmi160RawStartUs) / 1000UL));
+    return false;
+  }
   int16_t rgx = (int16_t)((buf[1]<<8)|buf[0]);
   int16_t rgy = (int16_t)((buf[3]<<8)|buf[2]);
   int16_t rgz = (int16_t)((buf[5]<<8)|buf[4]);
@@ -1336,6 +1495,8 @@ bool bmi160ReadRaw(float& gx, float& gy, float& gz, float& ax, float& ay, float&
     }
   }
 
+  perfRecordMax(perfMaxBmi160Ms,
+                (uint32_t)((micros() - perfBmi160RawStartUs) / 1000UL));
   return true;
 }
 
@@ -1522,6 +1683,8 @@ void inavZUPT(float ax_g, float ay_g, float az_g, float gyroZ_dps)
 // needed there — GPS naturally updates at its own, much lower, rate).
 void inertialNav()
 {
+  uint32_t perfInavStartUs = micros();
+
   static bool          originSet            = false;
   static double        lat0 = 0, lon0 = 0;
   static float         cosLat0              = 1.0f;
@@ -1538,7 +1701,9 @@ void inertialNav()
       lastBmiRetryMillis = millis();
       bmi160Ready = initBMI160();
     }
-    if (!bmi160Ready) return;   // device fully absent — nothing to do this cycle
+    if (!bmi160Ready) perfRecordMax(perfMaxI2cPathMs,
+               (uint32_t)((micros() - perfInavStartUs) / 1000UL));
+ return;   // device fully absent — nothing to do this cycle
   }
 
   float gx=0,gy=0,gz=0,ax=0,ay=0,az=0;
@@ -1700,6 +1865,8 @@ void inertialNav()
     xSemaphoreGive(dataMutex);
   }
   if (imuStuck) engMsgf("IMU STUCK: BMI160 no good read for %lus", (millis()-lastBmiOkMillis)/1000);
+  perfRecordMax(perfMaxI2cPathMs,
+                (uint32_t)((micros() - perfInavStartUs) / 1000UL));
 }
 
 // ============================================================================
@@ -1733,6 +1900,8 @@ void sensorTask(void* pvParam)
 
   while (true)
   {
+    uint32_t perfSensorCycleStartUs = micros();
+
     buzzerService();
     unsigned long loopStart = millis();
 
@@ -1958,6 +2127,8 @@ void sensorTask(void* pvParam)
     esp_task_wdt_reset();
 
     unsigned long elapsed = millis()-loopStart;
+    perfRecordMax(perfMaxSensorCycleMs,
+                  (uint32_t)((micros() - perfSensorCycleStartUs) / 1000UL));
     vTaskDelay(pdMS_TO_TICKS(elapsed < SENSOR_TASK_PERIOD_MS
                               ? SENSOR_TASK_PERIOD_MS - elapsed : 1));
   }
@@ -1969,6 +2140,8 @@ void sensorTask(void* pvParam)
 
 void blynkSendFast()
 {
+  uint32_t perfFastStartUs = micros();
+
   // Critical / navigation data — sent every BLYNK_SEND_FAST_MS (5s)
   if (WiFi.status() != WL_CONNECTED) return;
   int32_t rssi = WiFi.RSSI();
@@ -2001,10 +2174,14 @@ void blynkSendFast()
   safeWrite (V30, snap.inav_alt);
   safeWrite (V31, snap.inav_speed_mps);
   safeWrite (V32, snap.inav_heading_deg);
+  perfRecordMax(perfMaxFastSendMs,
+                (uint32_t)((micros() - perfFastStartUs) / 1000UL));
 }
 
 void blynkSendSlow()
 {
+  uint32_t perfSlowStartUs = micros();
+
   // Environmental / sensor data — sent every BLYNK_SEND_SLOW_MS (10s)
   if (WiFi.status() != WL_CONNECTED) return;
   SensorData snap;
@@ -2024,9 +2201,42 @@ void blynkSendSlow()
   safeWrite (V23, snap.eco2_ppm);
   safeWrite (V24, snap.aqi);
   safeWrite (V25, snap.co_heater_v);
-  // Additive diagnostic channel: V34 reports the ESP32 reset cause from boot.
-  safeWriteS(V34, bootResetReasonText);
+  perfRecordMax(perfMaxSlowSendMs,
+                (uint32_t)((micros() - perfSlowStartUs) / 1000UL));
 }
+
+// ─── DIAGNOSTIC VIRTUAL PINS — every 10 seconds ──────────────────────────────
+// Internal counters/timers continue constantly. Only their Blynk publication
+// is rate-limited to one snapshot every 10 seconds. This prevents diagnostic
+// traffic from being added to the 5-second FAST telemetry pathway.
+void blynkSendDiagnostics()
+{
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!Blynk.connected()) return;
+
+  // Existing V34 diagnostic channel: ESP32 reset cause from boot.
+  safeWriteS(V34, bootResetReasonText);
+
+  // Performance diagnostics V35-V44. These are retained maxima since boot
+  // except V35 (count) and V36 (current PPS age).
+  safeWriteI(V35, (int)ppsPulseCount);
+  safeWriteI(V36, (int)perfPpsAgeMs());
+  safeWriteI(V37, (int)perfMaxLoopGapMs);
+  safeWriteI(V38, (int)perfMaxSensorCycleMs);
+  safeWriteI(V39, (int)perfMaxBlynkRunMs);
+  safeWriteI(V40, (int)perfMaxGpsFeedMs);
+  safeWriteI(V41, (int)perfMaxI2cPathMs);
+  safeWriteI(V42, (int)perfMaxFastSendMs);
+  safeWriteI(V43, (int)perfMaxSlowSendMs);
+  safeWriteI(V44, (int)perfMaxPpsLedResponseMs);
+  safeWriteI(V45, (int)perfLastI2cDevice);
+  safeWriteI(V46, (int)perfLastI2cOperation);
+  safeWriteI(V47, (int)perfI2cErrorCount);
+  safeWriteI(V48, (int)perfMaxAht21Ms);
+  safeWriteI(V49, (int)perfMaxEns160Ms);
+  safeWriteI(V50, (int)perfMaxBmi160Ms);
+}
+
 
 // v2.5: Blynk Map widget on V33. The Map widget's virtualWrite convention
 // is Blynk.virtualWrite(vPin, index, lat, lon, value):
@@ -2426,6 +2636,7 @@ void setup()
   // ── BlynkTimer intervals ──────────────────────────────────────────────────
   blynkTimer.setInterval(BLYNK_SEND_FAST_MS, blynkSendFast);
   blynkTimer.setInterval(BLYNK_SEND_SLOW_MS, blynkSendSlow);
+  blynkTimer.setInterval(10000UL, blynkSendDiagnostics);
   blynkTimer.setInterval(MAP_SEND_INTERVAL_MS, blynkSendMap);
 
   engMsg("Setup OK v3.7 — long-term reliability monitoring enabled");
@@ -2442,6 +2653,14 @@ void setup()
 
 void loop()
 {
+  static uint32_t perfLastLoopStartUs = 0;
+  uint32_t perfLoopStartUs = micros();
+  if (perfLastLoopStartUs != 0)
+    perfRecordMax(perfMaxLoopGapMs,
+                  (uint32_t)((perfLoopStartUs - perfLastLoopStartUs) / 1000UL));
+  perfLastLoopStartUs = perfLoopStartUs;
+
+
   buzzerService();
 
   if (WIFI) {
@@ -2507,7 +2726,12 @@ void loop()
         // serviced again on the next loop pass — this is not a new handshake.
         // The short delay/yield below also gives the Arduino/ESP32 system tasks
         // a scheduling opportunity between successive protocol steps.
-        Blynk.run();
+        {
+          uint32_t perfBlynkRunStartUs = micros();
+          Blynk.run();
+          perfRecordMax(perfMaxBlynkRunMs,
+                        (uint32_t)((micros() - perfBlynkRunStartUs) / 1000UL));
+        }
         yield();
 
         if (Blynk.connected()) {
@@ -2528,7 +2752,12 @@ void loop()
       if (Blynk.connected()) {
         // Normal connected-state servicing. BLYNK_TIMEOUT_MS=1s also bounds
         // any waiting read if the server disappears between loop iterations.
-        Blynk.run();
+        {
+          uint32_t perfBlynkRunStartUs = micros();
+          Blynk.run();
+          perfRecordMax(perfMaxBlynkRunMs,
+                        (uint32_t)((micros() - perfBlynkRunStartUs) / 1000UL));
+        }
         yield();
         blynkTimer.run();
       }
@@ -2560,6 +2789,8 @@ void loop()
   }
 
   if (now - lastHealthReport >= HEALTH_REPORT_INTERVAL_MS) {
+    perfReport();
+
     lastHealthReport = now;
     Serial.printf("[HEALTH] heap=%u minHeap=%u largest=%u sensorHB=%lu WiFi=%s Blynk=%s PPS=%d\n",
                   ESP.getFreeHeap(), ESP.getMinFreeHeap(),
