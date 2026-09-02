@@ -1,5 +1,9 @@
+// Forward declaration required because the Arduino build process may generate
+// function prototypes before the RTC checkpoint struct definition below.
+struct RtcCheckpoint;
+
 // ============================================================================
-// Outdoor Air Quality Station — ESP32 Production Firmware v2.6
+// Outdoor Air Quality Station — ESP32 Production Firmware v3.8
 // Migrated & rewritten from original Arduino Mega + Esp8266EasyIoT (AM, 2017)
 //
 // ─── HARDWARE v2.0/2.1 ───────────────────────────────────────────────────────
@@ -67,6 +71,24 @@
 //               V10 Yaw         V11 IMU temp     V18 Dust mg/m³
 //               V23 eCO2 ppm    V24 AQI          V25 Heater V (A1 feedback)
 //               V34 ESP reset reason (diagnostic)
+//
+//               Diagnostic:
+//               V35 — cumulative PPS event counter
+//               V36 — milliseconds since last PPS
+//               V37 — maximum Arduino loop() gap
+//               V38 — maximum sensor-task cycle time
+//               V39 — maximum Blynk.run() duration
+//               V40 — maximum GPS processing duration
+//               V41 — maximum measured I²C sensor-path duration
+//               V42 — maximum FAST telemetry duration
+//               V43 — maximum SLOW telemetry duration
+//
+//               V45 — last I²C device  (0 = none/unknown, 1 = ENS160, 2 = AHT21, 3 = BMI160)
+//               V46 — last I²C operation (0 = none/unknown, 1 = read, 2 = measurement/command, 3 = configuration)
+//               V47 — cumulative I²C transaction error count
+//               V48 — maximum AHT21 read duration, ms
+//               V49 — maximum ENS160 operation/read duration, ms
+//               V50 — maximum BMI160 raw-read duration, ms
 //
 // ─── ARCHITECTURE ────────────────────────────────────────────────────────────
 //   Core 1 (app_cpu) — Arduino loop(): WiFi, Blynk.run(), BlynkTimer
@@ -248,6 +270,16 @@
 //   • Existing sensor, GPS, INAV, CO, Blynk, map, display, buzzer, and status
 //     logic is preserved; changes are limited to reliability/monitoring paths.
 // ============================================================================
+// v3.8 RTC CRASH DIAGNOSTICS — additive, existing behaviour kept
+//   • V51 now publishes the previous-run RTC checkpoint as a latched diagnostic
+//     string. The snapshot is captured before the new run starts updating RTC.
+//   • V51 is never populated from the live/current-run checkpoint, so it does not
+//     drift while a person is reading or recording the crash information.
+//   • The same latched V51 string may be re-published by the existing 10-second
+//     diagnostic pathway; its contents remain identical until the next reboot.
+//   • RTC checkpoint storage remains in ESP32 RTC SRAM only; no flash writes are
+//     introduced by this diagnostic feature.
+// ============================================================================
 // v3.7 LONG-TERM RELIABILITY IMPROVEMENTS — additive, existing behaviour kept
 //   • Added ESP32 reset-cause diagnostics at startup, including human-readable 
 //     reset reason reporting.
@@ -278,6 +310,8 @@
 //     stop the sensor task or prevent the remaining sensors from operating.
 //   • Preserved all existing sensor-specific fault detection, retry, watchdog, 
 //     GPS, CO, Blynk, WiFi, display, LED, buzzer, and status logic.
+//   • Periodic [PERF] Serial report
+//
 // ============================================================================
 
 
@@ -296,10 +330,134 @@
 // secrets.h: #define WIFI_SSID / WIFI_PASS / BLYNK_AUTH / BLYNK_SERVER / BLYNK_PORT
 #define BLYNK_PRINT Serial
 #include <WiFi.h>
-#include <BlynkSimpleEsp32.h>
+
+// v3.7 reliability fix: Blynk v0.6.1's stock ESP32 transport calls
+// WiFiClient::connect() without an explicit connection timeout. On this
+// firmware that can block Core 1 long enough to trigger the ESP32 Interrupt
+// WDT immediately after WiFi connects.
+//
+// Do NOT include BlynkSimpleEsp32.h here. That header creates its own global
+// Blynk object using the stock BlynkArduinoClient transport, so replacing it
+// from the sketch would cause a duplicate global object and cannot safely
+// override the transport. Instead, the small ESP32 wrapper below is reproduced
+// from the v0.6.1 header, with ONLY the transport type changed to the bounded
+// client. All Blynk protocol/application behaviour remains the same.
+#define BLYNK_SEND_ATOMIC
+#include <BlynkApiArduino.h>
+#include <Blynk/BlynkProtocol.h>
+#include <Adapters/BlynkArduinoClient.h>
+
+class BoundedBlynkArduinoClient : public BlynkArduinoClient
+{
+  WiFiClient& boundedClient;
+
+public:
+  BoundedBlynkArduinoClient(WiFiClient& c)
+      : BlynkArduinoClient(c), boundedClient(c) {}
+
+  bool connect()
+  {
+    // ESP32 Arduino core 3.3.x exposes the timeout through NetworkClient /
+    // WiFiClient, while the generic Arduino Client interface only has the
+    // two-argument connect() overload. Therefore the timeout MUST be set on
+    // the concrete WiFiClient before calling its two-argument connect().
+    boundedClient.setConnectionTimeout(150);
+
+    if (domain) {
+      BLYNK_LOG4(BLYNK_F("Connecting to "), domain, ':', port);
+
+      // BLYNK_SERVER in this project is normally a literal LAN IP. Use the
+      // IP overload when possible so DNS cannot add an unbounded delay.
+      IPAddress target;
+      if (target.fromString(domain)) {
+        isConn = (1 == boundedClient.connect(target, port));
+      } else {
+        isConn = (1 == boundedClient.connect(domain, port));
+      }
+      return isConn;
+    } else {
+      BLYNK_LOG_IP("Connecting to ", addr);
+      isConn = (1 == boundedClient.connect(addr, port));
+      return isConn;
+    }
+  }
+};
+
+class BlynkWifiBounded
+    : public BlynkProtocol<BoundedBlynkArduinoClient>
+{
+    typedef BlynkProtocol<BoundedBlynkArduinoClient> Base;
+public:
+    BlynkWifiBounded(BoundedBlynkArduinoClient& transp)
+        : Base(transp)
+    {}
+
+    void connectWiFi(const char* ssid, const char* pass)
+    {
+        BLYNK_LOG2(BLYNK_F("Connecting to "), ssid);
+        WiFi.mode(WIFI_STA);
+        if (pass && strlen(pass)) {
+            WiFi.begin(ssid, pass);
+        } else {
+            WiFi.begin(ssid);
+        }
+        while (WiFi.status() != WL_CONNECTED) {
+            BlynkDelay(500);
+        }
+        BLYNK_LOG1(BLYNK_F("Connected to WiFi"));
+
+        IPAddress myip = WiFi.localIP();
+        BLYNK_LOG_IP("IP: ", myip);
+    }
+
+    void config(const char* auth,
+                const char* domain = BLYNK_DEFAULT_DOMAIN,
+                uint16_t    port   = BLYNK_DEFAULT_PORT)
+    {
+        Base::begin(auth);
+        this->conn.begin(domain, port);
+    }
+
+    void config(const char* auth,
+                IPAddress   ip,
+                uint16_t    port = BLYNK_DEFAULT_PORT)
+    {
+        Base::begin(auth);
+        this->conn.begin(ip, port);
+    }
+
+    void begin(const char* auth,
+               const char* ssid,
+               const char* pass,
+               const char* domain = BLYNK_DEFAULT_DOMAIN,
+               uint16_t    port   = BLYNK_DEFAULT_PORT)
+    {
+        connectWiFi(ssid, pass);
+        config(auth, domain, port);
+        while(this->connect() != true) {}
+    }
+
+    void begin(const char* auth,
+               const char* ssid,
+               const char* pass,
+               IPAddress   ip,
+               uint16_t    port   = BLYNK_DEFAULT_PORT)
+    {
+        connectWiFi(ssid, pass);
+        config(auth, ip, port);
+        while(this->connect() != true) {}
+    }
+};
+
+static WiFiClient _boundedBlynkWifiClient;
+static BoundedBlynkArduinoClient _boundedBlynkTransport(_boundedBlynkWifiClient);
+BlynkWifiBounded Blynk(_boundedBlynkTransport);
 #include <esp_mac.h>
 #include <esp_task_wdt.h>
+#include <lwip/sockets.h>
+#include <lwip/netdb.h>
 #include <esp_system.h>
+#include <esp_attr.h>              // RTC_DATA_ATTR
 #include <esp_heap_caps.h>
 #include <TinyGPS++.h>
 #include <Wire.h>
@@ -329,6 +487,12 @@ volatile uint32_t perfMaxEns160Ms = 0;
 volatile uint32_t perfMaxAht21Ms = 0;
 volatile uint32_t perfMaxBmi160Ms = 0;
 
+enum : uint8_t { SENSOR_STATE_BOOT=0, SENSOR_STATE_RUN=1, SENSOR_STATE_I2C=2 };
+enum : uint8_t { LOOP_STATE_BOOT=0, LOOP_STATE_RUN=1, LOOP_STATE_WIFI=2,
+                 LOOP_STATE_BLYNK=3, LOOP_STATE_HEALTH=4 };
+volatile uint8_t sensorTaskState = SENSOR_STATE_BOOT;
+volatile uint8_t loopState = LOOP_STATE_BOOT;
+
 static inline void perfRecordMax(volatile uint32_t& dst, uint32_t value)
 {
   if (value > dst) dst = value;
@@ -345,6 +509,7 @@ static inline void perfI2cBegin(uint32_t device, uint32_t operation)
 {
   perfLastI2cDevice = device;
   perfLastI2cOperation = operation;
+  sensorTaskState = SENSOR_STATE_I2C;
 }
 
 static inline void perfI2cTimeout()
@@ -386,7 +551,9 @@ bool ten_mins_autoreset = false;
 // ─── INERTIAL NAVIGATION — user configurable (v2.3) ─────────────────────────
 float inav_update_hz          = 10.0f; // interpolation output frequency (Hz)
 int   inav_stale_after_misses = 3;     // consecutive missed GPS fixes before "stale" state
-int   inav_max_loss_minutes   = 5;     // stop interpolating after this many minutes without GPS
+int   inav_max_loss_minutes   = 2;     // stop interpolating after this many minutes without GPS
+                                        // (shortened from 5 — bounds worst-case gyro dead-reckoning
+                                        // drift distance; see V33 map-source note below)
 
 #define SENSOR_UNAVAILABLE (-999.0f)
 
@@ -559,7 +726,7 @@ void ppsLedTask(void *parameter)
     uint32_t perfPpsEventUs = perfPpsLastUs;
     if (perfPpsEventUs != 0)
       perfRecordMax(perfMaxPpsLedResponseMs,
-                    (uint32_t)((perfPpsLedResponseStartUs - perfPpsEventUs) / 1000UL));
+                    (uint32_t)((perfPpsLedResponseStartUs - perfPpsEventUs + 999UL) / 1000UL));
 
     // One PPS event = one 250ms ON pulse.
     setPpsLed(true);
@@ -641,6 +808,21 @@ bool ppsIsLocked()
 #define INAV_ZUPT_DURATION_MS  500       // sustained stillness before ZUPT fires
 #define INAV_ZUPT_R_V          0.01f     // tight variance on the zero-velocity pseudo-measurement
 #define INAV_MIN_COURSE_SPEED_MPS 0.5f   // below this, GPS course is unreliable — skip heading update
+
+// IMU variance-based stillness detector. ZUPT above reacts to a single
+// instantaneous sample being close to "at rest" — but a cheap GPS module
+// commonly reports 0.3-1.0 m/s of speed noise while genuinely stationary
+// (multipath/doppler jitter), which sits ABOVE INAV_MIN_COURSE_SPEED_MPS and
+// gets treated as real motion by the full GPS update. Tracking the rolling
+// VARIANCE of accel/gyro magnitude (not just their instantaneous value)
+// distinguishes "actually moving slowly" from "stationary, but the sensor/GPS
+// reading is noisy" — a single sample can be noisy in either direction, but
+// noise doesn't sustain low variance across a window the way true stillness
+// does.
+#define INAV_IMU_VAR_ALPHA         0.15f   // EMA smoothing factor for the variance tracker
+#define INAV_IMU_ACCEL_VAR_TOL_G2  0.0016f // accel-magnitude variance tolerance (g^2), ~0.04g std
+#define INAV_IMU_GYRO_VAR_TOL_DPS2 2.25f   // gyro-magnitude variance tolerance (dps^2), ~1.5dps std
+#define INAV_IMU_STILL_DURATION_MS 800     // sustained low-variance time before trusting "confirmed stationary"
 #define INAV_STATE_GPS_FIX     0
 #define INAV_STATE_IMU_RECENT  1
 #define INAV_STATE_IMU_STALE   2
@@ -685,6 +867,7 @@ bool ppsIsLocked()
 #define V48 48  // maximum AHT21 read duration (ms)
 #define V49 49  // maximum ENS160 operation/read duration (ms)
 #define V50 50  // maximum BMI160 raw-read duration (ms)
+#define V51 51  // previous-run RTC crash checkpoint summary (string)
 
 // ─── CO CLOSED-LOOP HEATER TARGETS ───────────────────────────────────────────
 // A1 feedback divider scales 5V→2.5V at ADC. We target the ADC-side voltage.
@@ -857,6 +1040,223 @@ static inline void perfI2cError()
 }
 
 
+// ─── PERSISTENT RTC CRASH CHECKPOINT ─────────────────────────────────────────
+// Two alternating RTC-SRAM records are used so an interrupted write cannot
+// destroy the last known-good checkpoint. RTC_DATA_ATTR survives ESP32 software
+// resets and watchdog resets; it is NOT persistent across power loss.
+#define RTC_CHECKPOINT_MAGIC       0x43504B54UL  // "CPKT"
+#define RTC_CHECKPOINT_VERSION     1
+#define RTC_CHECKPOINT_INTERVAL_MS 1000UL
+
+// Keep this type definition below the forward declaration at the top; this
+// avoids Arduino auto-prototype ordering errors during compilation.
+struct RtcCheckpoint {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t reserved;
+  uint32_t sequence;
+  uint32_t uptimeMs;
+  uint32_t ppsCount;
+  uint32_t sensorHeartbeat;
+  uint8_t  sensorState;
+  uint8_t  loopState;
+  uint8_t  loopAlive;
+  uint8_t  ppsAlive;
+  uint32_t ppsAgeMs;
+  uint32_t lastI2cDevice;
+  uint32_t lastI2cOperation;
+  uint32_t i2cErrorCount;
+  uint32_t crc;
+};
+
+RTC_DATA_ATTR RtcCheckpoint rtcCheckpointSlots[2];
+uint8_t rtcCheckpointActiveSlot = 0;
+uint32_t lastRtcCheckpointMillis = 0;
+
+// Snapshot of the checkpoint belonging to the run BEFORE this boot.
+// Kept separate from the live RTC slots so V51 continues to report the
+// crashed/previous run after the current run starts writing new checkpoints.
+RtcCheckpoint rtcPreviousRunCheckpoint = {};
+bool rtcPreviousRunCheckpointValid = false;
+
+static uint32_t rtcCheckpointCrc(const RtcCheckpoint& cp)
+{
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(&cp);
+  size_t n = offsetof(RtcCheckpoint, crc);
+  uint32_t crc = 0xFFFFFFFFUL;
+  while (n--) {
+    crc ^= *p++;
+    for (uint8_t bit=0; bit<8; ++bit)
+      crc = (crc >> 1) ^ (0xEDB88320UL & (-(int32_t)(crc & 1U)));
+  }
+  return ~crc;
+}
+
+static bool rtcCheckpointValid(const RtcCheckpoint& cp)
+{
+  return cp.magic == RTC_CHECKPOINT_MAGIC &&
+         cp.version == RTC_CHECKPOINT_VERSION &&
+         cp.crc == rtcCheckpointCrc(cp);
+}
+
+static bool rtcCheckpointNewer(const RtcCheckpoint& a, const RtcCheckpoint& b)
+{
+  return (int32_t)(a.sequence - b.sequence) > 0;
+}
+
+static bool rtcGetPreviousCheckpoint(RtcCheckpoint& out)
+{
+  bool a = rtcCheckpointValid(rtcCheckpointSlots[0]);
+  bool b = rtcCheckpointValid(rtcCheckpointSlots[1]);
+  if (!a && !b) return false;
+  if (a && (!b || rtcCheckpointNewer(rtcCheckpointSlots[0], rtcCheckpointSlots[1]))) {
+    out = rtcCheckpointSlots[0];
+    rtcCheckpointActiveSlot = 0;
+  } else {
+    out = rtcCheckpointSlots[1];
+    rtcCheckpointActiveSlot = 1;
+  }
+  return true;
+}
+
+static const char* rtcSensorStateText(uint8_t state)
+{
+  switch (state) {
+    case SENSOR_STATE_RUN: return "RUN";
+    case SENSOR_STATE_I2C: return "I2C";
+    default: return "BOOT";
+  }
+}
+
+static const char* rtcLoopStateText(uint8_t state)
+{
+  switch (state) {
+    case LOOP_STATE_RUN: return "RUN";
+    case LOOP_STATE_WIFI: return "WIFI";
+    case LOOP_STATE_BLYNK: return "BLYNK";
+    case LOOP_STATE_HEALTH: return "HEALTH";
+    default: return "BOOT";
+  }
+}
+
+static const char* rtcI2cDeviceText(uint32_t device)
+{
+  switch (device) {
+    case 1: return "ENS160";
+    case 2: return "AHT21";
+    case 3: return "BMI160";
+    default: return "NONE";
+  }
+}
+
+static const char* rtcI2cOperationText(uint32_t operation)
+{
+  switch (operation) {
+    case 1: return "READ";
+    case 2: return "MEAS/CMD";
+    case 3: return "CONFIG";
+    default: return "NONE";
+  }
+}
+
+static void rtcReportPreviousCheckpoint()
+{
+  RtcCheckpoint cp;
+  if (!rtcGetPreviousCheckpoint(cp)) {
+    rtcPreviousRunCheckpointValid = false;
+    Serial.println("[RTC] No valid previous-run checkpoint (first boot or power loss)");
+    return;
+  }
+
+  // Preserve this exact pre-boot snapshot for remote diagnostics on V51.
+  rtcPreviousRunCheckpoint = cp;
+  rtcPreviousRunCheckpointValid = true;
+  Serial.println("[RTC] Previous run checkpoint:");
+  Serial.printf("      uptime:        %lum %lus %lums\n",
+                (unsigned long)(cp.uptimeMs/60000UL),
+                (unsigned long)((cp.uptimeMs/1000UL)%60UL),
+                (unsigned long)(cp.uptimeMs%1000UL));
+  Serial.printf("      PPS count:     %lu\n", (unsigned long)cp.ppsCount);
+  Serial.printf("      sensor HB:     %lu (%s)\n",
+                (unsigned long)cp.sensorHeartbeat, rtcSensorStateText(cp.sensorState));
+  Serial.printf("      last I2C:      %s / %s\n",
+                rtcI2cDeviceText(cp.lastI2cDevice),
+                rtcI2cOperationText(cp.lastI2cOperation));
+  Serial.printf("      I2C errors:    %lu\n", (unsigned long)cp.i2cErrorCount);
+  Serial.printf("      loop alive:    %s (%s)\n",
+                cp.loopAlive ? "YES":"NO", rtcLoopStateText(cp.loopState));
+  Serial.printf("      PPS alive:     %s (age %lums)\n",
+                cp.ppsAlive ? "YES":"NO", (unsigned long)cp.ppsAgeMs);
+}
+
+static void rtcFormatPreviousRun(char* out, size_t outSize)
+{
+  if (!out || outSize == 0) return;
+
+  if (!rtcPreviousRunCheckpointValid) {
+    snprintf(out, outSize, "RTC: no valid previous checkpoint");
+    return;
+  }
+
+  const RtcCheckpoint& cp = rtcPreviousRunCheckpoint;
+  unsigned long minutes = (unsigned long)(cp.uptimeMs / 60000UL);
+  unsigned long seconds = (unsigned long)((cp.uptimeMs / 1000UL) % 60UL);
+  unsigned long millisPart = (unsigned long)(cp.uptimeMs % 1000UL);
+
+  snprintf(out, outSize,
+           "RTC: uptime: %lum %lus %lums, PPS count: %lu, sensor HB: %lu (%s), "
+           "sensor state: %s, last I2C: %s / %s, I2C errors: %lu, "
+           "loop alive: %s, loop state: %s, PPS alive: %s, PPS age: %lums",
+           minutes, seconds, millisPart,
+           (unsigned long)cp.ppsCount,
+           (unsigned long)cp.sensorHeartbeat,
+           rtcSensorStateText(cp.sensorState),
+           rtcSensorStateText(cp.sensorState),
+           rtcI2cDeviceText(cp.lastI2cDevice),
+           rtcI2cOperationText(cp.lastI2cOperation),
+           (unsigned long)cp.i2cErrorCount,
+           cp.loopAlive ? "YES" : "NO",
+           rtcLoopStateText(cp.loopState),
+           cp.ppsAlive ? "YES" : "NO",
+           (unsigned long)cp.ppsAgeMs);
+}
+
+static void rtcCheckpointWrite()
+{
+  RtcCheckpoint cp = {};
+  RtcCheckpoint previous;
+  bool havePrevious = rtcGetPreviousCheckpoint(previous);
+  cp.magic = RTC_CHECKPOINT_MAGIC;
+  cp.version = RTC_CHECKPOINT_VERSION;
+  cp.sequence = havePrevious ? previous.sequence+1UL : 1UL;
+  cp.uptimeMs = millis();
+  cp.ppsCount = ppsPulseCount;
+  cp.sensorHeartbeat = sensorTaskHeartbeat;
+  cp.sensorState = sensorTaskState;
+  cp.loopState = loopState;
+  cp.loopAlive = 1;
+  cp.ppsAgeMs = perfPpsAgeMs();
+  cp.ppsAlive = (cp.ppsAgeMs <= 2000UL) ? 1 : 0;
+  cp.lastI2cDevice = perfLastI2cDevice;
+  cp.lastI2cOperation = perfLastI2cOperation;
+  cp.i2cErrorCount = perfI2cErrorCount;
+  cp.crc = rtcCheckpointCrc(cp);
+
+  uint8_t nextSlot = havePrevious ? (rtcCheckpointActiveSlot ^ 1U) : 0;
+  rtcCheckpointSlots[nextSlot] = cp;
+  rtcCheckpointActiveSlot = nextSlot;
+}
+
+static void rtcCheckpointService()
+{
+  uint32_t now = millis();
+  if (lastRtcCheckpointMillis == 0 ||
+      now-lastRtcCheckpointMillis >= RTC_CHECKPOINT_INTERVAL_MS) {
+    lastRtcCheckpointMillis = now;
+    rtcCheckpointWrite();
+  }
+}
+
 
 
 void perfReport()
@@ -896,6 +1296,17 @@ float         inavGyroBiasDps = 0.0f;   // gyro Z bias, calibrated via ZUPT
 unsigned long zuptStartMillis = 0;
 float         inavLastAlt = SENSOR_UNAVAILABLE;
 bool          bmi160Ready = false;
+
+// IMU variance-based stillness tracker (see INAV_IMU_* constants above).
+// EMA state persists across calls; imuConfirmedStationary is the flag
+// inertialNav() consults before trusting a nonzero GPS speed reading.
+float         imuAccelMagEma         = 1.0f;   // EMA of accel magnitude (g)
+float         imuAccelVarEma         = 0.0f;   // EMA of accel-magnitude variance (g^2)
+float         imuGyroMagEma          = 0.0f;   // EMA of gyro magnitude (dps)
+float         imuGyroVarEma          = 0.0f;   // EMA of gyro-magnitude variance (dps^2)
+bool          imuVarEmaInited        = false;
+unsigned long imuStillStartMillis    = 0;
+bool          imuConfirmedStationary = false;
 
 BlynkTimer blynkTimer;
 
@@ -1650,9 +2061,26 @@ void inavKalmanUpdateFull(float zE, float zN, float zSpeed, float zHeadingRad,
   for (int i=0;i<4;i++) for (int j=0;j<4;j++) inavP[i][j] -= KP[i][j];
 }
 
+// Zero-velocity pseudo-measurement — 1-D Kalman update pulling state[2]
+// (speed) toward zero. Factored out so both inavZUPT() (below) and the
+// IMU-variance-confirmed-stationary path in inertialNav() can apply the same
+// correction without duplicating the Kalman math.
+void inavApplyZeroVelocity()
+{
+  float y = 0.0f - inavX[2];
+  float S = inavP[2][2] + INAV_ZUPT_R_V;
+  if (S <= 1e-9f) return;
+  float K[4];
+  for (int i=0;i<4;i++) K[i] = inavP[i][2]/S;
+  for (int i=0;i<4;i++) inavX[i] += K[i]*y;
+  float P2row[4]; for (int j=0;j<4;j++) P2row[j]=inavP[2][j];
+  for (int i=0;i<4;i++) for (int j=0;j<4;j++) inavP[i][j] -= K[i]*P2row[j];
+}
+
 // Zero-velocity update (ZUPT) — the standard robust technique for keeping a
 // dead-reckoning filter from drifting while stationary, and for calibrating
 // gyro bias without needing it to be a filter state (see header rationale).
+// Reacts to a single instantaneous sample being close to "at rest".
 void inavZUPT(float ax_g, float ay_g, float az_g, float gyroZ_dps)
 {
   float accelMag = sqrtf(ax_g*ax_g + ay_g*ay_g + az_g*az_g);
@@ -1666,15 +2094,53 @@ void inavZUPT(float ax_g, float ay_g, float az_g, float gyroZ_dps)
   // Gyro bias: slow EMA toward the current (true-rate-is-zero) reading.
   inavGyroBiasDps = 0.98f*inavGyroBiasDps + 0.02f*gyroZ_dps;
 
-  // Zero-velocity pseudo-measurement — 1-D Kalman update on state[2] only.
-  float y = 0.0f - inavX[2];
-  float S = inavP[2][2] + INAV_ZUPT_R_V;
-  if (S <= 1e-9f) return;
-  float K[4];
-  for (int i=0;i<4;i++) K[i] = inavP[i][2]/S;
-  for (int i=0;i<4;i++) inavX[i] += K[i]*y;
-  float P2row[4]; for (int j=0;j<4;j++) P2row[j]=inavP[2][j];
-  for (int i=0;i<4;i++) for (int j=0;j<4;j++) inavP[i][j] -= K[i]*P2row[j];
+  inavApplyZeroVelocity();
+}
+
+// Statistical (variance-based) stillness detector — complements ZUPT's
+// instantaneous-threshold check above. A single accel/gyro sample near "at
+// rest" can still coincide with genuine slow motion, and conversely a noisy
+// single sample can look like motion while the device is actually still.
+// Tracking the rolling VARIANCE of accel- and gyro-magnitude over a sustained
+// window is a much more reliable "is this actually moving, or just sensor
+// noise?" test than any one-shot threshold: real motion keeps the variance
+// elevated, while noise around a fixed true value does not sustain it.
+//
+// This feeds imuConfirmedStationary, which inertialNav() uses to decide
+// whether a small nonzero GPS-reported speed (commonly 0.3-1.0 m/s on cheap
+// modules like the ATGM336H, from multipath/doppler jitter even at a full
+// stop) should be trusted as real motion or treated as GPS speed noise.
+void imuVarianceCheck(float ax_g, float ay_g, float az_g,
+                       float gx_dps, float gy_dps, float gz_dps)
+{
+  float accelMag = sqrtf(ax_g*ax_g + ay_g*ay_g + az_g*az_g);
+  float gyroMag  = sqrtf(gx_dps*gx_dps + gy_dps*gy_dps + gz_dps*gz_dps);
+
+  if (!imuVarEmaInited) {
+    imuAccelMagEma = accelMag; imuGyroMagEma = gyroMag;
+    imuAccelVarEma = 0.0f;     imuGyroVarEma  = 0.0f;
+    imuVarEmaInited = true;
+  } else {
+    float da = accelMag - imuAccelMagEma;
+    float dg = gyroMag  - imuGyroMagEma;
+    imuAccelMagEma += INAV_IMU_VAR_ALPHA * da;
+    imuGyroMagEma  += INAV_IMU_VAR_ALPHA * dg;
+    // EMA of squared deviation from the EMA mean approximates rolling variance.
+    imuAccelVarEma += INAV_IMU_VAR_ALPHA * (da*da - imuAccelVarEma);
+    imuGyroVarEma  += INAV_IMU_VAR_ALPHA * (dg*dg - imuGyroVarEma);
+  }
+
+  bool lowVariance = (imuAccelVarEma < INAV_IMU_ACCEL_VAR_TOL_G2) &&
+                      (imuGyroVarEma  < INAV_IMU_GYRO_VAR_TOL_DPS2);
+
+  unsigned long now = millis();
+  if (!lowVariance) {
+    imuStillStartMillis = 0;
+    imuConfirmedStationary = false;
+    return;
+  }
+  if (imuStillStartMillis == 0) { imuStillStartMillis = now; imuConfirmedStationary = false; return; }
+  imuConfirmedStationary = (now - imuStillStartMillis >= INAV_IMU_STILL_DURATION_MS);
 }
 
 // Master entry point — called once per sensorTask loop iteration. Internally
@@ -1713,9 +2179,13 @@ void inertialNav()
   // cycle — GPS/EKF processing below still runs (gz=0 is a safe one-cycle
   // fallback for the predict step). "Stuck" means sustained failure.
   bool imuStuck = (lastBmiOkMillis > 0 && millis() - lastBmiOkMillis > IMU_TIMEOUT_MS);
+  // Don't let a stale "confirmed stationary" verdict (from before the IMU
+  // stopped producing good reads) keep suppressing GPS speed corrections.
+  if (imuStuck) imuConfirmedStationary = false;
 
   if (bmiOk) {
     inavZUPT(ax,ay,az,gz);
+    imuVarianceCheck(ax,ay,az,gx,gy,gz);
 
     // ── Roll/Pitch complementary filter (v2.4, replaces JY-901 fusion) ──────
     // Gravity-vector accel angle blended with gyro-integrated angle at 98/2.
@@ -1777,12 +2247,19 @@ void inertialNav()
     bool haveSpeedCourse = gps.speed.isValid() && gps.course.isValid();
     float gpsSpeedMps = haveSpeedCourse ? (float)gps.speed.mps() : 0.0f;
 
-    if (haveSpeedCourse && gpsSpeedMps > INAV_MIN_COURSE_SPEED_MPS) {
+    // imuConfirmedStationary distrusts a nonzero GPS speed/course reading
+    // when the IMU's variance-based check confirms the device isn't actually
+    // moving — a raised GPS speed here is then GPS noise, not real motion.
+    if (haveSpeedCourse && gpsSpeedMps > INAV_MIN_COURSE_SPEED_MPS &&
+        !imuConfirmedStationary) {
       float zHeading = (float)gps.course.deg() * DEG_TO_RAD;
       inavKalmanUpdateFull(zE, zN, gpsSpeedMps, zHeading,
                             INAV_R_POS, INAV_R_SPEED, INAV_R_HEADING);
     } else {
       inavKalmanUpdatePos(zE, zN, INAV_R_POS);
+      // IMU statistically confirms stillness — actively correct the speed
+      // state toward zero instead of leaving it pulled up by GPS noise.
+      if (imuConfirmedStationary) inavApplyZeroVelocity();
     }
     state = INAV_STATE_GPS_FIX;
   }
@@ -1900,6 +2377,7 @@ void sensorTask(void* pvParam)
 
   while (true)
   {
+    sensorTaskState = SENSOR_STATE_RUN;
     uint32_t perfSensorCycleStartUs = micros();
 
     buzzerService();
@@ -2209,6 +2687,14 @@ void blynkSendSlow()
 // Internal counters/timers continue constantly. Only their Blynk publication
 // is rate-limited to one snapshot every 10 seconds. This prevents diagnostic
 // traffic from being added to the 5-second FAST telemetry pathway.
+//
+// v3.8: V51 is intentionally LATCHED to the previous-run RTC checkpoint.
+// rtcReportPreviousCheckpoint() copies the pre-boot RTC record into
+// rtcPreviousRunCheckpoint before the new run starts writing checkpoints.
+// rtcFormatPreviousRun() therefore always formats that same snapshot.
+// Re-publishing V51 every 10 seconds does NOT change its contents.
+// V51 remains unchanged for the entire current run and is replaced only after
+// the next reboot/restart, when a new previous-run snapshot is captured.
 void blynkSendDiagnostics()
 {
   if (WiFi.status() != WL_CONNECTED) return;
@@ -2235,6 +2721,13 @@ void blynkSendDiagnostics()
   safeWriteI(V48, (int)perfMaxAht21Ms);
   safeWriteI(V49, (int)perfMaxEns160Ms);
   safeWriteI(V50, (int)perfMaxBmi160Ms);
+
+  // v3.8: V51 carries the complete PREVIOUS-RUN RTC checkpoint as one
+  // latched string. It is deliberately sourced only from
+  // rtcPreviousRunCheckpoint, never from the live RTC checkpoint.
+  char rtcText[512];
+  rtcFormatPreviousRun(rtcText, sizeof(rtcText));
+  safeWriteS(V51, rtcText);
 }
 
 
@@ -2285,10 +2778,16 @@ void blynkSendMap()
 
   if (unixT <= 0) return;   // no valid GPS time yet — skip this cycle, try again later
 
-  // Does inertial-nav data exist and can it be trusted right now?
+  // Does inertial-nav data exist and can it be trusted right now? IMU_STALE
+  // is deliberately EXCLUDED: it means several consecutive GPS fixes have
+  // already been missed, so the EKF is dead-reckoning on pure gyro/velocity
+  // integration with no fresh correction. Held velocity + drifting heading
+  // (see inavPredict()) traces looping arcs on the map the longer this runs.
+  // Only trust INAV while GPS is actively correcting it (GPS_FIX) or the gap
+  // is still short (IMU_RECENT); fall back to raw GPS as soon as it goes
+  // stale, well before the map-visible drift becomes large.
   bool inavExists = (inavState == INAV_STATE_GPS_FIX ||
-                      inavState == INAV_STATE_IMU_RECENT ||
-                      inavState == INAV_STATE_IMU_STALE);
+                      inavState == INAV_STATE_IMU_RECENT);
 
   double lat, lng;
   const char* src;
@@ -2327,7 +2826,13 @@ unsigned long blynkHandshakeStarted = 0;
 #define BLYNK_CONNECT_RETRY_MS 10000UL
 #define BLYNK_CONNECT_TIMEOUT_S 5UL
 #define BLYNK_HANDSHAKE_TIMEOUT_MS 10000UL
-#define BLYNK_SERVER_PROBE_TIMEOUT_MS 250UL
+#define BLYNK_SERVER_PROBE_TIMEOUT_MS 3000UL  // 3s gives ARP/TCP time to complete after fresh WiFi association
+    // connection attempt right after WiFi associates, when ARP for the server's
+    // IP has not yet been resolved. The probe remains hard-bounded by
+    // select() rather than an uncertain WiFiClient timeout, there's no
+    // watchdog risk in a longer bound — 1s comfortably covers ARP + local-LAN
+    // TCP handshake while still being a small fraction of the 10s task-WDT
+    // timeout and the 10s BLYNK_CONNECT_RETRY_MS retry interval.
 
 void wifiStartConnect()
 {
@@ -2444,7 +2949,7 @@ bool wifiConnect()
 void setup()
 {
   Serial.begin(115200);
-  Serial.println("\n[INIT] Air Quality Station ESP32 v3.7");
+  Serial.println("\n[INIT] Air Quality Station ESP32 v3.8");
   Serial.printf("[INIT] ten_mins_autoreset = %s\n", ten_mins_autoreset ? "ON":"OFF");
 
   // ── ESP reset-cause diagnostic ───────────────────────────────────────────
@@ -2452,6 +2957,9 @@ void setup()
   bootResetReasonText = resetReasonToString(bootResetReason);
   Serial.printf("[INIT] ESP reset reason: %s (%d)\n",
                 bootResetReasonText, (int)bootResetReason);
+
+  // Read the previous RTC-SRAM checkpoint before this run starts writing it.
+  rtcReportPreviousCheckpoint();
 
   // ── Explicit ESP task-watchdog configuration ─────────────────────────────
   // Do not rely on the Arduino core's default task-WDT settings. The sensor
@@ -2639,8 +3147,69 @@ void setup()
   blynkTimer.setInterval(10000UL, blynkSendDiagnostics);
   blynkTimer.setInterval(MAP_SEND_INTERVAL_MS, blynkSendMap);
 
-  engMsg("Setup OK v3.7 — long-term reliability monitoring enabled");
+  engMsg("Setup OK v3.8 — long-term reliability monitoring enabled");
   setupDone = true;
+}
+
+// Strictly non-blocking TCP reachability probe, hard-bounded by select().
+// WiFiClient::setTimeout() only reliably bounds READ operations on the
+// ESP32 Arduino core — the connect() phase itself can still block far
+// longer than requested when the host is unreachable or the handshake
+// hangs. That unbounded connect() is exactly what can trip the CPU1
+// Interrupt WDT (~300ms) even though BLYNK_SERVER_PROBE_TIMEOUT_MS is set.
+// A raw non-blocking socket + select() cannot have that failure mode:
+// the connect phase is hard-capped at timeoutMs, full stop, regardless of
+// core version quirks.
+bool blynkServerReachable(const char* host, uint16_t port, uint32_t timeoutMs)
+{
+  IPAddress ip;
+  // BLYNK_SERVER is configured as a literal dotted-decimal IP (a local
+  // server address), so parse it directly — this is pure string parsing
+  // and CANNOT block. Do NOT use WiFi.hostByName() here: on the ESP32
+  // Arduino core it does not reliably short-circuit numeric IPs and can
+  // fall through to the full lwIP DNS resolver, which is NOT bounded by
+  // timeoutMs. Right after a fresh WiFi association, DNS can be slow or
+  // briefly unreachable, and that unbounded resolve is enough on its own
+  // to trip the CPU1 Interrupt WDT — this was the actual cause of the
+  // panic seen immediately after "WiFi OK — Blynk configured...".
+  // If BLYNK_SERVER is ever changed to an actual hostname, fall back to
+  // hostByName() (best-effort — accept it will not be timeoutMs-bounded).
+  if (!ip.fromString(host)) {
+    if (!WiFi.hostByName(host, ip)) return false;
+  }
+
+  int sock = lwip_socket(AF_INET, SOCK_STREAM, 0);
+  if (sock < 0) return false;
+
+  int flags = lwip_fcntl(sock, F_GETFL, 0);
+  lwip_fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port   = htons(port);
+  addr.sin_addr.s_addr = (uint32_t)ip;
+
+  int res = lwip_connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+  bool ok = false;
+  if (res == 0) {
+    ok = true;   // connected immediately (rare, e.g. loopback)
+  } else if (errno == EINPROGRESS) {
+    fd_set wfds; FD_ZERO(&wfds); FD_SET(sock, &wfds);
+    struct timeval tv;
+    tv.tv_sec  = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    // select() is hard-bounded to timeoutMs — this is the whole point.
+    int sel = lwip_select(sock + 1, NULL, &wfds, NULL, &tv);
+    if (sel > 0) {
+      int soErr = 0; socklen_t len = sizeof(soErr);
+      lwip_getsockopt(sock, SOL_SOCKET, SO_ERROR, &soErr, &len);
+      ok = (soErr == 0);
+    }
+    // sel <= 0 => timed out or select error; ok stays false.
+  }
+  lwip_close(sock);
+  return ok;
 }
 
 // ============================================================================
@@ -2653,6 +3222,7 @@ void setup()
 
 void loop()
 {
+  loopState = LOOP_STATE_RUN;
   static uint32_t perfLastLoopStartUs = 0;
   uint32_t perfLoopStartUs = micros();
   if (perfLastLoopStartUs != 0)
@@ -2664,6 +3234,7 @@ void loop()
   buzzerService();
 
   if (WIFI) {
+    loopState = LOOP_STATE_WIFI;
     wifiService();
 
     if (WiFi.status() == WL_CONNECTED) {
@@ -2686,14 +3257,15 @@ void loop()
         // IMPORTANT: Blynk v0.6.1 Blynk.connect(timeout) is a blocking loop.
         // Even a nominal 1-second timeout can monopolize Core 1 long enough
         // to trigger the ESP32 Interrupt WDT when the TCP connection is not
-        // immediately usable. Probe the local Blynk TCP port first with a
-        // bounded WiFiClient timeout; only start Blynk.run() when the server
-        // has actually accepted a TCP connection. This avoids the failure mode
-        // where an unavailable/half-open Blynk server causes the CPU1 IWDT.
-        WiFiClient blynkProbe;
-        blynkProbe.setTimeout(BLYNK_SERVER_PROBE_TIMEOUT_MS);
-        bool serverReachable = blynkProbe.connect(BLYNK_SERVER, BLYNK_PORT);
-        blynkProbe.stop();
+        // Probe the local Blynk TCP port first with a hard-bounded,
+        // genuinely non-blocking connect (see blynkServerReachable() above —
+        // WiFiClient::connect()/setTimeout() does not reliably bound the
+        // connect phase and was the cause of this exact CPU1 IWDT panic).
+        // Only start Blynk.run() when the server has actually accepted a
+        // TCP connection. This avoids the failure mode where an
+        // unavailable/half-open Blynk server causes the CPU1 IWDT.
+        bool serverReachable = blynkServerReachable(BLYNK_SERVER, BLYNK_PORT,
+                                                     BLYNK_SERVER_PROBE_TIMEOUT_MS);
 
         if (!serverReachable) {
           Serial.println("[Blynk] Server TCP probe failed — retry later");
@@ -2719,6 +3291,7 @@ void loop()
       }
 
       if (blynkHandshakeActive && !Blynk.connected()) {
+        loopState = LOOP_STATE_BLYNK;
         // v3.3: Blynk v0.6.1 performs blocking socket reads inside Blynk.run().
         // BLYNK_TIMEOUT_MS is deliberately limited to 1s above, so one call
         // cannot monopolise Core 1 long enough to trip the ESP32 idle/interrupt
@@ -2735,6 +3308,7 @@ void loop()
         yield();
 
         if (Blynk.connected()) {
+        loopState = LOOP_STATE_BLYNK;
           blynkHandshakeActive = false;
           Serial.println("[Blynk] Connected");
         } else if (millis() - blynkHandshakeStarted >= BLYNK_HANDSHAKE_TIMEOUT_MS) {
@@ -2769,6 +3343,7 @@ void loop()
   }
 
   // ── Application health monitor ───────────────────────────────────────────
+  loopState = LOOP_STATE_HEALTH;
   // This does not replace the task watchdog. It provides a second, visible
   // diagnostic path and catches a sensor task that is alive but no longer
   // completing its normal work cycle.
@@ -2800,4 +3375,9 @@ void loop()
                   Blynk.connected() ? "OK" : "OFF",
                   ppsIsLocked() ? 1 : 0);
   }
+  // Persistent crash checkpoint: RTC SRAM only, once per second.
+  // If Core 1 stalls/crashes, this naturally stops advancing and the next boot
+  // sees the last known-good checkpoint.
+  rtcCheckpointService();
+
 }
