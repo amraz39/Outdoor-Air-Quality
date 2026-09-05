@@ -27,6 +27,7 @@
 15. [Air quality mapping](#air-quality-mapping)
 16. [Known limitations and future work](#known-limitations-and-future-work)
 17. [System Health Diagnostics](#system-health-diagnostics)
+18. [V55 remote hard reset](#v55-remote-hard-reset)
 
 ---
 
@@ -123,6 +124,37 @@ The current firmware (`AirQualityOutdoor_ESP32_Blynk(5).ino`) adds the following
 * Preserved the GPS PPS interrupt and dedicated PPS LED task: every received PPS event produces a fixed **250 ms** pulse on the ESP32 board's D2/GPIO2 LED.
 * Preserved the BMI160-based INAV EKF and the GPS-loss states `NO_FIX_YET`, `GPS_FIX`, `IMU_RECENT`, `IMU_STALE`, and `LOST`.
 
+### Reliability update: V55 and bounded ENS160 I²C handling
+
+The later reliability work added two important changes beyond the original v3.7
+description:
+
+* **V55 remote hard reset:** a Blynk V55 Button requests a direct `esp_restart()`.
+  Interrupts remain enabled during the restart sequence to avoid an Interrupt-WDT
+  failure.
+* **ENS160 measurement wait is bounded:** the ScioSense ENS160 `measure(true)` and
+  `measureRaw(true)` calls can poll indefinitely while waiting for new sensor data.
+  The updated firmware uses `measure(false)` inside a **1.5 s deadline**, feeding the
+  task watchdog and yielding during the wait. The raw measurement uses
+  `measureRaw(false)` so it cannot reintroduce the unbounded wait.
+* **I²C transaction timeout remains 50 ms:** `Wire.setTimeOut(50)` bounds individual
+  low-level I²C transactions. This is separate from the 1.5 s ENS160 measurement
+  deadline: the former limits one I²C operation, while the latter limits the sensor
+  driver's repeated status polling.
+* **I²C diagnostics V45–V50** record the last I²C device/operation, cumulative I²C
+  errors, and retained maximum timings for the AHT21, ENS160, and BMI160 paths.
+
+This distinction matters because a watchdog backtrace previously showed the sensor
+task inside the ENS160 I²C path (`ENS160.measure()` → `Wire.endTransmission()`).
+The bounded measurement logic prevents the ENS160 driver's repeated new-data polling
+from holding the sensor task indefinitely.
+
+### Software Reset
+
+* **V55** is the software reset command from the Blynk app.
+
+The device can be onw reset by pressing the reset button on the board or by sending a reset command from the Blynk app (via `V55`). 
+
 ### Important diagnostic distinction
 
 * **V4** is the changing application/telemetry diagnostic value.
@@ -132,6 +164,7 @@ The current firmware (`AirQualityOutdoor_ESP32_Blynk(5).ino`) adds the following
 * **V27** is the INAV state (`0`–`4`).
 * **V34** is the ESP32 **reset cause from the most recent boot**.
 * **V35–V50** are performance/I²C diagnostics (PPS count/age, retained-max timings, last I²C device/operation, I²C error count) for tracking down stalls.
+* **V51** is the last I²C error code (from `Wire.endTransmission()`) which confirms two FreeRTOS tasks (`sensorTask` pinned to Core 0 and `ppsLedTask` pinned to Core 1).
 
 ---
 
@@ -631,6 +664,44 @@ V34 → normally POWERON after a power-up; other values explain the preceding re
 
 ---
 
+## V55 remote hard reset
+
+The firmware provides **Blynk virtual pin V55** as a remote ESP32 restart control. Configure
+a Blynk **Button** widget on V55; **Push** mode is recommended. When the widget sends
+`1`, the firmware calls `esp_restart()`.
+
+### V55 setup
+
+| Setting | Value |
+|---|---|
+| Virtual pin | **V55** |
+| Widget | **Button** |
+| Mode | **Push** recommended |
+| ON / pressed value | `1` |
+| Purpose | Remote ESP32 software restart |
+
+The V55 reset is intentionally performed directly from the `BLYNK_WRITE(V55)` callback.
+Interrupts remain enabled and the firmware does **not** call `noInterrupts()` before
+`esp_restart()`. Disabling interrupts immediately before the ESP32 restart sequence
+can prevent the restart machinery from completing and trigger an **Interrupt-WDT**
+panic.
+
+A V55 restart is a **software reset**, so after reboot V34 should report:
+
+```text
+SOFTWARE
+```
+
+V55 is useful both for remote recovery and for controlled restart testing. Trigger V55,
+wait for the station to return, and then check V34 and the startup Serial diagnostics.
+
+### Why V55 was added
+
+V55 was added as a diagnostic/recovery control while investigating freezes during
+unattended operation. It provides a way to restart the ESP32 remotely without
+physically pressing the reset button or removing power. It does not replace the task
+watchdog or sensor fault-recovery mechanisms.
+
 ## Configuration reference
 
 ### Feature switches
@@ -664,6 +735,7 @@ int   inav_max_loss_minutes   = 5;     // after this, INAV becomes LOST and hold
 | `BLYNK_SERVER_PROBE_TIMEOUT_MS` | 250 ms | Bounds pre-Blynk TCP reachability probe |
 | `WIFI_RECONNECT_MS` | 30 s | WiFi retry interval |
 | `ENS_RETRY_MS` | 10 s | ENS160/AHT2x retry interval |
+| `ENS_MEASURE_TIMEOUT_MS` | 1.5 s | Maximum wait for ENS160 new-data polling |
 | `SENSOR_HEALTH_FAIL_LIMIT` | 5 | Persistent sensor fault threshold |
 | `IMU_TIMEOUT_MS` | 5 s | Persistent BMI160 read-loss threshold |
 | `SENSOR_TASK_HEALTH_TIMEOUT_MS` | 30 s | Sensor-task heartbeat diagnostic threshold |
@@ -775,7 +847,7 @@ heartbeat provide fault recovery without requiring periodic scheduled reboots.
 
 ---
 
-*Firmware: `AirQualityOutdoor_ESP32_Blynk(5).ino` v3.7 · Credentials: `secrets.h` · Backend: self-hosted Blynk 0.6.1 local server*
+*Firmware: `AirQualityOutdoor_ESP32_Blynk` v3.9.5 · Credentials: `secrets.h` · Backend: self-hosted Blynk 0.6.1 local server*
 
 ---
 

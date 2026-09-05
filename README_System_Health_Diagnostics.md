@@ -218,6 +218,9 @@ These channels are internal timing/counter diagnostics. The underlying counters 
 | **V48** | Max AHT21 read duration (ms) | Longest observed AHT21 read |
 | **V49** | Max ENS160 operation duration (ms) | Longest observed ENS160 read/operation |
 | **V50** | Max BMI160 raw-read duration (ms) | Longest observed BMI160 raw register read |
+operation |
+| **V51** | Last State of the device before crash-with-reboot (held in RTC) |
+
 
 ### Periodic `[PERF]` serial report
 

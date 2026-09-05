@@ -3,7 +3,7 @@
 struct RtcCheckpoint;
 
 // ============================================================================
-// Outdoor Air Quality Station — ESP32 Production Firmware v3.8
+// Outdoor Air Quality Station — ESP32 Production Firmware v3.9.5
 // Migrated & rewritten from original Arduino Mega + Esp8266EasyIoT (AM, 2017)
 //
 // ─── HARDWARE v2.0/2.1 ───────────────────────────────────────────────────────
@@ -270,7 +270,20 @@ struct RtcCheckpoint;
 //   • Existing sensor, GPS, INAV, CO, Blynk, map, display, buzzer, and status
 //     logic is preserved; changes are limited to reliability/monitoring paths.
 // ============================================================================
-// v3.8 RTC CRASH DIAGNOSTICS — additive, existing behaviour kept
+// v3.9 REMOTE HARD RESET — additive, existing behaviour kept
+//   • Blynk Virtual Pin V55 is a button that requests the strongest
+//     firmware-triggered ESP32 reset available through the application.
+//   • The reset occurs only when Blynk delivers HIGH/1 to V55.
+// v3.9.1 note: the earlier V55 reset was deferred until loop() was outside
+// Blynk.run(); that implementation also never disabled interrupts and added
+// explicit Blynk/WiFi teardown. v3.9.2 simplifies the reset to the direct
+// esp_restart() path below, with interrupts enabled, as required by the ESP32
+// restart machinery.
+//   • The reset path invokes esp_restart() so the ESP32 performs a full system
+//     software restart through ESP-IDF. Interrupts are NOT disabled by the sketch.
+//   • This is a firmware reset, not a physical power-cycle/brownout reset.
+// ============================================================================
+// // v3.8 RTC CRASH DIAGNOSTICS — additive, existing behaviour kept
 //   • V51 now publishes the previous-run RTC checkpoint as a latched diagnostic
 //     string. The snapshot is captured before the new run starts updating RTC.
 //   • V51 is never populated from the live/current-run checkpoint, so it does not
@@ -311,6 +324,8 @@ struct RtcCheckpoint;
 //   • Preserved all existing sensor-specific fault detection, retry, watchdog, 
 //     GPS, CO, Blynk, WiFi, display, LED, buzzer, and status logic.
 //   • Periodic [PERF] Serial report
+//   • v3.9.3: Serialized all sketch-level LEDC operations across Core 0 and Core 1
+//     to prevent a cross-core LEDC driver race that can trigger the CPU1 Interrupt-WDT.
 //
 // ============================================================================
 
@@ -467,6 +482,7 @@ BlynkWifiBounded Blynk(_boundedBlynkTransport);
 #include <Adafruit_AHTX0.h>      // AHT20/AHT21 temp+hum — install: Adafruit AHTX0
 #include <Adafruit_SSD1306.h>
 #include <driver/i2s_std.h>      // ESP32 NEW standard I2S driver for INMP441 (v2.2)
+#include "esp_system.h"
 
 // ─── PERFORMANCE / I2C DIAGNOSTICS — declarations must precede PPS ISR ───
 // Internal counters/timers run continuously; V34-V50 are published only
@@ -773,6 +789,11 @@ bool ppsIsLocked()
 // ─── LEDC ────────────────────────────────────────────────────────────────────
 #define LEDC_FREQ_CO 5000
 #define LEDC_RES_CO  8
+// v3.9.4: keep CO and buzzer in different LEDC channel groups. ESP32 channels
+// 0-7 are group 0 and 8-15 are group 1, so the two peripherals cannot share
+// the same hardware timer when the buzzer frequency changes.
+#define LEDC_CHANNEL_CO     0
+#define LEDC_CHANNEL_BUZZER 8
 
 // ─── GY-BMI160 6-DOF IMU — I2C, shares bus with ENS160/AHT2x (v2.3) ─────────
 // Minimal register-level driver — no external library, avoids adding another
@@ -834,6 +855,7 @@ bool ppsIsLocked()
 #define IMU_TIMEOUT_MS         5000
 #define ENS_MAX_FAILS             5
 #define ENS_RETRY_MS          10000
+#define ENS_MEASURE_TIMEOUT_MS 1500UL
 #define CO_PHASE_MAX_MS      180000
 #define WIFI_RECONNECT_MS     30000
 #define ENG_MSG_INTERVAL      15000
@@ -1013,6 +1035,7 @@ BuzzerPatternStep buzzerPattern[BUZZER_PATTERN_MAX_STEPS];
 volatile uint8_t buzzerPatternCount = 0;
 volatile uint8_t buzzerPatternIndex = 0;
 volatile bool buzzerPatternRunning = false;
+volatile bool buzzerLEDCReady = false; // v3.9.4: declared before buzzerTone() so Arduino/C++ sees it.
 volatile unsigned long buzzerPatternNextMillis = 0;
 
 // ─── LONG-TERM HEALTH MONITORING ─────────────────────────────────────────────
@@ -1385,8 +1408,13 @@ void buzzerTone(uint16_t frequency, uint16_t durationMs)
   buzzerPatternRunning = false;
   buzzerPatternCount = 0;
   buzzerPatternIndex = 0;
-  ledcAttach(buzzPin, frequency, 8);
-  ledcWrite(buzzPin, 128);
+  // v3.9.4: the buzzer is permanently attached to its own LEDC channel/group.
+  // Do NOT attach/detach it for every tone: the previous implementation entered
+  // ledcAttachChannel() immediately after WiFi came up and still reproduced the
+  // CPU1 Interrupt-WDT. Changing only the buzzer's dedicated timer is much safer.
+  if (!buzzerLEDCReady) return;
+  ledcChangeFrequencySafe(buzzPin, frequency, 8);
+  ledcWriteSafe(buzzPin, 128);
   buzzerActiveFrequency = frequency;
   buzzerActive = true;
   buzzerStopMillis = millis() + durationMs;
@@ -1411,8 +1439,10 @@ void buzzerService()
 
   if (buzzerActive) {
     if ((long)(now - buzzerStopMillis) >= 0) {
-      ledcWrite(buzzPin, 0);
-      ledcDetach(buzzPin);
+      ledcWriteSafe(buzzPin, 0);
+      // v3.9.4: keep the buzzer LEDC channel attached permanently. Detaching and
+      // re-attaching it repeatedly is unnecessary and exercises the LEDC allocator
+      // on Core 1 while the CO heater is active on Core 0.
       buzzerActive = false;
       if (buzzerPatternRunning) {
         buzzerPatternNextMillis = now + buzzerPattern[buzzerPatternIndex].pauseMs;
@@ -1423,8 +1453,13 @@ void buzzerService()
 
   if (buzzerPatternRunning && (long)(now - buzzerPatternNextMillis) >= 0) {
     BuzzerPatternStep step = buzzerPattern[buzzerPatternIndex];
-    ledcAttach(buzzPin, step.frequency, 8);
-    ledcWrite(buzzPin, 128);
+    // v3.9.4: use the buzzer's permanently attached, dedicated LEDC timer.
+    if (!buzzerLEDCReady) {
+      buzzerPatternRunning = false;
+      return;
+    }
+    ledcChangeFrequencySafe(buzzPin, step.frequency, 8);
+    ledcWriteSafe(buzzPin, 128);
     buzzerActiveFrequency = step.frequency;
     buzzerActive = true;
     buzzerStopMillis = now + step.durationMs;
@@ -1576,11 +1611,43 @@ bool readENS(float& tvoc, float& eco2, float& aqi_out, float& temp_out, float& h
   ens160.set_envdata((int)temp_out, (int)hum_out);
 
   // Trigger measurement
+  // v3.9.5 FIX: do NOT use measure(true)/measureRaw(true) here. The ScioSense
+  // library implements those forms as an unbounded polling loop on DATA_STATUS.
+  // If the ENS160 is electrically present but stops asserting NEWDAT/NEWGPR
+  // (for example after a connector/wire disturbance), the sensorTask can stay
+  // inside read8()/Wire indefinitely until the task-WDT fires. Instead, poll
+  // with the library's non-waiting form and impose our own finite deadline.
+  // Each individual Wire transaction remains bounded by Wire.setTimeOut(50),
+  // while the outer deadline prevents the library's measurement wait from ever
+  // becoming an unbounded sensor-task stall. Standard operating mode is
+  // continuous, so a short wait here is enough; the next sensorTask cycle will
+  // retry if fresh data has not appeared yet.
   perfI2cBegin(1, 2);
-  ens160.measure(true);
-  ens160.measureRaw(true);
+  bool ensMeasureReady = false;
+  unsigned long ensMeasureWaitStart = millis();
+  while (millis() - ensMeasureWaitStart < ENS_MEASURE_TIMEOUT_MS) {
+    ensMeasureReady = ens160.measure(false);
+    if (ensMeasureReady) break;
+    esp_task_wdt_reset();
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
 
-  // Read results — always available after measure()
+  if (!ensMeasureReady) {
+    perfI2cError();
+    perfRecordMax(perfMaxEns160Ms,
+                  (uint32_t)((micros() - perfEns160OnlyStartUs) / 1000UL));
+    perfRecordMax(perfMaxI2cPathMs,
+                  (uint32_t)((micros() - perfEnsStartUs) / 1000UL));
+    return false;
+  }
+
+  // Raw hotplate data is not used by this sketch, but keep the existing raw
+  // measurement call additive and non-blocking. It must never be allowed to
+  // turn the bounded prediction measurement above back into an unbounded wait.
+  perfI2cBegin(1, 2);
+  ens160.measureRaw(false);
+
+  // Read results — valid after the bounded prediction measurement above
   perfI2cBegin(1, 1);
   tvoc    = (float)ens160.getTVOC();   // ppb
   eco2    = (float)ens160.geteCO2();   // ppm equivalent CO2
@@ -1689,7 +1756,8 @@ float readINMP441_dB()
 void setHeatDuty(byte duty)
 {
   co_duty = duty;
-  ledcWrite(CO_PWM_PIN, duty);
+  // v3.9.3: CO heater PWM shares the LEDC driver with the Core-1 buzzer.
+  ledcWriteSafe(CO_PWM_PIN, duty);
 }
 
 void startMeasurementPhase()
@@ -2806,7 +2874,69 @@ void blynkSendMap()
     Serial.printf("[BLYNK MAP] idx=%ld lat=%.6f lng=%.6f src=%s\n", unixT, lat, lng, src);
 }
 
-// ─── NON-BLOCKING WiFi recovery state ───────────────────────────────────────
+// ─── LEDC cross-core protection ─────────────────────────────────────────────
+// v3.9.4 FIX: LEDC is used by BOTH cores. Core 1 drives the non-blocking
+// buzzer, while Core 0 drives the CO heater PWM. ESP32 Arduino core 3.x LEDC
+// operations enter the ESP-IDF LEDC driver and may briefly hold its internal
+// critical section with interrupts disabled. Calling LEDC APIs concurrently
+// from the two cores can therefore make one core wait inside the driver long
+// enough to trip the Interrupt-WDT. The V55 software-reset boot exposed this
+// race immediately because WiFi connection success schedules a buzzer tone
+// while the sensor task is already running. Serialize ALL sketch-level LEDC
+// operations with a dedicated mutex so only one core can touch the LEDC driver
+// at a time. No sensor, buzzer, or PWM logic is removed.
+SemaphoreHandle_t ledcMutex = NULL;
+bool ledcTakeLock(uint32_t timeoutMs = 100)
+{
+  if (ledcMutex == NULL) return false;
+  return xSemaphoreTake(ledcMutex, pdMS_TO_TICKS(timeoutMs)) == pdTRUE;
+}
+
+void ledcGiveLock()
+{
+  if (ledcMutex != NULL) xSemaphoreGive(ledcMutex);
+}
+
+bool ledcAttachSafe(uint8_t pin, uint32_t freq, uint8_t resolution)
+{
+  if (!ledcTakeLock()) return false;
+  bool ok = ledcAttach(pin, freq, resolution);
+  ledcGiveLock();
+  return ok;
+}
+
+bool ledcAttachChannelSafe(uint8_t pin, uint32_t freq, uint8_t resolution, int8_t channel)
+{
+  if (!ledcTakeLock()) return false;
+  bool ok = ledcAttachChannel(pin, freq, resolution, channel);
+  ledcGiveLock();
+  return ok;
+}
+
+bool ledcChangeFrequencySafe(uint8_t pin, uint32_t freq, uint8_t resolution)
+{
+  if (!ledcTakeLock()) return false;
+  uint32_t result = ledcChangeFrequency(pin, freq, resolution);
+  ledcGiveLock();
+  return result != 0;
+}
+
+bool ledcWriteSafe(uint8_t pin, uint32_t duty)
+{
+  if (!ledcTakeLock()) return false;
+  bool ok = ledcWrite(pin, duty);
+  ledcGiveLock();
+  return ok;
+}
+
+bool ledcDetachSafe(uint8_t pin)
+{
+  if (!ledcTakeLock()) return false;
+  bool ok = ledcDetach(pin);
+  ledcGiveLock();
+  return ok;
+}
+
 bool wifiConnectInProgress = false;
 unsigned long wifiConnectStarted = 0;
 unsigned long wifiFailureAlertAt = 0;
@@ -2823,6 +2953,9 @@ unsigned long lastBlynkConnectAttempt = 0;
 // waiting for the next 10s connection-attempt interval.
 bool blynkHandshakeActive = false;
 unsigned long blynkHandshakeStarted = 0;
+// v3.9.1: after a software reset, briefly delay the new Blynk handshake.
+unsigned long blynkStartupHoldoffUntil = 0;
+#define BLYNK_SOFT_RESET_HOLDOFF_MS 15000UL
 #define BLYNK_CONNECT_RETRY_MS 10000UL
 #define BLYNK_CONNECT_TIMEOUT_S 5UL
 #define BLYNK_HANDSHAKE_TIMEOUT_MS 10000UL
@@ -2859,6 +2992,11 @@ void wifiMarkConnected()
   blynkHandshakeActive = false;
   blynkHandshakeStarted = 0;
   lastBlynkConnectAttempt = millis() - BLYNK_CONNECT_RETRY_MS;
+  // A V55 software reset may leave the previous Blynk TCP session closing.
+  // Give that session a short grace period before opening the replacement.
+  blynkStartupHoldoffUntil = (bootResetReason == ESP_RST_SW)
+                           ? millis() + BLYNK_SOFT_RESET_HOLDOFF_MS
+                           : 0;
   if (xSemaphoreTake(dataMutex,pdMS_TO_TICKS(10))==pdTRUE) {
     sd.status_flags|=STATUS_WIFI_OK; xSemaphoreGive(dataMutex);
   }
@@ -2946,10 +3084,39 @@ bool wifiConnect()
 // SETUP — runs on Core 1 (Arduino default app_cpu)
 // ============================================================================
 
+// ─── V55 REMOTE HARD RESET ────────────────────────────────────────────────────
+// Configure V55 in Blynk as a Button widget (Push is recommended).
+// A HIGH/1 write requests a firmware-triggered ESP32 restart.
+//
+// The RTC checkpoint is written independently and survives this software
+// restart, so V51 can report the previous run after the device comes back.
+// v3.9.2 FIX: the V55 reset is performed directly from the Blynk callback.
+// esp_restart() is allowed to run with interrupts enabled; noInterrupts() is
+// deliberately NOT used because it can prevent the ESP32 restart machinery
+// from completing and trigger the Interrupt-WDT.
+// The short delay after Serial.flush() only gives the reset message time to
+// leave the UART before esp_restart() starts the system restart.
+//
+// The RTC checkpoint is written independently and survives this software
+// restart, so V51 can report the previous run after the device comes back.
+
+// V55 — Blynk hard-reset button.
+// Configure V55 in Blynk as a Button widget; send 1 when pressed.
+BLYNK_WRITE(V55)
+{
+  if (param.asInt() == 1) {
+    Serial.println("[V55] REMOTE HARD RESET requested");
+    Serial.flush();
+    delay(10);
+    esp_restart();
+  }
+}
+
+
 void setup()
 {
   Serial.begin(115200);
-  Serial.println("\n[INIT] Air Quality Station ESP32 v3.8");
+  Serial.println("\n[INIT] Air Quality Station ESP32 v3.9.5");
   Serial.printf("[INIT] ten_mins_autoreset = %s\n", ten_mins_autoreset ? "ON":"OFF");
 
   // ── ESP reset-cause diagnostic ───────────────────────────────────────────
@@ -2991,6 +3158,17 @@ void setup()
                 R_DIVIDER_SERIES,R_DIVIDER_GND,divider_ratio,divider_scale,5.0f*divider_ratio);
 
   dataMutex = xSemaphoreCreateMutex();
+
+  // v3.9.3: create the LEDC mutex before either Core can use the LEDC driver.
+  // The sensor task is launched before the CO PWM setup below, so this must
+  // exist before xTaskCreatePinnedToCore(sensorTask, ...).
+  ledcMutex = xSemaphoreCreateMutex();
+  if (ledcMutex == NULL) {
+    Serial.println("[WARN] LEDC mutex creation failed — buzzer/CO PWM protected calls disabled");
+  } else {
+    Serial.println("[INIT] LEDC cross-core mutex created");
+  }
+
   memset(&sd, 0, sizeof(sd));
   strncpy(sd.eng_msg, "Booting...", sizeof(sd.eng_msg));
   // Keep the reset cause in the normal engineering-message path so it is
@@ -3016,6 +3194,16 @@ void setup()
   pinMode(PPS_LED_PIN, OUTPUT); setPpsLed(false);
   pinMode(dustLED, OUTPUT); digitalWrite(dustLED, HIGH);
   pinMode(buzzPin, OUTPUT);
+  // v3.9.4: attach the buzzer ONCE during single-threaded setup, before
+  // sensorTask starts on Core 0. Use channel 8 (LEDC group 1), deliberately
+  // separate from the CO heater's channel 0 (LEDC group 0).
+  buzzerLEDCReady = ledcAttachChannelSafe(buzzPin, 5000, 8, LEDC_CHANNEL_BUZZER);
+  if (buzzerLEDCReady) {
+    ledcWriteSafe(buzzPin, 0);
+    Serial.println("[INIT] Buzzer LEDC attached on channel 8 (group 1)");
+  } else {
+    Serial.println("[WARN] Buzzer LEDC attach failed — buzzer disabled");
+  }
   pinMode(CO_ADC_PIN,   INPUT);
   pinMode(CO_A1_PIN,    INPUT);
   pinMode(UV_OUT_PIN,   INPUT);
@@ -3077,8 +3265,9 @@ void setup()
 
   // ── CO LEDC PWM ──────────────────────────────────────────────────────────
   if (COsensorThere) {
-    ledcAttach(CO_PWM_PIN, LEDC_FREQ_CO, LEDC_RES_CO);
-    ledcWrite(CO_PWM_PIN, 0);
+    // v3.9.4: explicit channel 0 keeps the CO heater in LEDC group 0.
+    ledcAttachChannelSafe(CO_PWM_PIN, LEDC_FREQ_CO, LEDC_RES_CO, LEDC_CHANNEL_CO);
+    ledcWriteSafe(CO_PWM_PIN, 0);
   }
 
   // [SUPERSEDED v2.4] JY-901 UART2 init removed — GPIO16/17 are free. BMI160
@@ -3147,7 +3336,7 @@ void setup()
   blynkTimer.setInterval(10000UL, blynkSendDiagnostics);
   blynkTimer.setInterval(MAP_SEND_INTERVAL_MS, blynkSendMap);
 
-  engMsg("Setup OK v3.8 — long-term reliability monitoring enabled");
+  engMsg("Setup OK v3.9.5 — long-term reliability monitoring enabled");
   setupDone = true;
 }
 
@@ -3251,6 +3440,7 @@ void loop()
       unsigned long nowBlynk = millis();
 
       if (blynkConfigured && !Blynk.connected() && !blynkHandshakeActive &&
+          nowBlynk >= blynkStartupHoldoffUntil &&
           nowBlynk - lastBlynkConnectAttempt >= BLYNK_CONNECT_RETRY_MS) {
         lastBlynkConnectAttempt = nowBlynk;
 
@@ -3341,6 +3531,10 @@ void loop()
       }
     }
   }
+
+  // v3.9.1 note retained: the previous implementation deferred V55 until
+  // Blynk callback processing had returned to loop(). v3.9.2 performs the
+  // restart directly in BLYNK_WRITE(V55), with interrupts left enabled.
 
   // ── Application health monitor ───────────────────────────────────────────
   loopState = LOOP_STATE_HEALTH;
