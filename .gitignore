@@ -25,3 +25,5 @@ MQ-7*.txt
 HOW_TO_*.txt
 .theia/
 *.BAD
+.gitignore
+*.lnk
