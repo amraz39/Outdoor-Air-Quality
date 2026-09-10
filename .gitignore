@@ -27,3 +27,4 @@ HOW_TO_*.txt
 *.BAD
 .gitignore
 *.lnk
+ESP32_TEST

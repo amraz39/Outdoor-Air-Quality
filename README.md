@@ -377,9 +377,12 @@ sensor — and the exponential moving average is not updated.
 
 ## GPS initialisation
 
-The current GPS is an **ATGM336H** using standard NMEA output at **9600 baud**.
-No u-blox UBX configuration sequence is used. TinyGPS++ parses the NMEA stream on
-Core 0.
+The current GPS is an **ATGM336H** using standard NMEA output at **115200 baud**.
+Auto-baud detection at startup, then configured via PMTK commands to:
+- 115200 baud (highest rate)
+- 10Hz update rate (100ms interval)
+- Only RMC and GGA NMEA sentences (reduced data load)
+TinyGPS++ parses the NMEA stream on Core 0.
 
 The GPS also supplies a **1PPS signal on GPIO5**. The PPS ISR records timing/event
 state only; a dedicated FreeRTOS task generates a fixed 250 ms pulse on the ESP32

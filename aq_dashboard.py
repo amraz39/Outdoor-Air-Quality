@@ -530,9 +530,12 @@ def do_remote_reset():
         return
 
     def _worker():
+        # Press software button (set pin HIGH)
         write_pin(RESET_PIN, 1)
         import time
+        # Hold HIGH for 0.5 s to trigger reset
         time.sleep(0.5)
+        # Release button (set pin LOW)
         write_pin(RESET_PIN, 0)
 
     threading.Thread(target=_worker, daemon=True).start()
