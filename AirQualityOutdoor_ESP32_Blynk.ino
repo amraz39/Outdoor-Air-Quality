@@ -3,10 +3,55 @@
 struct RtcCheckpoint;
 
 // Firmware version - printed on boot and sent to Blynk for tracking
-#define FIRMWARE_VERSION "3.9.32"
-// v3.9.32 compile fix: keep this threshold in the early configuration
+#define FIRMWARE_VERSION "3.9.39"
+
+// v3.9.39 BLYNK FORCED WIFI-RECOVERY FIX
+//   - v3.9.38 correctly fixed clean power-on by avoiding aggressive teardown on
+//     the first WiFi association. However, after a real WiFi failure the Blynk
+//     protocol object can still report connected even though its TCP session is
+//     dead. The v3.9.38 probe gate required !Blynk.connected(), so the recovery
+//     could stop at "handshake pending" forever.
+//   - v3.9.39 adds blynkForceReconnect. It is set only after a subsequent WiFi
+//     re-association, forces a fresh Blynk/socket teardown, and bypasses the
+//     stale Blynk.connected() gate until a NEW Blynk connection is confirmed.
+//   - Clean power-on behavior is unchanged.
+//   - Existing I2C recovery, bounded raw transport, WiFi reconnect state
+//     machine, watchdogs, diagnostics, and telemetry logic are preserved.
+//
+// v3.9.38 BLYNK/WIFI RECOVERY FIX
+//   - Restores the clean power-on Blynk startup path from v3.9.34.
+//   - v3.9.35-3.9.37 called Blynk.disconnect() during EVERY WiFi association,
+//     including the first association after power-on. That teardown is only
+//     needed when recovering from a previous WiFi session.
+//   - On first WiFi association: configure Blynk and immediately request the
+//     bounded TCP probe, without first destroying the fresh Blynk state.
+//   - On subsequent WiFi associations: keep the aggressive Blynk/raw-socket
+//     teardown so a stale Blynk session cannot survive a WiFi reconnect.
+//   - Keep the v3.9.17+ WiFi reconnect state machine and 250ms disconnect
+//     settle window; WiFi.setAutoReconnect(false) remains intentional because
+//     wifiService() is the single owner of reconnect timing.
+//   - Keep the v3.9.37 explicit immediate-probe flag; no millis() subtraction
+//     trick is used near boot.
+// v3.9.33 compile fix: keep this threshold in the early configuration
 // section so Arduino-generated function prototypes can see it.
 #define I2C_DIAG_SLOW_MS 100UL
+
+// v3.9.35 I2C SENSOR RECOVERY — fixes shared-bus loss after long runtime
+//   - If ENS160/AHT2x loses I2C communication after it was previously healthy,
+//     ensReady is now cleared on a failed read so the next recovery attempt can
+//     actually rerun initENS(). Previously ensReady could remain true forever,
+//     leaving a physically recovered device with stale library state.
+//   - If BMI160 has sustained read failures, bmi160Ready is cleared and the
+//     sensor is fully re-probed/reinitialized instead of remaining permanently
+//     marked ready after the bus/device disappears.
+//   - I2C recovery now explicitly releases the bus, performs the 9-clock recovery,
+//     reinitializes Wire, and verifies the bus lines before sensor reinit.
+//   - Recovery is conservative and rate-limited; no sensor/Blynk scheduling is
+//     removed and no external reset pin is assumed.
+//   - If the common 3.3V rail or a sensor itself has latched into a power fault,
+//     software I2C recovery cannot replace a real power cycle; the firmware logs
+//     that condition instead of silently remaining in a stale-ready state.
+// ============================================================================
 
 // v3.9.32 DIAGNOSTICS:
 //   - Keeps Arduino-ESP32 core 2.0.17 compatibility unchanged.
@@ -524,12 +569,27 @@ struct RtcCheckpoint;
 // at the library-supported minimum.  A handshake may therefore require more
 // than one Blynk.run() call, but each individual call remains bounded and the
 // Core 1 idle task can continue to be serviced between calls.
-#define BLYNK_TIMEOUT_MS 1000UL
+#define BLYNK_TIMEOUT_MS 3000UL
 
 #include "secrets.h"
 // secrets.h: #define WIFI_SSID / WIFI_PASS / BLYNK_AUTH / BLYNK_SERVER / BLYNK_PORT
+
+// ============================================================================
+// v3.9.33 stability tuning + selectable Blynk transport
+// BLYNK CONNECTION MODE
+//   0 = BOUNDED : existing raw non-blocking socket transport
+//   1 = SIMPLE  : stock BlynkSimpleEsp32 transport (same transport as TEST.ino)
+//
+// Use this switch for long-duration A/B testing.  The application/timers stay the same; only the Blynk transport/recovery path changes.
+// ============================================================================
+#ifndef CONNECTION_MODE
+  #define CONNECTION_MODE 0
+#endif
+
 #define DEBUGON        false
-#if DEBUGON
+// Enable Blynk library diagnostics when either verbose debugging is enabled
+// OR the stock BlynkSimpleEsp32 connection mode is being tested.
+#if DEBUGON || (CONNECTION_MODE == 1)
   #define BLYNK_PRINT Serial
 #endif
 
@@ -544,8 +604,22 @@ struct RtcCheckpoint;
   #define DBG_PRINTF(...) do {} while (0)
 #endif
 
+#define GPS_DEBUG_PRINTOUT false
+
 #include <WiFi.h>
 
+// Stability tuning: 3s is deliberately above the 1s historical value while
+// remaining below the Blynk library maximum of 10s.  This gives a marginal
+// network more recovery headroom without making one Blynk.run() call excessively
+// long.  Blynk's current library default is 6s.
+
+#if (CONNECTION_MODE != 0) && (CONNECTION_MODE != 1)
+  #error "CONNECTION_MODE must be 0 (BOUNDED) or 1 (SIMPLE)"
+#endif
+
+// v3.9.33: Keep the custom transport compiled in both modes so the source
+// remains A/B-testable without changing the diagnostics or socket implementation.
+// Only the active global Blynk transport is selected below.
 // v3.9.12/13: these were previously included further down (right after the
 // Blynk object is constructed), but BoundedSocketClient below now implements
 // its transport directly on raw lwIP sockets (lwip_socket/connect/send/recv/
@@ -1128,8 +1202,14 @@ public:
     }
 };
 
-static BoundedBlynkArduinoClient _boundedBlynkTransport;
-BlynkWifiBounded Blynk(_boundedBlynkTransport);
+#if CONNECTION_MODE == 0
+  static BoundedBlynkArduinoClient _boundedBlynkTransport;
+  BlynkWifiBounded Blynk(_boundedBlynkTransport);
+#else
+  // Stock Blynk transport, intentionally identical in transport choice to TEST.ino.
+  #include <BlynkSimpleEsp32.h>
+#endif
+
 #include <esp_mac.h>
 #include <esp_task_wdt.h>
 #include <esp_system.h>
@@ -1360,41 +1440,43 @@ static bool gpsRawChecksum(const char* line, uint16_t len, uint8_t& calculated, 
 
 static void gpsPrintRawCapture()
 {
-  if (gpsRawLineCount == 0) {
-    Serial.println("[GPS RAW] no complete $...\n sentence captured yet");
-    return;
-  }
+  if (GPS_DEBUG_PRINTOUT == true) {
+    if (gpsRawLineCount == 0) {
+      Serial.println("[GPS RAW] no complete $...\n sentence captured yet");
+      return;
+    }
 
-  Serial.printf("[GPS RAW] captured %u complete NMEA-looking line(s):\n",
-                (unsigned)gpsRawLineCount);
+    Serial.printf("[GPS RAW] captured %u complete NMEA-looking line(s):\n",
+                  (unsigned)gpsRawLineCount);
 
-  for (uint8_t i = 0; i < gpsRawLineCount; ++i) {
-    const char* line = gpsRawLines[i];
-    const uint16_t len = gpsRawLineLengths[i];
-    uint8_t calc = 0;
-    int tx = -1;
-    const bool haveChecksum = gpsRawChecksum(line, len, calc, tx);
+    for (uint8_t i = 0; i < gpsRawLineCount; ++i) {
+      const char* line = gpsRawLines[i];
+      const uint16_t len = gpsRawLineLengths[i];
+      uint8_t calc = 0;
+      int tx = -1;
+      const bool haveChecksum = gpsRawChecksum(line, len, calc, tx);
 
-    Serial.printf("[GPS RAW %u] ", (unsigned)(i + 1));
-    for (uint16_t j = 0; j < len; ++j) {
-      const uint8_t c = (uint8_t)line[j];
-      if (c == '\r' || c == '\n') continue;
-      if (c >= 32 && c <= 126) {
-        Serial.write(c);
+      Serial.printf("[GPS RAW %u] ", (unsigned)(i + 1));
+      for (uint16_t j = 0; j < len; ++j) {
+        const uint8_t c = (uint8_t)line[j];
+        if (c == '\r' || c == '\n') continue;
+        if (c >= 32 && c <= 126) {
+          Serial.write(c);
+        } else {
+          Serial.printf("\\x%02X", (unsigned)c);
+        }
+      }
+      if (haveChecksum) {
+        Serial.printf(" | checksum RX=%02X CALC=%02X %s\n",
+                      (unsigned)tx, (unsigned)calc,
+                      tx == calc ? "VALID" : "BAD");
       } else {
-        Serial.printf("\\x%02X", (unsigned)c);
+        Serial.println(" | checksum: NOT DECODABLE");
       }
     }
-    if (haveChecksum) {
-      Serial.printf(" | checksum RX=%02X CALC=%02X %s\n",
-                    (unsigned)tx, (unsigned)calc,
-                    tx == calc ? "VALID" : "BAD");
-    } else {
-      Serial.println(" | checksum: NOT DECODABLE");
-    }
-  }
 
-  gpsRawCaptureReset();
+    gpsRawCaptureReset();
+  }
 }
 
 // v3.5: Capture TinyGPS++ location-update state before any normal GPS
@@ -1792,6 +1874,8 @@ unsigned long lastFusionMillis = 0;   // for complementary filter dt
 int           ens_fail_count = 0;
 unsigned long lastENSattempt = 0;
 bool          ensReady       = false;  // true after first successful init
+uint8_t       ens_i2c_fail_streak = 0;
+uint8_t       bmi_i2c_fail_streak = 0;
 float         hum_prev = 20.0f, temp_prev = 20.0f;
 
 // ─── MISC STATE ──────────────────────────────────────────────────────────────
@@ -2728,7 +2812,7 @@ void initGPS()
   // Wait for PPS signal before starting baud detection (GPS needs time to initialize)
   Serial.println("[INIT] GPS waiting for PPS signal (V26=1) before baud detection...");
   unsigned long ppsWaitStart = millis();
-  const unsigned long PPS_WAIT_TIMEOUT_MS = 30000; // 30 second timeout for PPS
+  const unsigned long PPS_WAIT_TIMEOUT_MS = 3000; // 30 second timeout for PPS
   bool ppsDetected = false;
   
   while (millis() - ppsWaitStart < PPS_WAIT_TIMEOUT_MS) {
@@ -2892,25 +2976,27 @@ void feedGPS()
   // This lets us distinguish: no UART bytes, wrong baud/garbage, or valid NMEA
   // that TinyGPS++ has not yet converted into a fix. Baud rate is now auto-detected.
   {
-    static unsigned long lastGPSUartStatus = 0;
-    if (millis() - lastGPSUartStatus >= 5000) {
-      lastGPSUartStatus = millis();
-      Serial.printf("[GPS UART] baud=%lu RX13/TX23 bytes=%lu chars=%lu $=%lu LF=%lu pass=%lu fail=%lu fixSent=%lu sats=%lu hdop=%.2f loc=%s lastByteAge=%lums PPS=%d rawLines=%u\n",
-                    (unsigned long)gps_serial.baudRate(),
-                    (unsigned long)gpsUartBytesReceived,
-                    gps.charsProcessed(),
-                    (unsigned long)gpsDollarCount,
-                    (unsigned long)gpsCrlfCount,
-                    gps.passedChecksum(),
-                    gps.failedChecksum(),
-                    gps.sentencesWithFix(),
-                    gps.satellites.value(),
-                    gps.hdop.value()/100.0f,
-                    gps.location.isValid() ? "VALID" : "INVALID",
-                    gpsLastByteMillis ? (unsigned long)(millis() - gpsLastByteMillis) : 0UL,
-                    ppsIsLocked() ? 1 : 0,
-                    (unsigned)gpsRawLineCount);
-      gpsPrintRawCapture();
+    if (GPS_DEBUG_PRINTOUT == true) {
+      static unsigned long lastGPSUartStatus = 0;
+      if (millis() - lastGPSUartStatus >= 5000) {
+        lastGPSUartStatus = millis();
+        Serial.printf("[GPS UART] baud=%lu RX13/TX23 bytes=%lu chars=%lu $=%lu LF=%lu pass=%lu fail=%lu fixSent=%lu sats=%lu hdop=%.2f loc=%s lastByteAge=%lums PPS=%d rawLines=%u\n",
+                      (unsigned long)gps_serial.baudRate(),
+                      (unsigned long)gpsUartBytesReceived,
+                      gps.charsProcessed(),
+                      (unsigned long)gpsDollarCount,
+                      (unsigned long)gpsCrlfCount,
+                      gps.passedChecksum(),
+                      gps.failedChecksum(),
+                      gps.sentencesWithFix(),
+                      gps.satellites.value(),
+                      gps.hdop.value()/100.0f,
+                      gps.location.isValid() ? "VALID" : "INVALID",
+                      gpsLastByteMillis ? (unsigned long)(millis() - gpsLastByteMillis) : 0UL,
+                      ppsIsLocked() ? 1 : 0,
+                      (unsigned)gpsRawLineCount);
+        gpsPrintRawCapture();
+      }
     }
   }
 
@@ -2996,6 +3082,7 @@ bool initENS()
     return false;
   }
   engMsg("ENS160+AHT2x: OK");
+  ens_i2c_fail_streak = 0;
   return true;
 }
 
@@ -3387,6 +3474,8 @@ void tickCO()
 #define I2C_SCL_PIN 22
 #define I2C_TIMEOUT_MS 50
 #define I2C_RECOVERY_MIN_INTERVAL_MS 2000UL
+#define ENS_I2C_REINIT_FAILS 2
+#define BMI_I2C_REINIT_FAILS 3
 unsigned long lastI2CRecovery = 0;
 unsigned long lastI2CFaultMsg = 0;
 volatile uint32_t i2cProbeFailCount = 0;
@@ -3439,6 +3528,13 @@ void i2cBusRecover()
   if (now - lastI2CRecovery < I2C_RECOVERY_MIN_INTERVAL_MS) return;
   lastI2CRecovery = now;
 
+  // First detach the Arduino TwoWire peripheral so a previously aborted
+  // transaction cannot leave its internal state attached to the bus.
+  Wire.end();
+  delayMicroseconds(20);
+
+  // Release SDA and manually generate up to 9 SCL clocks. This is the standard
+  // I2C slave-unlock sequence for a device that was interrupted mid-byte.
   pinMode(I2C_SDA_PIN, INPUT_PULLUP);
   pinMode(I2C_SCL_PIN, OUTPUT_OPEN_DRAIN);
   digitalWrite(I2C_SCL_PIN, HIGH);
@@ -3451,6 +3547,7 @@ void i2cBusRecover()
     delayMicroseconds(5);
   }
 
+  // Generate an explicit STOP while both lines are released.
   pinMode(I2C_SDA_PIN, OUTPUT_OPEN_DRAIN);
   digitalWrite(I2C_SDA_PIN, LOW);
   delayMicroseconds(5);
@@ -3459,15 +3556,21 @@ void i2cBusRecover()
   digitalWrite(I2C_SDA_PIN, HIGH);
   delayMicroseconds(5);
 
+  // Reattach TwoWire and restore the bounded transaction timeout.
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setTimeOut(I2C_TIMEOUT_MS);
+  delayMicroseconds(20);
   i2cCaptureLineState();
   ++i2cBusRecoveryCount;
+
   DBG_PRINTF("[I2C] bus recovery attempted SDA=%d SCL=%d count=%lu\n",
              i2cLastSdaLevel, i2cLastSclLevel,
              (unsigned long)i2cBusRecoveryCount);
-}
 
+  if (i2cLastSdaLevel == LOW || i2cLastSclLevel == LOW) {
+    DBG_PRINTF("[I2C] BUS STILL HELD LOW after recovery — external power/device fault likely\n");
+  }
+}
 bool i2cSensorPresent(uint8_t address, const char* name)
 {
   if (i2cDevicePresent(address)) return true;
@@ -3622,6 +3725,7 @@ bool initBMI160()
   bmi160WriteReg(BMI160_REG_CMD, BMI160_CMD_GYR_NORMAL);
   delay(100);
   engMsgf("BMI160: init OK (±4g, ±500dps, 100Hz, I2C 0x%02X)", bmi160ActiveAddr);
+  bmi_i2c_fail_streak = 0;
   return true;
 }
 
@@ -3633,10 +3737,19 @@ bool bmi160ReadRaw(float& gx, float& gy, float& gz, float& ax, float& ay, float&
   uint8_t buf[12];
   if (!bmi160ReadRegs(BMI160_REG_DATA, buf, 12)) {
     perfI2cError();
+    if (bmi_i2c_fail_streak < 255) bmi_i2c_fail_streak++;
+    if (bmi_i2c_fail_streak >= BMI_I2C_REINIT_FAILS) {
+      bmi160Ready = false;
+      DBG_PRINTF("[I2C RECOVERY] BMI160 marked not-ready after %u consecutive failed raw reads — reinitializing
+",
+                 (unsigned)bmi_i2c_fail_streak);
+      i2cBusRecover();
+    }
     perfRecordMax(perfMaxBmi160Ms,
                   (uint32_t)((micros() - perfBmi160RawStartUs) / 1000UL));
     return false;
   }
+  bmi_i2c_fail_streak = 0;
   int16_t rgx = (int16_t)((buf[1]<<8)|buf[0]);
   int16_t rgy = (int16_t)((buf[3]<<8)|buf[2]);
   int16_t rgz = (int16_t)((buf[5]<<8)|buf[4]);
@@ -4235,9 +4348,27 @@ void sensorTask(void* pvParam)
       }
       if (ensReady) {
         ensOK = readENS(tvoc, eco2, aqi, t, h);
-        if (ensOK) { temp_prev=t; hum_prev=h; ens_fail_count=0; }
-        else        { ens_fail_count++; t=temp_prev; h=hum_prev; }
-      } else { ens_fail_count++; }
+        if (ensOK) {
+          temp_prev=t; hum_prev=h;
+          ens_fail_count=0;
+          ens_i2c_fail_streak=0;
+        } else {
+          ens_fail_count++;
+          t=temp_prev; h=hum_prev;
+          if (ens_i2c_fail_streak < 255) ens_i2c_fail_streak++;
+          // A failed preflight/read means the physical device or I2C bus may
+          // have disappeared. Do not keep a stale "ready" library state.
+          if (ens_i2c_fail_streak >= ENS_I2C_REINIT_FAILS) {
+            ensReady = false;
+            DBG_PRINTF("[I2C RECOVERY] ENS160/AHT2x marked not-ready after %u consecutive failed cycles — reinitializing
+",
+                       (unsigned)ens_i2c_fail_streak);
+            i2cBusRecover();
+          }
+        }
+      } else {
+        ens_fail_count++;
+      }
       if (ens_fail_count == ENS_MAX_FAILS)
         engMsgf("ENS FAULT: %d failures — retrying every %ds", ENS_MAX_FAILS, ENS_RETRY_MS/1000);
     }
@@ -4734,10 +4865,10 @@ bool wifiReconnectPending = false;
 // Blynk.run() must NEVER be allowed to initiate an unbounded connection
 // attempt on Core 1, because that can starve the ESP32 interrupt watchdog
 // when the Blynk server is unreachable.  We therefore make a bounded TCP
-// probe first, use the library-supported 1s Blynk I/O timeout, and service
+// probe first, use the library-supported 3s Blynk I/O timeout, and service
 // the same handshake incrementally until it completes.
 bool blynkConfigured = false;
-// v3.9.17: application-level Blynk protocol heartbeat scheduler.
+// v3.9.33: application-level Blynk protocol heartbeat scheduler.
 // This is deliberately separate from BLYNK_HEARTBEAT so normal telemetry
 // traffic cannot suppress the explicit connectivity probe.
 unsigned long lastBlynkForcePing = 0;
@@ -4761,6 +4892,17 @@ static uint8_t blynkHandshakeFailCount = 0;
 static uint8_t blynkWifiRecoveryFailCount = 0;
 // v3.9.1: after a software reset, briefly delay the new Blynk handshake.
 unsigned long blynkStartupHoldoffUntil = 0;
+// v3.9.37: explicit one-shot flag for an immediate Blynk probe after WiFi association.
+// Do not emulate an expired millis() interval near boot because unsigned wraparound
+// can make the retry-age test appear shorter than BLYNK_CONNECT_RETRY_MS.
+static bool blynkConnectImmediate = false;
+static bool blynkForceReconnect = false;
+// v3.9.39: true after a real WiFi re-association until a NEW Blynk protocol
+// connection is confirmed.  This deliberately bypasses Blynk.connected() as a
+// gate because a stale Blynk 0.6.1 protocol object can report connected after
+// the underlying WiFi/TCP session has died.  In that state the old v3.9.38
+// reconnect path could repeatedly print "handshake pending" but never enter
+// the TCP probe because !Blynk.connected() was false.
 #define BLYNK_SOFT_RESET_HOLDOFF_MS 15000UL
 #define BLYNK_CONNECT_RETRY_MS 10000UL
 #define BLYNK_CONNECT_TIMEOUT_S 5UL
@@ -4837,6 +4979,19 @@ void wifiStartConnect()
 
 void wifiMarkConnected()
 {
+  // v3.9.38: distinguish the first WiFi association after boot from a true
+  // WiFi recovery.  v3.9.35-3.9.37 called Blynk.disconnect() and tore down the
+  // raw transport even on the very first association. That was intended to
+  // clean stale sessions after a WiFi failure, but it also broke the clean
+  // power-on path on this firmware/Blynk 0.6.1 combination. The first boot
+  // must use the normal Blynk.config() path; only a real WiFi re-association
+  // needs the aggressive stale-session teardown.
+  const bool firstWifiAssociation = (wifiSuccessfulConnections == 0);
+
+  // Clean power-on uses the normal Blynk startup path. Forced recovery is
+  // enabled only for a later WiFi re-association.
+  if (firstWifiAssociation) blynkForceReconnect = false;
+
   wifiConnectInProgress = false;
   wifiSuccessfulConnections++;
   wifiConsecutiveFailures = 0;
@@ -4846,6 +5001,40 @@ void wifiMarkConnected()
                 WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel(),
                 WiFi.BSSIDstr().c_str(), WiFi.macAddress().c_str(),
                 (unsigned)wifiLastDisconnectReason);
+  // v3.9.38: only force a Blynk/session teardown when this is a REAL WiFi
+  // recovery. On a clean power boot there is no stale Blynk session to tear down,
+  // and the v3.9.35-3.9.37 teardown could leave the Blynk protocol state in a
+  // condition where the first bounded probe never started.
+  if (!firstWifiAssociation) {
+    // v3.9.39: force the next Blynk connection attempt to start even if the
+    // Blynk protocol object still reports connected. This is the exact failure
+    // seen after a WiFi loss/re-association: WiFi comes back, but the stale
+    // Blynk session can otherwise block the probe gate.
+    blynkForceReconnect = true;
+
+    // WiFi can reconnect while the Blynk protocol object still believes it is
+    // connected. Blynk.config() only changes the configured server; it does NOT
+    // force the old protocol/session state to disconnected. Tear down the old
+    // session and raw socket before rebuilding the Blynk connection.
+    Blynk.disconnect();
+#if CONNECTION_MODE == 0
+    _boundedBlynkTransport.disconnect();
+#endif
+  }
+
+  blynkProbeAbort();
+  blynkProbeInFlight = false;
+  blynkConfigured = false;
+  blynkHandshakeActive = false;
+  blynkHandshakeStarted = 0;
+  blynkOfflineSince = 0;
+  blynkLastConnectedMillis = 0;
+  // v3.9.38: both first boot and WiFi recovery request an explicit immediate
+  // bounded TCP probe. This avoids the old 10-second startup gap and avoids
+  // unsigned-millis wraparound tricks near boot.
+  blynkConnectImmediate = true;
+  lastBlynkConnectAttempt = millis();
+
   // Blynk.config() sets server address only — does NOT block or spin.
   // IMPORTANT: do NOT rely on the first Blynk.run() to establish the server
   // connection. With Blynk v0.6.1, Blynk.run() can invoke the default connection
@@ -4856,16 +5045,20 @@ void wifiMarkConnected()
   blynkConfigured = true;
   blynkHandshakeActive = false;
   blynkHandshakeStarted = 0;
-  lastBlynkConnectAttempt = millis();
-  // A V55 software reset may leave the previous Blynk TCP session closing.
-  // Give that session a short grace period before opening the replacement.
-  blynkStartupHoldoffUntil = (bootResetReason == ESP_RST_SW)
-                           ? millis() + BLYNK_SOFT_RESET_HOLDOFF_MS
-                           : 0;
+  // v3.9.36: the raw Blynk transport was explicitly closed above, so do not
+  // add a 15-second startup holdoff here. A software reset must recover Blynk
+  // immediately just like a power-on. If the old TCP FIN is still being
+  // processed by the server, the new bounded TCP probe/handshake will fail
+  // cleanly and retry without blocking Core 1.
+  blynkStartupHoldoffUntil = 0;
   if (xSemaphoreTake(dataMutex,pdMS_TO_TICKS(10))==pdTRUE) {
     sd.status_flags|=STATUS_WIFI_OK; xSemaphoreGive(dataMutex);
   }
-  engMsgf("WiFi OK — Blynk config set %s:%d (handshake pending)", BLYNK_SERVER, BLYNK_PORT);
+  if (firstWifiAssociation) {
+    engMsgf("WiFi OK — Blynk config set %s:%d (initial handshake pending)", BLYNK_SERVER, BLYNK_PORT);
+  } else {
+    engMsgf("WiFi OK — Blynk transport reset; config set %s:%d (handshake pending)", BLYNK_SERVER, BLYNK_PORT);
+  }
   buzzerTone(5000, 100);
 }
 
@@ -4955,6 +5148,9 @@ void wifiService()
     lastWiFiCheck = now;
     engMsg("WiFi: reconnect attempt");
     Blynk.disconnect();
+#if CONNECTION_MODE == 0
+    _boundedBlynkTransport.disconnect();
+#endif
     WiFi.disconnect();
     wifiDisconnectSettleUntil = now + WIFI_DISCONNECT_SETTLE_MS;
     wifiReconnectPending = true;
@@ -5033,7 +5229,11 @@ BLYNK_WRITE(V55)
 void setup()
 {
   Serial.begin(115200);
-  Serial.println("\n[INIT] Air Quality Station ESP32 v3.9.32 — Arduino core 2.0.17 — GPS 115200 baud + 10Hz config");
+  Serial.printf("[INIT] Blynk connection mode: %s\n",
+                CONNECTION_MODE == 0 ? "BOUNDED (raw non-blocking)" : "SIMPLE (BlynkSimpleEsp32)");
+  Serial.printf("[INIT] Blynk timeout: %lums, heartbeat: %us, forced-refresh: OFF\n",
+                (unsigned long)BLYNK_TIMEOUT_MS, (unsigned)BLYNK_HEARTBEAT);
+  Serial.println("\n[INIT] Air Quality Station ESP32 v3.9.33 — Arduino core 2.0.17 — GPS 115200 baud + 10Hz config");
   Serial.printf("[INIT] ten_mins_autoreset = %s\n", ten_mins_autoreset ? "ON":"OFF");
   Serial.printf("[INIT] DEBUGON = %s\n", DEBUGON ? "ON" : "OFF");
 
@@ -5275,7 +5475,11 @@ void setup()
   blynkTimer.setInterval(10000UL, blynkSendDiagnostics);
   blynkTimer.setInterval(MAP_SEND_INTERVAL_MS, blynkSendMap);
 
-  engMsg("Setup OK v3.9.21 — raw nonblocking Blynk transport enabled");
+  #if CONNECTION_MODE == 0
+    engMsgf("Setup OK v%s — Blynk transport: BOUNDED raw nonblocking", FIRMWARE_VERSION);
+  #else
+    engMsgf("Setup OK v%s — Blynk transport: SIMPLE BlynkSimpleEsp32", FIRMWARE_VERSION);
+  #endif
   setupDone = true;
 }
 
@@ -5486,16 +5690,34 @@ void loop()
       // serviced again until it reaches Blynk.connected().
       unsigned long nowBlynk = millis();
 
+#if CONNECTION_MODE == 0
       // v3.9.24: the probe is now a non-blocking state machine spread across
       // loop() passes (blynkProbeStart/blynkProbePoll) instead of a single
       // call that blocked Core 1 for up to BLYNK_SERVER_PROBE_TIMEOUT_MS.
       // blynkProbeInFlight tracks whether we are mid-probe; while true we
       // skip straight to polling it below instead of starting a new one.
       if (!blynkProbeInFlight &&
-          blynkConfigured && !Blynk.connected() && !blynkHandshakeActive &&
+          blynkConfigured && !blynkHandshakeActive &&
           nowBlynk >= blynkStartupHoldoffUntil &&
-          nowBlynk - lastBlynkConnectAttempt >= BLYNK_CONNECT_RETRY_MS) {
+          (blynkConnectImmediate ||
+           nowBlynk - lastBlynkConnectAttempt >= BLYNK_CONNECT_RETRY_MS) &&
+          (blynkForceReconnect || !Blynk.connected())) {
+        // v3.9.37: consume the explicit immediate-connect request now that the
+        // probe is actually being started. Subsequent attempts use the normal retry interval.
+        blynkConnectImmediate = false;
         lastBlynkConnectAttempt = nowBlynk;
+
+        if (blynkForceReconnect) {
+          // Do this again immediately before the probe. The goal is not merely
+          // to configure the server; it is to guarantee that a stale protocol
+          // object/socket cannot suppress the new connection attempt.
+          Blynk.disconnect();
+#if CONNECTION_MODE == 0
+          _boundedBlynkTransport.disconnect();
+#endif
+          DBG_PRINTF("[Blynk] FORCED recovery probe — stale connected=%d cleared\n",
+                     Blynk.connected() ? 1 : 0);
+        }
 
         // IMPORTANT: Blynk v0.6.1 Blynk.connect(timeout) is a blocking loop.
         // Even a nominal 1-second timeout can monopolize Core 1 long enough
@@ -5596,10 +5818,10 @@ void loop()
         // Blynk.run(), sensor mutex service, etc. below/above as normal.
       }
 
-      if (blynkHandshakeActive && !Blynk.connected()) {
+      if (blynkHandshakeActive && (blynkForceReconnect || !Blynk.connected())) {
         loopState = LOOP_STATE_BLYNK;
         // v3.3: Blynk v0.6.1 performs blocking socket reads inside Blynk.run().
-        // BLYNK_TIMEOUT_MS is deliberately limited to 1s above, so one call
+        // BLYNK_TIMEOUT_MS is deliberately limited to 3s above, so one call
         // cannot monopolise Core 1 long enough to trip the ESP32 idle/interrupt
         // watchdog. If the server needs more time, the SAME Blynk session is
         // serviced again on the next loop pass — this is not a new handshake.
@@ -5618,6 +5840,7 @@ void loop()
         if (Blynk.connected()) {
         loopState = LOOP_STATE_BLYNK;
           blynkHandshakeActive = false;
+          blynkForceReconnect = false;
           blynkLastConnectedMillis = millis();
           blynkHandshakeFailCount = 0;
           blynkWifiRecoveryFailCount = 0;
@@ -5680,7 +5903,7 @@ void loop()
         blynkOfflineSince = 0;
         blynkHandshakeFailCount = 0;
         blynkWifiRecoveryFailCount = 0;
-        // Normal connected-state servicing. BLYNK_TIMEOUT_MS=1s also bounds
+        // Normal connected-state servicing. BLYNK_TIMEOUT_MS=3s also bounds
         // any waiting read if the server disappears between loop iterations.
         {
           core1StageBegin(CORE1_STAGE_BLYNK_RUN);
@@ -5733,24 +5956,68 @@ void loop()
             Blynk.disconnect();
           }
         } else {
-          // v3.9.25: ESP32 WiFi driver (ESP-IDF 5.5.5) can enter a corrupted state
-          // where Blynk.connected() returns true but the TCP connection is broken.
-          // Serial data continues (sensor task alive), but no Blynk data flows.
-          // Periodically refresh the connection to prevent state accumulation.
-          // This is a proactive measure to avoid the observed stale state.
-          // Issue persists on both v3.3.11 and v3.0.7, indicating a fundamental
-          // WiFi driver issue rather than a library version problem.
-          // v3.9.28: reduced from 5 minutes to 3 minutes. Corruption is happening
-          // faster than expected, so more frequent refreshes are needed.
-          unsigned long connectedAge = millis() - blynkLastConnectedMillis;
-          if (connectedAge >= 180000UL) {  // 3 minutes
-            DBG_PRINTF("[Blynk] Proactive refresh after %lums connected\n", (unsigned long)connectedAge);
-            Blynk.disconnect();
-            blynkHandshakeActive = false;
-            blynkLastConnectedMillis = millis();  // Reset timer
+          // v3.9.33: Do not deliberately tear down a healthy Blynk connection
+          // on a fixed 3-minute timer. A forced refresh hides the real failure
+          // mechanism and creates an avoidable reconnect opportunity. Keep the
+          // connection alive until Blynk reports an actual transition/failure.
+          const unsigned long connectedAge = millis() - blynkLastConnectedMillis;
+          if (connectedAge > 0 && (connectedAge % 60000UL) < 20UL) {
+            DBG_PRINTF("[Blynk] Healthy connection age=%lums\n",
+                       (unsigned long)connectedAge);
           }
         }
       }
+
+#else  // CONNECTION_MODE == 1
+      // SIMPLE mode deliberately uses the stock BlynkSimpleEsp32 transport,
+      // just like TEST.ino.  Do not run the raw TCP probe/handshake state
+      // machine here; Blynk.run() owns connection establishment/retry.
+      loopState = LOOP_STATE_BLYNK;
+      core1StageBegin(CORE1_STAGE_BLYNK_RUN);
+      uint32_t perfBlynkRunStartUs = micros();
+      Blynk.run();
+      perfRecordMax(perfMaxBlynkRunMs,
+                    (uint32_t)((micros() - perfBlynkRunStartUs) / 1000UL));
+      core1StageEnd();
+      yield();
+
+      if (Blynk.connected()) {
+        blynkOfflineSince = 0;
+        blynkHandshakeActive = false;
+        blynkHandshakeFailCount = 0;
+        blynkWifiRecoveryFailCount = 0;
+        if (blynkLastConnectedMillis == 0) {
+          blynkLastConnectedMillis = millis();
+          lastBlynkForcePing = millis();
+          blynkForcePingCount = 0;
+          DBG_PRINTF("[Blynk SIMPLE] Connected - Firmware %s\n", FIRMWARE_VERSION);
+          engMsgf("Blynk SIMPLE connected - FW %s", FIRMWARE_VERSION);
+        }
+
+        core1StageBegin(CORE1_STAGE_BLYNK_HEARTBEAT);
+        blynkHeartbeatService();
+        core1StageEnd();
+
+        core1StageBegin(CORE1_STAGE_BLYNK_TIMER);
+        blynkTimer.run();
+        core1StageEnd();
+
+        core1StageBegin(CORE1_STAGE_BLYNK_TX);
+        blynkTxService();
+        core1StageEnd();
+
+        if (!Blynk.connected()) {
+          if (blynkOfflineSince == 0) {
+            blynkOfflineSince = millis();
+            DBG_PRINTLN("[Blynk SIMPLE] Connection lost");
+          }
+          // Do not immediately call Blynk.disconnect(). In SIMPLE mode the
+          // stock Blynk transport owns connection establishment/retry.
+        }
+      } else {
+        if (blynkOfflineSince == 0) blynkOfflineSince = millis();
+      }
+#endif  // CONNECTION_MODE
 
       if (xSemaphoreTake(dataMutex,pdMS_TO_TICKS(5))==pdTRUE) {
         sd.status_flags|=STATUS_WIFI_OK; xSemaphoreGive(dataMutex);
