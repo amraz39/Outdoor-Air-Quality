@@ -107,6 +107,11 @@ SENSOR_PINS = {
 
 MISC_PINS = {"eng_msg": 19, "status_flags": 20}
 
+# V4 is used by the app/telemetry layer as a rolling diagnostic counter.
+# It is displayed in the top-right diagnostic card and is always replaced
+# with the newest value rather than accumulated as history.
+APP_TELEM_RND_PIN = 4
+
 DIAG_PINS = {
     "reset_reason": 34,
     "pps_count": 35, "pps_age_ms": 36, "loop_gap_max": 37, "sensor_cycle_max": 38,
@@ -134,6 +139,7 @@ for k, v in INAV_PINS.items():
     ALL_READ_PINS[f"inav_{k}"] = v
 ALL_READ_PINS.update(SENSOR_PINS)
 ALL_READ_PINS.update(MISC_PINS)
+ALL_READ_PINS["app_telem_rnd"] = APP_TELEM_RND_PIN
 ALL_READ_PINS.update(DIAG_PINS)
 
 INAV_STATE_NAMES = {
@@ -163,16 +169,16 @@ STATUS_GOOD_WHEN_SET = {1 << 0, 1 << 1, 1 << 2, 1 << 3}
 # COLOR THEME
 # ============================================================
 
-BG = "#090d16"
-CARD = "#0f1623"
-BORDER = "#2a3a52"
-TXT_MAIN = "#f1f5f9"
-TXT_SUB = "#94a3b8"
-TXT_DIM = "#475569"
-ACCENT = "#22d3ee"
-GREEN = "#22c55e"
-AMBER = "#f59e0b"
-RED = "#ef4444"
+BG = "#090d16"   # Very dark (mostly black) blue
+CARD = "#0f1623"   # Very dark (mostly black) blue
+BORDER = "#2a3a52"   #  Very dark desaturated blue
+TXT_MAIN = "#f1f5f9"   # Light gray
+TXT_SUB = "#94a3b8"   # Medium gray
+TXT_DIM = "#475569"   # Dark gray
+ACCENT = "#22d3ee"   # Cyan
+GREEN = "#22c55e"   # Green
+AMBER = "#f59e0b"   # Amber
+RED = "#ef4444"   # Red
 
 FONT_TITLE = ("Segoe UI", 22, "bold")
 FONT_SECTION = ("Segoe UI", 15, "bold")
@@ -497,11 +503,13 @@ graph_canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
 # SECTION 4 — REMOTE CONTROL + DIAGNOSTICS
 # ============================================================
 
-section_title(body, "🛠️", "Diagnostics & Remote Control")
+section_title(body, "🛠️", "Diagnostics & Remote control")
 
 diag_top = ctk.CTkFrame(body, fg_color="transparent")
 diag_top.pack(fill="x", padx=4)
 
+# Keep the engineering message as a single current-state message.
+# Updating the label replaces the previous value; it never appends/stack messages.
 msg_card = make_card(diag_top, side="left", fill="both", expand=True)
 ctk.CTkLabel(msg_card, text="📝  Engineering Message (V19)", font=FONT_LABEL,
              text_color=TXT_SUB).pack(anchor="w", padx=12, pady=(10, 2))
@@ -510,8 +518,12 @@ v_eng_msg = ctk.CTkLabel(msg_card, text="—", font=("Segoe UI", 13),
                           justify="left")
 v_eng_msg.pack(anchor="w", padx=12, pady=(0, 6))
 
-v_reset_reason = ctk.CTkLabel(msg_card, text="Reset reason (V34): —",
-                               font=FONT_SMALL, text_color=TXT_DIM, anchor="w")
+# V34 is deliberately a single replacement value.
+# The widget is updated with configure(text=...) only, so a new reset reason
+# replaces the previous one instead of creating another label/message below it.
+v_reset_reason = ctk.CTkLabel(msg_card, text="",
+                               font=FONT_SMALL, text_color=TXT_DIM, anchor="w",
+                               wraplength=520, justify="left")
 v_reset_reason.pack(anchor="w", padx=12, pady=(0, 6))
 
 v_rtc_checkpoint = ctk.CTkLabel(msg_card, text="RTC checkpoint (V51): —",
@@ -519,7 +531,33 @@ v_rtc_checkpoint = ctk.CTkLabel(msg_card, text="RTC checkpoint (V51): —",
                                  wraplength=520, justify="left")
 v_rtc_checkpoint.pack(anchor="w", padx=12, pady=(0, 10))
 
-reset_card = make_card(diag_top, side="left", fill="both")
+# Right-side controls are kept in their own vertical column so the diagnostic
+# value stays at the top and the hard-reset control is clearly separated below.
+diag_right = ctk.CTkFrame(diag_top, fg_color="transparent", width=250)
+diag_right.pack(side="left", fill="y", padx=(6, 0))
+diag_right.pack_propagate(False)
+
+# App / telemetry diagnostic card (V4)
+diag_rnd_card = ctk.CTkFrame(diag_right, fg_color=CARD, corner_radius=14,
+                             border_width=1, border_color=BORDER)
+diag_rnd_card.pack(fill="x", pady=(6, 6))
+
+ctk.CTkLabel(diag_rnd_card, text="DIAG (App/Telem. RND# Alive)",
+             font=("Segoe UI", 14, "bold"), text_color=TXT_MAIN,
+             anchor="w", justify="left", wraplength=210).pack(
+                 anchor="w", padx=12, pady=(12, 8))
+
+v_app_telem_rnd = ctk.CTkLabel(
+    diag_rnd_card, text="—", font=("Segoe UI", 18, "bold"),
+    text_color=TXT_SUB, anchor="w"
+)
+v_app_telem_rnd.pack(anchor="w", padx=12, pady=(0, 14))
+
+# Remote hard reset is intentionally lower on the right side.
+reset_card = ctk.CTkFrame(diag_right, fg_color=CARD, corner_radius=14,
+                          border_width=1, border_color=BORDER)
+reset_card.pack(fill="x", pady=(5, 6), after=diag_rnd_card)
+
 ctk.CTkLabel(reset_card, text="🔁  Remote Hard Reset (V55)", font=FONT_LABEL,
              text_color=TXT_SUB).pack(anchor="w", padx=12, pady=(10, 6))
 
@@ -839,9 +877,31 @@ def _apply_values(values):
     v_co_raw.configure(text=fmt(values.get("co_raw"), "", 0))
 
     # ---- Debug / diagnostics ----
+    # Replace the current widgets in-place. Do not append new messages/labels.
     v_eng_msg.configure(text=values.get("eng_msg") or "—")
-    v_reset_reason.configure(text=f"Reset reason (V34): {values.get('reset_reason') or '—'}")
-    v_rtc_checkpoint.configure(text=f"RTC checkpoint (V51): {values.get('rtc_checkpoint') or '—'}")
+
+    # V34 is a single current reset-reason value. If the server ever returns
+    # a multiline value, keep only the newest non-empty line so old messages
+    # cannot visually stack in the dashboard.
+    reset_reason = values.get("reset_reason")
+    if reset_reason is None:
+        # Keep V34 visually empty until the first actual value is read.
+        reset_reason_text = ""
+    else:
+        reset_reason_lines = [line.strip() for line in str(reset_reason).splitlines()
+                              if line.strip()]
+        reset_reason_text = reset_reason_lines[-1] if reset_reason_lines else ""
+    v_reset_reason.configure(
+        text=f"Reset reason (V34): {reset_reason_text}" if reset_reason_text else ""
+    )
+
+    v_rtc_checkpoint.configure(
+        text=f"RTC checkpoint (V51): {values.get('rtc_checkpoint') or '—'}"
+    )
+
+    # V4 diagnostic value is also replacement-only: each poll overwrites the
+    # previous value in the same widget.
+    v_app_telem_rnd.configure(text=values.get("app_telem_rnd") or "—")
 
     status_flags = _as_float(values, "status_flags")
     flags_int = int(status_flags) if status_flags is not None else 0
