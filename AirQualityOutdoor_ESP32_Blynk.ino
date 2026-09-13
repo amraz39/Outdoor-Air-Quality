@@ -3,7 +3,7 @@
 struct RtcCheckpoint;
 
 // Firmware version - printed on boot and sent to Blynk for tracking
-#define FIRMWARE_VERSION "3.9.39"
+#define FIRMWARE_VERSION "3.9.40"
 
 // v3.9.39 BLYNK FORCED WIFI-RECOVERY FIX
 //   - v3.9.38 correctly fixed clean power-on by avoiding aggressive teardown on
@@ -586,6 +586,10 @@ struct RtcCheckpoint;
   #define CONNECTION_MODE 0
 #endif
 
+// v3.9.42: temporarily set true for field diagnostics of the WiFi/Blynk
+// silent-stall issue (captures [Blynk STATUS], [WiFi] Reconnect triggered,
+// and all [Blynk RAW]/[Blynk TRANSPORT] lines). Set back to false once the
+// issue is diagnosed — this produces significant serial chatter.
 #define DEBUGON        false
 // Enable Blynk library diagnostics when either verbose debugging is enabled
 // OR the stock BlynkSimpleEsp32 connection mode is being tested.
@@ -685,6 +689,7 @@ extern volatile uint16_t blynkTransportLastRemotePort;
 extern volatile uint32_t blynkTransportConnectionAgeMs;
 extern volatile uint32_t blynkTransportLastFailureAgeMs;
 extern volatile bool     blynkTransportKeepaliveConfigured;
+extern volatile unsigned long blynkLastRxMillis;
 
 class BoundedBlynkArduinoClient : public BlynkArduinoClient
 {
@@ -1040,6 +1045,7 @@ public:
       const int n = lwip_recv(rawSock, p + got, len - got, MSG_DONTWAIT);
       if (n > 0) {
         got += (size_t)n;
+        blynkLastRxMillis = millis();
         continue;
       }
       if (n == 0) {
@@ -1751,8 +1757,18 @@ uint8_t bmi160ActiveAddr = BMI160_ADDR;  // v3.9.32: runtime address; auto-detec
 // virtualWrite), so it is not subject to BLYNK_MSG_LIMIT. The normal Blynk
 // protocol still owns connection state and will update lastActivityIn when the
 // server replies.
-#define BLYNK_FORCE_PING_MS    20000UL
+#define BLYNK_FORCE_PING_MS    10000UL
 #define BLYNK_SEND_SLOW_MS    10000
+// v3.9.43: blynkSendDiagnostics() (V34-V60, 22 fields — retained maxima and
+// counters, not live sensor data) previously ran on the same 10s cadence as
+// time-sensitive SLOW telemetry. It is the single largest per-cycle
+// contributor to Blynk server write load of any TX group. Slowed to 30s to
+// reduce steady-state server-side load (a candidate factor in the write-
+// stall/EAGAIN issue investigated in the v3.9.43 recovery-ladder fix above —
+// less write volume gives the server's socket-read loop more headroom even
+// if it does not fully eliminate an occasional stall). FAST/SLOW/V4 are
+// unchanged and still carry all real-time sensor and position data.
+#define BLYNK_SEND_DIAG_MS    30000UL
 #define MAP_SEND_INTERVAL_MS  30000   // V33 Map widget point rate — deliberately slower
                                       // than FAST/SLOW telemetry to avoid flooding the
                                       // Blynk Map widget with a marker every few seconds
@@ -1764,7 +1780,7 @@ uint8_t bmi160ActiveAddr = BMI160_ADDR;  // v3.9.32: runtime address; auto-detec
 
 // ─── PERFORMANCE DIAGNOSTIC VIRTUAL PINS ───────────────────────────────────
 // Internal timing/counters run continuously; these pins are published
-// only once every 10 seconds by blynkSendDiagnostics().
+// only once every BLYNK_SEND_DIAG_MS (30s, see v3.9.43) by blynkSendDiagnostics().
 #define V35 35  // PPS event count
 #define V36 36  // milliseconds since last PPS
 #define V37 37  // maximum Arduino loop gap (ms)
@@ -2587,7 +2603,19 @@ void buzzerService()
 // intervals remain unchanged.
 #define BLYNK_TX_QUEUE_SIZE      64
 #define BLYNK_TX_VALUE_LEN       256
-#define BLYNK_TX_INTERVAL_MS     100UL   // <=10 virtual-write packets/sec
+// v3.9.43: slowed from 100ms (<=10 pkt/s) to 150ms (<=~6.7 pkt/s). Investigated
+// alongside the Blynk server's own GC log: the server's occasional brief
+// socket-read stalls correlate with G1 allocation/marking pressure, not with
+// this device's total data volume (already ruled out — see the diagnostics-
+// cadence change above, which cut volume 3x with no change in stall
+// frequency). What IS still adjustable here is burstiness: a smoother,
+// slightly slower packet cadence is less likely to land a write inside
+// whatever brief window the server's socket-read loop is unavailable in,
+// even though it cannot prevent that window from existing. This does not
+// reduce total information sent — the coalescing queue (see block comment
+// above) already collapses repeated same-pin updates, so a slightly longer
+// interval mainly spreads out delivery, it does not drop data.
+#define BLYNK_TX_INTERVAL_MS     150UL   // <=~6.7 virtual-write packets/sec
 
 struct BlynkTxItem {
   bool pending;
@@ -2624,6 +2652,16 @@ volatile uint32_t blynkTransportReadLastMs = 0;
 // and are included in the periodic diagnostic snapshot.
 volatile uint32_t blynkTransportConnectCalls = 0;
 volatile uint32_t blynkTransportConnectFailures = 0;
+// v3.9.40: last time the raw transport actually received real bytes from the
+// peer (see BoundedBlynkArduinoClient::read() below). This is the only true
+// proof-of-life signal for the TCP session. Blynk.connected() and even our own
+// connected() override can both keep reporting "connected" indefinitely on a
+// half-open socket (peer process died/hung without sending FIN/RST — MSG_PEEK
+// then just returns EAGAIN forever, see connected() comments). Without this,
+// a stale session was only ever cleared by an unrelated WiFi-level disconnect
+// event, which is why field failures took minutes to self-heal instead of
+// recovering on their own shortly after the peer actually went silent.
+volatile unsigned long blynkLastRxMillis = 0;
 volatile uint32_t blynkTransportWriteEagain = 0;
 volatile uint32_t blynkTransportWriteTimeouts = 0;
 volatile uint32_t blynkTransportSocketErrors = 0;
@@ -2704,6 +2742,20 @@ void safeWriteS(int vpin, const char* val)
 // function before the later global declarations.
 unsigned long blynkLastTxAttemptMillis = 0;
 unsigned long blynkLastTxSuccessMillis = 0;
+// v3.9.43: brief pause on the TX (telemetry-sending) side only, right after a
+// FRESH Blynk connection is established. Does not affect Blynk.run(),
+// heartbeat pings, or the handshake itself — only blynkTxService() checks
+// this. Rationale: a reconnect after an outage often has a backed-up queue
+// (observed txPending=46 in a field log right after a write-timeout
+// recovery); bursting through that backlog at full TX pace immediately after
+// the server has just re-accepted the connection is the worst possible
+// moment to hit it hard again if the underlying cause was brief server-side
+// pressure. This grace period does not fix the server-side cause (see the
+// companion G1GC tuning), it only avoids compounding it from this device's
+// side, and it costs at most BLYNK_TX_POST_RECONNECT_GRACE_MS of telemetry
+// latency once per reconnect — negligible next to the outage itself.
+#define BLYNK_TX_POST_RECONNECT_GRACE_MS 2000UL
+unsigned long blynkTxGraceUntil = 0;
 
 static uint16_t blynkTxPendingCount()
 {
@@ -2717,6 +2769,7 @@ static uint16_t blynkTxPendingCount()
 static void blynkTxService()
 {
   if (!Blynk.connected()) return;
+  if (millis() < blynkTxGraceUntil) return;
 
   const unsigned long now = millis();
   if (now - blynkTxLastSend < BLYNK_TX_INTERVAL_MS) return;
@@ -3085,6 +3138,19 @@ bool initENS()
   ens_i2c_fail_streak = 0;
   return true;
 }
+
+// v3.9.42 FIX: i2cLastSdaLevel/i2cLastSclLevel were previously declared much
+// later in the file (after readENS(), which uses them in several DBG_PRINTF
+// diagnostic lines). This compiled silently with DEBUGON=false because the
+// no-op DBG_PRINTF macro discards its arguments entirely at the preprocessor
+// stage, so the undeclared symbols were never actually reached by the
+// compiler. Enabling DEBUGON=true for field diagnostics exposed the latent
+// forward-reference bug. Moved the declarations here, before first use;
+// the original declarations further down (with i2cLastWireError and the
+// other I2C diagnostic counters, which are NOT used before their own
+// declaration point) are left in place.
+volatile uint8_t i2cLastSdaLevel = 1;
+volatile uint8_t i2cLastSclLevel = 1;
 
 // Read ENS160 + AHT2x. Returns true if valid data obtained.
 // ENS160 needs temperature+humidity compensation for accuracy — we feed it
@@ -3480,8 +3546,8 @@ unsigned long lastI2CRecovery = 0;
 unsigned long lastI2CFaultMsg = 0;
 volatile uint32_t i2cProbeFailCount = 0;
 volatile uint32_t i2cBusRecoveryCount = 0;
-volatile uint8_t i2cLastSdaLevel = 1;
-volatile uint8_t i2cLastSclLevel = 1;
+// i2cLastSdaLevel/i2cLastSclLevel moved earlier in the file (before readENS())
+// — see the v3.9.42 comment there. Not redeclared here.
 
 // v3.9.32 I2C/IMU diagnostics. These are deliberately lightweight and
 // rate-limited: they record the exact I2C stage that was slow/failing without
@@ -3740,8 +3806,7 @@ bool bmi160ReadRaw(float& gx, float& gy, float& gz, float& ax, float& ay, float&
     if (bmi_i2c_fail_streak < 255) bmi_i2c_fail_streak++;
     if (bmi_i2c_fail_streak >= BMI_I2C_REINIT_FAILS) {
       bmi160Ready = false;
-      DBG_PRINTF("[I2C RECOVERY] BMI160 marked not-ready after %u consecutive failed raw reads — reinitializing
-",
+      DBG_PRINTF("[I2C RECOVERY] BMI160 marked not-ready after %u consecutive failed raw reads — reinitializing\n",
                  (unsigned)bmi_i2c_fail_streak);
       i2cBusRecover();
     }
@@ -4360,8 +4425,7 @@ void sensorTask(void* pvParam)
           // have disappeared. Do not keep a stale "ready" library state.
           if (ens_i2c_fail_streak >= ENS_I2C_REINIT_FAILS) {
             ensReady = false;
-            DBG_PRINTF("[I2C RECOVERY] ENS160/AHT2x marked not-ready after %u consecutive failed cycles — reinitializing
-",
+            DBG_PRINTF("[I2C RECOVERY] ENS160/AHT2x marked not-ready after %u consecutive failed cycles — reinitializing\n",
                        (unsigned)ens_i2c_fail_streak);
             i2cBusRecover();
           }
@@ -4609,6 +4673,8 @@ void blynkSendSlow()
 // Re-publishing V51 every 10 seconds does NOT change its contents.
 // V51 remains unchanged for the entire current run and is replaced only after
 // the next reboot/restart, when a new previous-run snapshot is captured.
+// v3.9.43: cadence changed from 10s to BLYNK_SEND_DIAG_MS (30s) — see the
+// constant's definition above for why. Field list/order unchanged.
 void blynkSendDiagnostics()
 {
   if (WiFi.status() != WL_CONNECTED) return;
@@ -4818,6 +4884,16 @@ volatile uint32_t wifiGotIpEventCount = 0;
 volatile uint8_t wifiLastDisconnectReason = 0;
 volatile uint32_t wifiLastDisconnectEventMs = 0;
 volatile uint32_t wifiLastGotIpEventMs = 0;
+// v3.9.41: set by the WiFi event callback the instant a real
+// ARDUINO_EVENT_WIFI_STA_DISCONNECTED fires. Previously wifiService() had no
+// event-driven path at all — it only noticed a disconnect by polling
+// WiFi.status() on a fixed WIFI_RECONNECT_MS (30s) timer, and WiFi's own
+// built-in fast reconnect was deliberately disabled (WiFi.setAutoReconnect
+// (false)) to avoid the two reconnect paths fighting each other. That
+// combination meant every real disconnect sat idle for up to 30s before
+// anything reacted at all, on top of the handshake time after that — this
+// flag lets wifiService() react on the very next loop() pass instead.
+volatile bool wifiDisconnectEventPending = false;
 uint32_t wifiConnectAttempts = 0;
 uint32_t wifiSuccessfulConnections = 0;
 uint32_t wifiConsecutiveFailures = 0;
@@ -4835,6 +4911,7 @@ void wifiEventCallback(WiFiEvent_t event, WiFiEventInfo_t info)
   if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
     wifiLastDisconnectReason = info.wifi_sta_disconnected.reason;
     wifiLastDisconnectEventMs = millis();
+    wifiDisconnectEventPending = true;
   } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
     ++wifiGotIpEventCount;
     wifiLastGotIpEventMs = millis();
@@ -4886,8 +4963,14 @@ unsigned long blynkHandshakeStarted = 0;
 // handshake failures; only reset WiFi after repeated failures.
 unsigned long blynkOfflineSince = 0;
 #define BLYNK_OFFLINE_RECOVERY_MS 60000UL
-#define BLYNK_HANDSHAKE_FAILS_BEFORE_WIFI_RESET 3U
-#define BLYNK_WIFI_RECOVERY_FAILS_BEFORE_ESP_RESET 3U
+// v3.9.43: reduced from 3/3 to 2/2 (see the v3.9.43 note above
+// BLYNK_CONNECT_RETRY_MS for the full outage-time accounting). Two failures
+// is still enough to distinguish "handshake was just briefly slow" from
+// "this session/WiFi association is actually dead" — it is not a hair-
+// trigger single-failure escalation, which would risk the v3.9.9 thrashing
+// problem these counters were originally added to prevent.
+#define BLYNK_HANDSHAKE_FAILS_BEFORE_WIFI_RESET 2U
+#define BLYNK_WIFI_RECOVERY_FAILS_BEFORE_ESP_RESET 2U
 static uint8_t blynkHandshakeFailCount = 0;
 static uint8_t blynkWifiRecoveryFailCount = 0;
 // v3.9.1: after a software reset, briefly delay the new Blynk handshake.
@@ -4897,6 +4980,39 @@ unsigned long blynkStartupHoldoffUntil = 0;
 // can make the retry-age test appear shorter than BLYNK_CONNECT_RETRY_MS.
 static bool blynkConnectImmediate = false;
 static bool blynkForceReconnect = false;
+// v3.9.42 DIAGNOSTIC ONLY — added to actually see what state the connection
+// is in during a silent stall (no reconnect logged, no data flowing). Prints
+// on a short fixed interval; takes no action and touches no connection state.
+// This must stay purely observational: no thresholds here may ever set
+// blynkForceReconnect or call disconnect() — see v3.9.40/41/42 history above
+// for why an earlier watchdog that DID act on a similar signal caused
+// self-inflicted disconnects. Placed here (after blynkHandshakeActive and
+// blynkForceReconnect are declared) rather than near blynkTxService(),
+// because both are needed and moving the variables would touch working code.
+#define BLYNK_STATUS_LOG_MS 5000UL
+static unsigned long lastBlynkStatusLog = 0;
+static void blynkStatusLogPassive()
+{
+  const unsigned long now = millis();
+  if (now - lastBlynkStatusLog < BLYNK_STATUS_LOG_MS) return;
+  lastBlynkStatusLog = now;
+
+  DBG_PRINTF("[Blynk STATUS] connected=%d wifiStatus=%d RSSI=%d rxAge=%lums txPending=%u lastTxAttemptAge=%lums lastTxSuccessAge=%lums handshakeActive=%d forceReconnect=%d\n",
+                Blynk.connected() ? 1 : 0,
+                (int)WiFi.status(),
+                WiFi.RSSI(),
+                (unsigned long)(blynkLastRxMillis ? now - blynkLastRxMillis : 0),
+                (unsigned)blynkTxPendingCount(),
+                (unsigned long)(blynkLastTxAttemptMillis ? now - blynkLastTxAttemptMillis : 0),
+                (unsigned long)(blynkLastTxSuccessMillis ? now - blynkLastTxSuccessMillis : 0),
+                blynkHandshakeActive ? 1 : 0,
+                blynkForceReconnect ? 1 : 0);
+}
+// v3.9.42: the v3.9.40/v3.9.41 RX-staleness watchdog (BLYNK_RX_STALE_MS) was
+// removed — see blynkHeartbeatService() for why. blynkForceReconnect is now
+// set only by a genuine WiFi re-association (wifiMarkConnected()) or by the
+// pre-existing probe/handshake failure-count escalation below, both of which
+// reflect an actual connectivity problem rather than a heuristic guess.
 // v3.9.39: true after a real WiFi re-association until a NEW Blynk protocol
 // connection is confirmed.  This deliberately bypasses Blynk.connected() as a
 // gate because a stale Blynk 0.6.1 protocol object can report connected after
@@ -4904,16 +5020,32 @@ static bool blynkForceReconnect = false;
 // reconnect path could repeatedly print "handshake pending" but never enter
 // the TCP probe because !Blynk.connected() was false.
 #define BLYNK_SOFT_RESET_HOLDOFF_MS 15000UL
-#define BLYNK_CONNECT_RETRY_MS 10000UL
+// v3.9.43 FIX: BLYNK_CONNECT_RETRY_MS/BLYNK_HANDSHAKE_TIMEOUT_MS/
+// BLYNK_SERVER_PROBE_TIMEOUT_MS/BLYNK_HANDSHAKE_FAILS_BEFORE_WIFI_RESET/
+// BLYNK_WIFI_RECOVERY_FAILS_BEFORE_ESP_RESET together determine total outage
+// time after a genuine dead-socket stall (confirmed by field log: write
+// timeout errno=11/EAGAIN after 121s connected, TX buffer stopped draining —
+// this is a real peer-side stall, not a self-inflicted disconnect). The
+// original values (10s retry + 10s handshake + 6s probe, x3 handshake fails,
+// x3 WiFi-reset fails) added up to ~2m38s end-to-end before a software
+// restart, confirmed against the same field log's timestamps. That is far
+// too slow for a platform whose position/readings are moving in real time.
+// The multi-tier structure itself (probe -> handshake-fail count -> WiFi
+// reset -> ESP restart) is intentionally kept — see the v3.9.9/v3.9.10 notes
+// below explaining why a single fast reconnect attempt is not enough on its
+// own (a reachable TCP port does not guarantee an immediate Blynk login
+// response). Only the per-stage durations and fail counts are tightened:
+//   probe 6s -> 4s, handshake 10s -> 6s, retry gate 10s -> 4s,
+//   handshake fails before WiFi reset 3 -> 2, WiFi-reset fails before
+//   ESP restart 3 -> 2.
+// New worst case: ~2 x (4s probe + 4s retry + 6s handshake) per tier x 2
+// tiers =~ 55-60s to a software restart, versus ~2m38s before. Typical case
+// (server responds within one probe/handshake cycle) recovers in well under
+// 15s, matching the WiFi-layer speed already achieved in v3.9.41.
+#define BLYNK_CONNECT_RETRY_MS 4000UL
 #define BLYNK_CONNECT_TIMEOUT_S 5UL
-// v3.9.28: reduced from 15000UL to 10000UL. WiFi driver corruption causes
-// handshake to hang indefinitely. Failing faster allows quicker recovery.
-#define BLYNK_HANDSHAKE_TIMEOUT_MS 10000UL
-// v3.9.24: raised from 3000UL. A stable but non-ideal RSSI link (observed
-// around -62dBm) occasionally needs longer than 3s for the TCP handshake to
-// complete, especially right after a prior socket teardown. This alone will
-// not fix a genuinely stale/dead TCP session — only a hung/slow handshake.
-#define BLYNK_SERVER_PROBE_TIMEOUT_MS 6000UL  // was 3000UL — more headroom for a marginal but stable RSSI link
+#define BLYNK_HANDSHAKE_TIMEOUT_MS 6000UL
+#define BLYNK_SERVER_PROBE_TIMEOUT_MS 4000UL
 // v3.9.8: if the Blynk server becomes unreachable while WiFi still reports
 // connected, do not remain trapped in repeated TCP-probe failures. After a
 // small number of consecutive failures, explicitly tear down the Blynk socket
@@ -4941,8 +5073,17 @@ void wifiStartConnect()
              WIFI_SSID, (unsigned long)wifiConnectAttempts,
              (unsigned long)wifiConsecutiveFailures);
   WiFi.mode(WIFI_STA);
-  // ESP32-specific: set TX power to maximum for stable connection on marginal networks
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  // v3.9.41 FIX: was forced to max (WIFI_POWER_19_5dBm) on every reconnect.
+  // Max TX power on a nearby/uncongested AP can itself cause instability —
+  // an overly "loud" client can trigger AP-side retransmit storms or
+  // outright association drops (WIFI_REASON_ASSOC_LEAVE and similar), which
+  // looks identical to "the ESP32 keeps randomly disconnecting" from this
+  // side. A stable ESP8266 on the same network typically runs at a much
+  // lower default TX power, which is a plausible reason it doesn't show this
+  // symptom. Backed off to a moderate default; raise it again only if RSSI
+  // logs (already printed at every reconnect, see wifiService()) show the
+  // link is actually marginal.
+  WiFi.setTxPower(WIFI_POWER_15dBm);
   // v3.9.26: DISABLED. WiFi.setAutoReconnect(true) makes the underlying
   // ESP32 WiFi driver run its OWN independent reconnect logic on every
   // disconnect, entirely separate from and unaware of wifiService()'s
@@ -5029,6 +5170,7 @@ void wifiMarkConnected()
   blynkHandshakeStarted = 0;
   blynkOfflineSince = 0;
   blynkLastConnectedMillis = 0;
+  blynkLastRxMillis = millis();
   // v3.9.38: both first boot and WiFi recovery request an explicit immediate
   // bounded TCP probe. This avoids the old 10-second startup gap and avoids
   // unsigned-millis wraparound tricks near boot.
@@ -5144,9 +5286,23 @@ void wifiService()
     }
   }
 
-  if (now - lastWiFiCheck >= WIFI_RECONNECT_MS) {
+  if (now - lastWiFiCheck >= WIFI_RECONNECT_MS || wifiDisconnectEventPending) {
+    // v3.9.41: react immediately to a real disconnect event instead of only
+    // a 30s poll. wifiDisconnectEventPending is set from the WiFi event
+    // callback the instant ARDUINO_EVENT_WIFI_STA_DISCONNECTED fires; the
+    // WIFI_RECONNECT_MS timer remains only as a safety net in case an event
+    // is ever missed. Log the reason/RSSI right here, at the moment we react,
+    // since that is the only place that can tell us *why* — the 10s summary
+    // elsewhere only shows the last known values by the time it prints.
+    const bool eventTriggered = wifiDisconnectEventPending;
+    wifiDisconnectEventPending = false;
     lastWiFiCheck = now;
-    engMsg("WiFi: reconnect attempt");
+    DBG_PRINTF("[WiFi] Reconnect triggered by %s — reason=%u eventAge=%lums lastRSSI=%d\n",
+               eventTriggered ? "DISCONNECT EVENT" : "30s poll (no event seen)",
+               (unsigned)wifiLastDisconnectReason,
+               (unsigned long)(now - wifiLastDisconnectEventMs),
+               WiFi.RSSI());
+    engMsgf("WiFi: reconnect (reason=%u)", (unsigned)wifiLastDisconnectReason);
     Blynk.disconnect();
 #if CONNECTION_MODE == 0
     _boundedBlynkTransport.disconnect();
@@ -5472,7 +5628,15 @@ void setup()
   blynkTimer.setInterval(BLYNK_SEND_FAST_MS, blynkSendFast);
   blynkTimer.setInterval(BLYNK_SEND_SLOW_MS, blynkSendSlow);
   blynkTimer.setInterval(1000UL, blynkSendV4);  // V4 diagnostic every 1 second
-  blynkTimer.setInterval(10000UL, blynkSendDiagnostics);
+  // v3.9.43: slowed from 10000UL to BLYNK_SEND_DIAG_MS (30s). blynkSendDiagnostics()
+  // writes 22 fields (V34-V60) every cycle — the single largest contributor to
+  // Blynk server write load among all TX groups (see the v3.9.43 note at
+  // BLYNK_SEND_DIAG_MS below). These are retained maxima/counters, not live
+  // sensor readings, so they do not need a 10s cadence; nothing meaningful is
+  // lost by checking them 3x less often. This reduces steady-state server-side
+  // write load without touching BLYNK_SEND_FAST_MS/BLYNK_SEND_SLOW_MS/V4,
+  // which carry the actual time-sensitive sensor/position data.
+  blynkTimer.setInterval(BLYNK_SEND_DIAG_MS, blynkSendDiagnostics);
   blynkTimer.setInterval(MAP_SEND_INTERVAL_MS, blynkSendMap);
 
   #if CONNECTION_MODE == 0
@@ -5627,6 +5791,21 @@ void blynkProbeAbort()
 // Sending a small protocol PING every 20s gives the LAN/server path a frequent
 // request/response opportunity. PING is explicitly exempt from BLYNK_MSG_LIMIT
 // in v0.6.1, so this cannot recreate the telemetry-burst problem.
+// v3.9.42 FIX: removed the RX-staleness watchdog added in v3.9.40. It set
+// blynkForceReconnect=true purely from "no bytes read in N seconds", but that
+// can trip on a perfectly healthy, already-connected session (server just had
+// nothing new to send and a PONG lagged past the threshold). Once tripped, the
+// handshake-service code below re-enters its handshake path on an ALREADY-
+// CONNECTED session and, if that doesn't resolve within
+// BLYNK_HANDSHAKE_TIMEOUT_MS, calls Blynk.disconnect() + WiFi.disconnect() —
+// a fully self-inflicted disconnect. This is what produced the
+// "WiFi: reconnect (reason=8)" (ASSOC_LEAVE) log lines roughly 3 minutes after
+// every successful connect: reason 8 is what the driver reports for OUR OWN
+// WiFi.disconnect() call, not an external kick or weak signal. The pre-
+// existing blynkProbeFailCount / blynkHandshakeFailCount escalation logic
+// already exists to detect and recover from a genuinely dead session; that is
+// kept, and is now serviced faster via the event-driven WiFi reconnect
+// (v3.9.41). No separate staleness heuristic is layered on top of it.
 static void blynkHeartbeatService()
 {
   if (!Blynk.connected()) return;
@@ -5717,6 +5896,10 @@ void loop()
 #endif
           DBG_PRINTF("[Blynk] FORCED recovery probe — stale connected=%d cleared\n",
                      Blynk.connected() ? 1 : 0);
+          // v3.9.40: give the new session a fresh RX-staleness window so it
+          // isn't immediately re-flagged as stale before the new handshake
+          // has had any chance to receive traffic.
+          blynkLastRxMillis = millis();
         }
 
         // IMPORTANT: Blynk v0.6.1 Blynk.connect(timeout) is a blocking loop.
@@ -5846,6 +6029,11 @@ void loop()
           blynkWifiRecoveryFailCount = 0;
           lastBlynkForcePing = millis();
           blynkForcePingCount = 0;
+          // v3.9.43: see BLYNK_TX_POST_RECONNECT_GRACE_MS comment above —
+          // hold off telemetry sends briefly after a fresh connection so a
+          // backed-up queue does not immediately burst at a freshly-
+          // recovering server.
+          blynkTxGraceUntil = millis() + BLYNK_TX_POST_RECONNECT_GRACE_MS;
           DBG_PRINTF("[Blynk] Connected - Firmware %s\n", FIRMWARE_VERSION);
           engMsgf("Blynk connected - FW %s", FIRMWARE_VERSION);
         } else if (millis() - blynkHandshakeStarted >= BLYNK_HANDSHAKE_TIMEOUT_MS) {
@@ -5932,6 +6120,10 @@ void loop()
         core1StageBegin(CORE1_STAGE_BLYNK_TX);
         blynkTxService();
         core1StageEnd();
+
+        // v3.9.42 DIAGNOSTIC ONLY — see blynkStatusLogPassive() above. Purely
+        // observational; does not affect connection state.
+        blynkStatusLogPassive();
 
         // v3.9.9: Blynk can transition from connected to disconnected inside
         // Blynk.run(). Do not leave that condition waiting for the much longer
@@ -6082,11 +6274,12 @@ void loop()
                   core1StageText(core1StageId),
                   (unsigned long)core1MaxStageMs,
                   (unsigned long)core1StallCount);
-    DBG_PRINTF("[Blynk HEALTH] connectedAge=%lums lastTxAttemptAge=%lums lastTxSuccessAge=%lums offlineAge=%lums\n",
+    DBG_PRINTF("[Blynk HEALTH] connectedAge=%lums lastTxAttemptAge=%lums lastTxSuccessAge=%lums offlineAge=%lums lastRxAge=%lums\n",
                   (unsigned long)(blynkLastConnectedMillis ? now - blynkLastConnectedMillis : 0),
                   (unsigned long)(blynkLastTxAttemptMillis ? now - blynkLastTxAttemptMillis : 0),
                   (unsigned long)(blynkLastTxSuccessMillis ? now - blynkLastTxSuccessMillis : 0),
-                  (unsigned long)(blynkOfflineSince ? now - blynkOfflineSince : 0));
+                  (unsigned long)(blynkOfflineSince ? now - blynkOfflineSince : 0),
+                  (unsigned long)(blynkLastRxMillis ? now - blynkLastRxMillis : 0));
     DBG_PRINTF("[Blynk TX DIAG] calls=%lu lastV=V%d lastLen=%u last=%lums max=%lums\n",
                   (unsigned long)blynkTxCallCount, (int)blynkTxLastVPin,
                   (unsigned)blynkTxLastValueLen, (unsigned long)blynkTxLastCallMs,
