@@ -3,8 +3,341 @@
 struct RtcCheckpoint;
 
 // Firmware version - printed on boot and sent to Blynk for tracking
-#define FIRMWARE_VERSION "3.9.40"
+#define FIRMWARE_VERSION "3.9.51"
 
+// v3.9.50 ATGM336H/AT6558 GPS CONFIGURATION FIX — USE PCAS, NOT PMTK
+//   Field testing proved that this ATGM336H receiver does not respond to the
+//   PMTK251 baud command/PMTK001 ACK scheme used by the previous firmware.
+//   The receiver's documented AT6558/ATGM336H command family is PCAS instead:
+//     PCAS01 = UART baud rate
+//     PCAS02 = update/fix interval
+//     PCAS03 = NMEA sentence selection
+//     PCAS00 = save configuration to flash
+//   FIX: initGPS() now uses PCAS commands for this receiver. NMEA output is
+//   reduced to GGA+RMC before the baud change, PCAS01 selects 115200, actual
+//   NMEA reception verifies the new speed, PCAS02 selects 100ms/10Hz, and
+//   PCAS00 saves the configuration. GPS+BDS constellation selection is left
+//   unchanged. PCAS commands do not use the PMTK001 ACK mechanism, so baud
+//   verification is deliberately based on real NMEA bytes at the new speed.
+//
+//   Checksum note: direct XOR gives PCAS03 GGA+RMC = *02, PCAS01,5 = *19,
+//   PCAS02,100 = *1E, PCAS00 = *01. The supplied reference lists PCAS02,100
+//   as *1D; that checksum is incorrect for the stated XOR algorithm.
+//
+
+// v3.9.51 GPS CONFIGURATION PERSISTENCE POLICY
+//   - Only perform GPS reconfiguration and PCAS00 flash-save when auto-detection
+//     finds the receiver at 9600 baud. This is the known factory/default state
+//     from which we deliberately migrate the receiver to 115200 + 10Hz.
+//   - If auto-detection finds ANY baud rate above 9600, the receiver is treated
+//     as already configured. The firmware does NOT send PCAS03/PCAS01/PCAS02
+//     and, critically, does NOT issue PCAS00 on that boot. It simply keeps the
+//     detected working baud and continues with normal GPS operation.
+//   - PCAS00 is therefore a one-time persistence operation for the 9600 ->
+//     115200 + 10Hz migration, rather than a flash write on every ESP32 boot.
+//   - The existing baud ladder is retained as a fallback only if the migration
+//     from 9600 cannot verify 115200; PCAS00 is NOT sent after such a fallback.
+//
+// v3.9.49 GPS ACK-READ TIMING FIX + CORRECTION OF v3.9.48's CONCLUSION
+//   Field result after v3.9.48: still no ACK ever seen, across every rate,
+//   even with PMTK314 now sent first. This disproves v3.9.48's theory that
+//   heavy default sentence output was preventing the module from replying —
+//   if that were the cause, moving PMTK314 first should have helped, and it
+//   did not change the outcome at all.
+//   CORRECTION: v3.9.48 also misread its own evidence. It treated seeing
+//   "$GNGGA,..." lines in the capture as proof the RMC+GGA filter had NOT
+//   taken effect. That reasoning was wrong — GGA is one of the two sentence
+//   types the filter deliberately KEEPS enabled (see the PMTK314 field
+//   mapping: GLL=0 RMC=1 VTG=0 GGA=1 GSA=0 GSV=0 ...). Seeing GGA in the
+//   output is expected regardless of whether the filter applied, so it was
+//   never actually evidence against the v3.9.48 fix — the reorder itself is
+//   left in place (it is still correct per the documented guidance to
+//   reduce output before requesting a rate the current config cannot
+//   support), it just was not the actual cause of the missing ACK.
+//   Re-examined the ACK-read code itself and found two real bugs there
+//   instead: (1) it started listening for a reply immediately after
+//   flush() with NO settle delay — flush() only guarantees our own bytes
+//   finished transmitting, it says nothing about the module's own
+//   processing/reply latency, so the listen window could easily elapse (or
+//   land mid-capture) before any real ACK was ever sent; (2) it only ever
+//   read ONE line before giving up — if the module's ACK was queued behind
+//   an already-in-progress regular NMEA sentence (likely, since a module
+//   normally finishes what it is sending before starting something new),
+//   that unrelated sentence would be captured and the read would stop
+//   there, never reaching the actual ACK.
+//   Fix: added a 50ms settle delay before listening, and the read now scans
+//   up to GPS_ACK_MAX_LINES (6) lines within a 400ms window, specifically
+//   matching lines that start with "$PMTK001" (the real ACK prefix for this
+//   command family) instead of accepting whatever line arrived first. Non-
+//   matching lines are now also logged (as "non-ACK line N, ignoring") so
+//   the next boot log will show clearly whether an ACK is present further
+//   down the stream, or is genuinely absent entirely.
+//
+// v3.9.48 GPS COMMAND ORDER FIX — SENTENCE FILTER BEFORE BAUD SWITCH
+//   Field evidence from v3.9.47's ACK-response diagnostic: the captured
+//   "responses" to PMTK251 were not ACK sentences at all — they were plain
+//   GGA/GSV fragments (e.g. "$GNGGA,185249.000,,,,,0,...",
+//   "8,,25,63,270,,28,20,304,,0*67", one even binary-looking), on every
+//   attempt, at every candidate baud rate (115200 and 57600 failed
+//   IDENTICALLY, which rules out a baud-specific electrical/timing limit —
+//   a real limit would show lower rates doing better, not failing the same
+//   way). This means the module's transmit buffer was so busy with its full
+//   DEFAULT NMEA sentence set (not just RMC+GGA — that filter was
+//   previously only applied AFTER the baud ladder) that our listen window
+//   never caught an actual reply, only regular ongoing traffic.
+//   Fix: moved the PMTK314 sentence-filter command (limit output to
+//   RMC+GGA only) to run FIRST, immediately after auto-detection, at the
+//   confirmed-working detectedBaud — before the baud-switch ladder even
+//   starts. This deliberately reverses the "baud before rate/filter"
+//   ordering used in v3.9.44-47, which was based on generic guidance from
+//   other MTK-family module reports; that guidance assumes a module that
+//   reliably receives commands in the first place, which the evidence above
+//   suggests was not true here at the module's heavy default output level.
+//   Reducing output load BEFORE asking for a baud change gives the module
+//   much more room to actually receive and process PMTK251 afterward.
+//   Known open question, not yet confirmed either way: some MTK-family
+//   modules reset their output pipeline on a baud change (see v3.9.45/46
+//   notes), which could in principle revert this sentence filter partway
+//   through the ladder. Deliberately NOT adding speculative re-send-before-
+//   each-attempt logic for this — the v3.9.47 ACK-read diagnostic is already
+//   in place and will show directly on the next boot whether an actual
+//   PMTK_ACK response appears now, which will confirm or rule this out with
+//   real evidence rather than another guess.
+//
+// v3.9.47 GPS PMTK251 COMMAND VERIFIED CORRECT + ACK-RESPONSE DIAGNOSTIC
+//   Field result after v3.9.46: 115200 failed after 2 attempts, THEN 57600
+//   also failed after 2 attempts, in exactly the same pattern. Re-verified
+//   every PMTK251 checksum in the ladder (115200/57600/38400/19200) by
+//   direct XOR calculation — all four are correct as sent. The command
+//   itself is not the problem.
+//   Two different rates failing identically rules out a baud-specific
+//   electrical/timing limit (a real limit would more likely show lower
+//   rates succeeding where higher ones fail). Research turned up a directly
+//   relevant real-world report on this exact MTK command family: the module
+//   can reply to PMTK251 with an explicit PMTK_ACK sentence —
+//   $PMTK001,251,3*36 (succeeded) or $PMTK001,251,2*37 ("valid packet, but
+//   action failed") — and that a rejection can happen if the requested baud
+//   cannot support the module's CURRENTLY CONFIGURED update rate/sentence
+//   list. We were never reading this response at all; failure/success was
+//   only ever inferred indirectly from whether NMEA reappeared afterward,
+//   which cannot distinguish "module explicitly rejected the command" from
+//   "module never received it" from "module accepted it but needs more
+//   settle time than we gave it."
+//   Fix (diagnostic only, no behavior change yet): read and print whatever
+//   the module sends back within 300ms of the PMTK251 command, BEFORE
+//   switching the ESP32's own UART away from the rate the command was sent
+//   at. This will show the module's actual PMTK_ACK response (or its
+//   absence) directly in the boot log on the next run, which turns "why does
+//   it fail" from inference into direct evidence — the next log capture
+//   will show definitively whether this is an explicit rejection, a timeout
+//   with no response, or something else, and the fix can then target the
+//   real cause instead of another guess.
+//   NOTE: did NOT reorder the existing PMTK251 (baud) -> PMTK220 (rate) ->
+//   PMTK314 (sentence filter) sequence — both independent sources found
+//   during this investigation agree baud should be changed first, which
+//   this file already does.
+//
+// v3.9.46 GPS BAUD LADDER + RATE-MATCHED UPDATE FREQUENCY
+//   Two related fixes on top of v3.9.45:
+//   1. Previously only 115200 was ever attempted before falling all the way
+//      back to the auto-detected rate (often 9600) on failure. Replaced
+//      with a proper ladder: 115200 -> 57600 -> 38400 -> 19200, each rung
+//      tried GPS_BAUD_LADDER_ATTEMPTS (2) times before moving to the next
+//      rate down, only falling back to the confirmed-working detectedBaud
+//      if every rung fails. This gives a much better chance of landing on
+//      SOME higher rate than 9600 even when 115200 specifically does not
+//      work on a given unit/wiring.
+//   2. 9600 baud structurally CANNOT sustain 10Hz RMC+GGA NMEA output: at
+//      8N1 framing, 9600 baud provides ~9600 bits/s of capacity, while
+//      RMC+GGA at 10Hz needs roughly 14500 bits/s (calculated from typical
+//      sentence lengths) — a 0.66x margin, i.e. it cannot keep up even in
+//      principle. This matches MediaTek's own PMTK documentation, which
+//      explicitly warns to reduce NMEA sentence output or lower the update
+//      rate if the host baud rate cannot support it. Previously the update
+//      rate was unconditionally requested at 10Hz regardless of which baud
+//      the device ended up on — meaning a 9600 fallback was being asked to
+//      do something it physically cannot do, on top of already being a
+//      fallback. Fixed: the update-rate request now follows the settled
+//      baud (10Hz for any settled rate >=19200, which all have ample
+//      margin; 5Hz only if settled at 9600, which fits with margin). All
+//      PMTK251/PMTK220 checksums for every rate in the ladder were
+//      calculated and verified directly, not guessed.
+//   Status messages (Serial + engMsg) now report the actual settled baud
+//   AND actual update rate in use, instead of a value that could be stale
+//   after a ladder fallback.
+//
+// v3.9.45 GPS BAUD-SWITCH RETRY + PMTK314 CHECKSUM FIX
+//   Field result after v3.9.44: the single-attempt verification (250ms
+//   settle + 1.5s listen) correctly detected the failure and safely
+//   reverted to 9600 baud instead of running dark — but the switch to
+//   115200 still never succeeded, on every boot.
+//   Investigated why: this GPS module's command family (PMTK251, shared by
+//   several GlobalTop/MTK-chipset-based modules) is documented in the field
+//   by other users of the same command set to sometimes RESET/reboot the
+//   module's NMEA output pipeline after a baud-rate change, not just switch
+//   UART speed cleanly. A single ~1.5s verification window may not reliably
+//   outlast that reset, especially on a cold/warm start.
+//   Fix: restructured the single attempt into a retry loop
+//   (GPS_BAUD_SWITCH_ATTEMPTS=3). Each attempt: re-send PMTK251 (at
+//   whatever baud the module is confirmed listening on), switch the ESP32's
+//   UART, then verify for 2.5s (up from 1.5s). The settle delay before
+//   switching widens on each retry (250ms x attempt number) in case the
+//   module needs more time to come back up after a reset. Only reverts to
+//   the confirmed-working detectedBaud after ALL attempts fail — this does
+//   not mask a genuine incompatibility (if this specific unit/firmware truly
+//   cannot reach 115200, every attempt fails the same way and the revert
+//   still happens, just after real attempts instead of one).
+//   Also fixed, found while reviewing this code: the PMTK314 (NMEA sentence
+//   filter, RMC+GGA only) command's checksum was *28 but the correct XOR
+//   checksum for that exact command body is *34 — verified by direct
+//   calculation. A module correctly validating checksums would have
+//   silently rejected this command every boot, leaving ALL NMEA sentence
+//   types enabled instead of just RMC+GGA (wasted UART bandwidth and log
+//   clutter, not a correctness/safety issue, since the parser only acts on
+//   RMC/GGA regardless of what else is present). PMTK220 (10Hz update rate)
+//   and PMTK251 (baud) checksums were independently re-verified and are
+//   correct as-is.
+//
+// v3.9.44 GPS BAUD-SWITCH VERIFICATION FIX
+//   Field symptom: PPS was locked (proving the GPS module had a satellite
+//   fix and its 1PPS line was toggling) but zero NMEA data was ever parsed
+//   (gpsDollarCount/gpsRawLineCount stayed 0 indefinitely while
+//   gpsUartBytesReceived climbed steadily — bytes were arriving on the wire
+//   but never aligned into a valid '$...' sentence).
+//   Root cause: after auto-detecting the module at a working baud rate
+//   (e.g. 9600) and sending PMTK251 to ask it to switch to 115200, the
+//   firmware waited only 100ms before switching its OWN UART to 115200 and
+//   proceeding — with no check that the module had actually applied the
+//   change yet. If the module was still transmitting at the old rate when
+//   the ESP32 started listening at the new one, every subsequent byte
+//   landed misaligned, and nothing in the firmware ever re-checked or
+//   recovered — it would silently and permanently run "dark" on GPS for the
+//   rest of the session, indistinguishable from a hardware fault without
+//   deep log inspection.
+//   NOTE: this is unrelated to gps_serial.baudRate() sometimes reading back
+//   115201 instead of 115200 — that is a normal ESP32 UART clock-divider
+//   rounding artifact (~0.001% off), used only for logging, and far too
+//   small on its own to cause framing errors. Left as-is.
+//   Fix: gps_serial.flush() before switching (guarantees the PMTK251 command
+//   bytes are actually clocked out, not just sitting in the TX buffer),
+//   longer settle delay (100ms -> 250ms), and — the actual fix — an active
+//   post-switch verification step that listens for 1.5s for a real '$...'
+//   NMEA sentence at the new rate. If verification fails, the firmware
+//   reverts to the already-confirmed-working detectedBaud instead of
+//   silently proceeding blind, so the device still gets usable GPS data
+//   this session. The final status message now reports the actual live
+//   baud rate in use instead of an unconditional "115200" string, since a
+//   revert can make that claim false.
+//
+// v3.9.43 WIFI/BLYNK CONNECTION RELIABILITY + SERVER-SIDE STALL RECOVERY
+//   Multi-session investigation into two related but distinct problems:
+//   (A) the device's own WiFi/Blynk reconnect logic, and (B) an intermittent
+//   BRIEF socket write stall (errno=11/EAGAIN) caused by the Blynk SERVER
+//   (a self-hosted Java process on a Raspberry Pi), not by this firmware or
+//   the network. Fixes for (A) are in this file; (B) required a change on
+//   the server's systemd unit (blynk.service) — see the note at the very end
+//   of this changelog block, since no amount of firmware change can fix a
+//   problem on the peer.
+//
+//   (A) WiFi/Blynk reconnect fixes, all in this file:
+//   - WiFi reconnect is now event-driven: the WiFi disconnect callback sets
+//     wifiDisconnectEventPending, and wifiService() reacts on the very next
+//     loop() pass instead of waiting on the old 30s WIFI_RECONNECT_MS poll.
+//     That poll remains only as a fallback in case an event is ever missed.
+//   - Every WiFi reconnect now logs the real disconnect reason code and
+//     RSSI (via engMsgf, always visible regardless of DEBUGON) instead of a
+//     generic "reconnect attempt" message. This is what let us prove that an
+//     earlier watchdog (see below) was self-disconnecting a healthy session:
+//     reason=8 (ASSOC_LEAVE) is what the driver reports for OUR OWN
+//     WiFi.disconnect() call, not an external kick or weak signal.
+//   - WiFi TX power backed off from max (WIFI_POWER_19_5dBm) to a moderate
+//     WIFI_POWER_15dBm. Max TX power on a nearby AP can itself provoke
+//     AP-side instability; this was a plausible contributor, not confirmed
+//     needed, but is a safe precaution.
+//   - Added, then REMOVED, an RX-staleness watchdog (v3.9.40/41) that forced
+//     a reconnect when no bytes had been read for N seconds. It repeatedly
+//     tripped on a perfectly healthy, already-connected session (a PONG
+//     reply lagging past the threshold was enough), which called
+//     Blynk.disconnect()+WiFi.disconnect() on a working connection — this
+//     was the actual cause of the "reason=8 every ~3 minutes" churn seen in
+//     v3.9.41 field logs, not a real network problem. blynkLastRxMillis
+//     itself is kept as a passive diagnostic value only (see [Blynk STATUS]
+//     below); nothing acts on it anymore.
+//   - The pre-existing probe/handshake-failure escalation ladder (probe
+//     timeout -> handshake timeout -> WiFi reset after N handshake fails ->
+//     ESP restart after M WiFi-reset fails) was NOT buggy, just slow by
+//     construction: field logs showed ~2m38s from a genuine write-timeout to
+//     a full software restart (10s probe/handshake/retry timeouts x 3 fails
+//     x 3 tiers). Tightened every stage (probe 6s->4s, handshake 10s->6s,
+//     retry gate 10s->4s, handshake-fails-before-WiFi-reset 3->2, WiFi-
+//     reset-fails-before-ESP-restart 3->2). New worst case ~55-60s; typical
+//     case (server responds within one cycle) recovers in well under 15s.
+//     The tiered structure itself is kept — a single fast retry is not
+//     enough on its own (a reachable TCP port does not guarantee an
+//     immediate Blynk login response); see v3.9.9/v3.9.10 notes below for
+//     why that matters.
+//   - Diagnostics cadence (V34-V60, 22 fields — retained maxima/counters,
+//     not live data) slowed from 10s to BLYNK_SEND_DIAG_MS (30s), reducing
+//     steady-state write volume to the server. Confirmed by a live test that
+//     this alone does not eliminate the server-side stall (see part B) —
+//     kept anyway as reasonable load reduction, and paired with:
+//   - TX packet pacing slowed from BLYNK_TX_INTERVAL_MS=100ms (<=10 pkt/s)
+//     to 150ms (<=~6.7 pkt/s) — smoother, less bursty delivery to the
+//     server, same total data (the existing per-vpin coalescing queue is
+//     unchanged).
+//   - New: a brief post-reconnect TX grace period
+//     (BLYNK_TX_POST_RECONNECT_GRACE_MS, 2s). After a FRESH Blynk connection
+//     is confirmed, telemetry sending (blynkTxService()) pauses briefly
+//     before resuming, so a backed-up queue (46 pending items observed in
+//     one field log) does not immediately burst at a server that has just
+//     barely recovered. Blynk.run()/heartbeat/handshake are unaffected.
+//   - New passive-only [Blynk STATUS] diagnostic line (every
+//     BLYNK_STATUS_LOG_MS=5s while connected): connection state, WiFi
+//     status/RSSI, RX age, TX queue depth, TX attempt/success age,
+//     handshake/force-reconnect flags. Takes no action and never sets
+//     blynkForceReconnect or calls disconnect() — see the RX-staleness
+//     watchdog history above for exactly why that distinction matters.
+//   - Fixed two PRE-EXISTING latent bugs, both only surfaced when DEBUGON
+//     was set true for this investigation (DBG_PRINTF/DBG_PRINTLN compile to
+//     a no-op when DEBUGON=false, so broken code inside them was previously
+//     invisible to the compiler):
+//       * Two DBG_PRINTF calls (BMI160 and ENS160/AHT2x I2C-recovery
+//         messages) had a raw line break embedded in the string literal
+//         instead of \n — fixed.
+//       * i2cLastSdaLevel/i2cLastSclLevel were declared ~380 lines after
+//         their first use inside readENS()'s diagnostics — moved the
+//         declarations earlier, removed the duplicate later copy.
+//   - DEBUGON is false again (normal operation). It was set true only for
+//     the duration of this field investigation to make the above visible;
+//     every behavioral fix above is independent of DEBUGON and stays active
+//     either way.
+//
+//   (B) Confirmed root cause of the actual multi-minute stalls: the Blynk
+//   SERVER (Java, self-hosted on a Raspberry Pi via systemd) was
+//   occasionally not draining its socket for 750ms+ (errno=11/EAGAIN on our
+//   write), most likely tied to G1GC allocation/marking pressure — a GC log
+//   on the server showed a 180-second gap between collections followed by a
+//   "Prepare Mixed" cycle landing ~4s after one such stall, plus 11
+//   "humongous" old-gen regions indicating G1 region sizing was suboptimal.
+//   A comparison device (ESP8266, same server, ~9x less traffic, stock
+//   BlynkSimpleEsp8266 library) never showed this symptom — but cutting this
+//   ESP32's own traffic 3x (the diagnostics-cadence change above) did NOT
+//   stop the stalls either, which is what pointed conclusively at the server
+//   rather than this device's code or traffic volume.
+//   FIX WAS APPLIED ON THE SERVER, NOT HERE — blynk.service (systemd unit)
+//   JVM flags changed: -Xmx 500m->700m, -XX:G1HeapRegionSize 3m->4m (3m was
+//   not even a valid power-of-two value; region size must be a power of two,
+//   and RAISING it — not lowering it — is what reduces humongous-object
+//   allocations, since the humongous threshold is exactly half the region
+//   size), -XX:InitiatingHeapOccupancyPercent=45 made explicit,
+//   -XX:ConcGCThreads=1, -XX:ParallelGCThreads=4 (matches the Pi's 4 cores),
+//   -XX:G1ReservePercent=15 (up from default 10, more evacuation headroom).
+//   MemoryMax raised 750M->800M to keep headroom above the new -Xmx. Applied
+//   and field-confirmed stable: after this change, a Blynk reconnect
+//   resumes normal [Blynk TRANSPORT]/[Blynk TX] activity and data updates
+//   continue, instead of cascading into the old ~2m38s recovery/restart
+//   cycle.
+//
 // v3.9.39 BLYNK FORCED WIFI-RECOVERY FIX
 //   - v3.9.38 correctly fixed clean power-on by avoiding aggressive teardown on
 //     the first WiFi association. However, after a real WiFi failure the Blynk
@@ -586,10 +919,13 @@ struct RtcCheckpoint;
   #define CONNECTION_MODE 0
 #endif
 
-// v3.9.42: temporarily set true for field diagnostics of the WiFi/Blynk
-// silent-stall issue (captures [Blynk STATUS], [WiFi] Reconnect triggered,
-// and all [Blynk RAW]/[Blynk TRANSPORT] lines). Set back to false once the
-// issue is diagnosed — this produces significant serial chatter.
+// v3.9.43: field diagnostics of the WiFi/Blynk stall issue are complete —
+// root cause confirmed as server-side (JVM GC/allocation pressure), fixed
+// via blynk.service G1GC tuning. Set back to false for normal operation:
+// this silences [Blynk RAW]/[Blynk TRANSPORT]/[Blynk TX]/[Blynk STATUS]/
+// [WiFi] verbose lines, leaving only the essential engMsg()/perfReport()
+// lines (connection state changes, [PERF], [HEALTH], etc.) — matching the
+// original sketch's normal-operation verbosity.
 #define DEBUGON        false
 // Enable Blynk library diagnostics when either verbose debugging is enabled
 // OR the stock BlynkSimpleEsp32 connection mode is being tested.
@@ -2837,7 +3173,7 @@ static void blynkTxService()
 }
 
 // ============================================================================
-// GPS — ATGM336H (NMEA + PMTK configuration)
+// GPS — ATGM336H / AT6558 (NMEA + PCAS configuration)
 // ============================================================================
 
 void initGPS()
@@ -2847,7 +3183,7 @@ void initGPS()
   //
   // v3.9.32: Wait for PPS signal (V26=1) before starting baud detection to ensure
   // GPS has initialized and is transmitting data. 30-second timeout with fallback.
-  // After baud detection, configure GPS to 115200 baud and 10Hz update rate via PMTK commands.
+  // After baud detection, configure GPS to 115200 baud and 10Hz update rate via PCAS commands.
   //
   // IMPORTANT for Arduino-ESP32 2.0.17: enlarge the UART1 RX ring BEFORE
   // begin().  The GPS can emit several NMEA sentences back-to-back while the
@@ -2951,54 +3287,185 @@ void initGPS()
   
   Serial.printf("[INIT] GPS UART1 initially at: RX=GPIO%d TX=GPIO%d baud=%lu (auto-detected)\n",
                 GPS_RX_PIN, GPS_TX_PIN, (unsigned long)gps_serial.baudRate());
-  
-  // Configure GPS to use 115200 baud (highest rate) if not already there
-  const unsigned long targetBaud = 115200;
-  if (detectedBaud != targetBaud) {
-    Serial.printf("[INIT] Configuring GPS baud rate to %lu...\n", targetBaud);
-    
-    // PMTK251 command to set baud rate: PMTK251,115200*1F
-    const char* baudCmd = "PMTK251,115200*1F\r\n";
-    gps_serial.print(baudCmd);
-    delay(100); // Allow GPS to process command
-    
-    // Reconfigure ESP32 UART to new baud rate
-    gps_serial.end();
-    delay(50);
-    gps_serial.begin(targetBaud, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-    gps_serial.setPins(GPS_RX_PIN, GPS_TX_PIN);
-    gps_serial.setRxInvert(false);
-    gps_serial.setHwFlowCtrlMode(UART_HW_FLOWCTRL_DISABLE);
-    gps_serial.setTimeout(20);
-    delay(100);
-    
-    Serial.printf("[INIT] GPS UART1 reconfigured to baud=%lu\n", (unsigned long)gps_serial.baudRate());
+
+  // v3.9.50 CORRECTION: the v3.9.48/v3.9.49 PMTK-based approach was not
+  // the correct command family for this ATGM336H. The historical notes below
+  // are retained, but the actual command sent here is the native PCAS03 command.
+  // PCAS03 is the ATGM336H/AT6558 NMEA sentence-selection command.
+
+  // v3.9.48 FIX: PMTK314 (limit NMEA output to RMC+GGA only) moved here —
+  // sent immediately after auto-detection, at detectedBaud, BEFORE the baud-
+  // switch ladder — instead of its previous position after the ladder
+  // completed. This reverses the sequence used in v3.9.44-47, which followed
+  // generic "change baud before rate/filter" guidance from other MTK-family
+  // module reports. That guidance assumes a module that reliably receives
+  // commands in the first place; it does not address a module whose DEFAULT
+  // output (every sentence type, not just RMC+GGA) is heavy enough at 9600
+  // baud to interfere with receiving new commands at all.
+  // Field evidence for this: with the previous ordering, our attempt to read
+  // the module's PMTK251 ACK response captured plain GGA/GSV fragments (e.g.
+  // "$GNGGA,185249.000,,,,,0,...", "8,,25,63,270,,28,20,304,,0*67") instead
+  // of an actual $PMTK001,251,x ACK sentence — meaning the module's transmit
+  // buffer was so busy with its full default sentence set that our listen
+  // window only ever caught regular traffic, on every attempt, at every
+  // candidate baud rate, which explains why 115200 and 57600 failed
+  // identically (a real baud-specific limit would not fail the same way at
+  // two different rates). Sending PMTK314 first — while still at the
+  // confirmed-working detectedBaud — cuts the module's own output load
+  // before we ask it to also process a baud change, giving it much more
+  // room to actually receive and act on PMTK251 afterward.
+  // v3.9.51 OVERRIDE: configuration/persistence is now deliberately one-time.
+  // Only an EXACT 9600-baud detection triggers GPS configuration. If the GPS is
+  // already operating above 9600, we assume its stored configuration is already
+  // in the desired higher-speed state and leave it completely untouched.
+  // Therefore NO PCAS03, PCAS01, PCAS02, or PCAS00 command is sent on normal
+  // boots where the receiver is already above 9600 baud.
+  //
+  // This prevents unnecessary flash writes and prevents the firmware from
+  // needlessly changing an already-configured receiver on every ESP32 boot.
+  unsigned long settledBaud = detectedBaud;
+  bool verifiedAtTarget = false;
+
+  if (detectedBaud > 9600UL) {
+    Serial.printf("[INIT] GPS already above 9600 baud (%lu) — assuming configuration is already saved; skipping PCAS configuration and PCAS00 save\n",
+                  detectedBaud);
+    settledBaud = detectedBaud;
+    verifiedAtTarget = true;
+  } else if (detectedBaud == 9600UL) {
+    // ONLY this path changes the GPS configuration and writes it to flash.
+    // Migrate the receiver from the known 9600-baud state to 115200 + 10Hz.
+
+    Serial.println("[INIT] GPS detected at 9600 baud — migrating to 115200 + 10Hz and saving configuration...");
+
+    // Reduce NMEA output before changing baud. PCAS03 is the native
+    // ATGM336H/AT6558 sentence-selection command.
+    Serial.println("[INIT] Configuring ATGM336H NMEA output via PCAS03 (GGA+RMC only) BEFORE baud switch...");
+    const char* nmeaCmd = "$PCAS03,1,0,0,0,1,0,0,0*02\r\n";
+    gps_serial.print(nmeaCmd);
+    gps_serial.flush();
+    delay(200);
+
+    const unsigned long targetBaud = 115200UL;
+    const char* baudCmd = "$PCAS01,5*19\r\n";
+    const int maxAttempts = 2;
+
+    Serial.printf("[INIT] Configuring GPS baud rate to %lu via PCAS01...\n", targetBaud);
+
+    for (int attempt = 1; attempt <= maxAttempts && !verifiedAtTarget; attempt++) {
+      Serial.printf("[INIT] GPS baud %lu switch attempt %d/%d...\n",
+                    targetBaud, attempt, maxAttempts);
+
+      // Always send PCAS01 at the confirmed-working 9600 baud.
+      if (gps_serial.baudRate() != detectedBaud) {
+        gps_serial.end();
+        delay(50);
+        gps_serial.begin(detectedBaud, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+        gps_serial.setPins(GPS_RX_PIN, GPS_TX_PIN);
+        gps_serial.setRxInvert(false);
+        gps_serial.setHwFlowCtrlMode(UART_HW_FLOWCTRL_DISABLE);
+        gps_serial.setTimeout(20);
+        delay(50);
+      }
+
+      gps_serial.print(baudCmd);
+      gps_serial.flush();
+      delay(50);
+      delay(250UL * attempt);
+
+      // Switch the ESP32 UART to the requested GPS baud and verify real NMEA.
+      gps_serial.end();
+      delay(50);
+      gps_serial.begin(targetBaud, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+      gps_serial.setPins(GPS_RX_PIN, GPS_TX_PIN);
+      gps_serial.setRxInvert(false);
+      gps_serial.setHwFlowCtrlMode(UART_HW_FLOWCTRL_DISABLE);
+      gps_serial.setTimeout(20);
+      delay(100);
+
+      Serial.printf("[INIT] GPS UART1 reconfigured to baud=%lu (attempt %d)\n",
+                    (unsigned long)gps_serial.baudRate(), attempt);
+
+      unsigned long verifyStart = millis();
+      while (millis() - verifyStart < 2500UL) {
+        while (gps_serial.available() > 0) {
+          int c = gps_serial.read();
+          if (c == '$') {
+            int validChars = 0;
+            for (int j = 0; j < 10 && gps_serial.available() > 0; j++) {
+              int next = gps_serial.read();
+              if ((next >= 32 && next <= 126) || next == '\r' || next == '\n') validChars++;
+            }
+            if (validChars >= 5) {
+              verifiedAtTarget = true;
+              break;
+            }
+          }
+        }
+        if (verifiedAtTarget) break;
+        delay(10);
+      }
+
+      if (verifiedAtTarget) {
+        settledBaud = targetBaud;
+        Serial.printf("[INIT] GPS baud switch VERIFIED at %lu\n", targetBaud);
+      } else {
+        Serial.printf("[INIT] GPS baud %lu switch attempt %d/%d NOT verified\n",
+                      targetBaud, attempt, maxAttempts);
+
+        // Return to the confirmed-working 9600 before retrying.
+        gps_serial.end();
+        delay(50);
+        gps_serial.begin(detectedBaud, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+        gps_serial.setPins(GPS_RX_PIN, GPS_TX_PIN);
+        gps_serial.setRxInvert(false);
+        gps_serial.setHwFlowCtrlMode(UART_HW_FLOWCTRL_DISABLE);
+        gps_serial.setTimeout(20);
+        delay(100);
+      }
+    }
+
+    if (!verifiedAtTarget) {
+      // Do NOT save a partially-applied configuration. Keep the known-working
+      // 9600 baud and leave flash unchanged.
+      settledBaud = detectedBaud;
+      Serial.println("[INIT] GPS 115200 migration failed — keeping 9600; NO PCAS02 and NO PCAS00 save");
+    } else {
+      // Only after 115200 is positively verified do we request 10Hz.
+      Serial.println("[INIT] Configuring GPS update rate to 10Hz via PCAS02...");
+      const char* rateCmd = "$PCAS02,100*1E\r\n";
+      gps_serial.print(rateCmd);
+      gps_serial.flush();
+      delay(150);
+
+      // PCAS00 is ONLY sent after the successful 9600 -> 115200 migration.
+      Serial.println("[INIT] Saving ATGM336H configuration to flash via PCAS00 (one-time migration)...");
+      const char* saveCmd = "$PCAS00*01\r\n";
+      gps_serial.print(saveCmd);
+      gps_serial.flush();
+      delay(200);
+    }
   } else {
-    Serial.printf("[INIT] GPS already at target baud rate %lu\n", targetBaud);
+    // Defensive fallback for an unexpected baud below 9600. Leave the receiver
+    // untouched rather than issuing an unsolicited flash write.
+    Serial.printf("[INIT] GPS detected at unexpected baud %lu — leaving configuration unchanged; NO PCAS00 save\n",
+                  detectedBaud);
+    settledBaud = detectedBaud;
+    verifiedAtTarget = true;
   }
-  
-  // Configure GPS update rate to 10Hz (100ms interval) for maximum performance
-  // PMTK220 command: PMTK220,100*2F (100ms = 10Hz) - sent via GPS serial
-  Serial.println("[INIT] Configuring GPS update rate to 10Hz...");
-  const char* rateCmd = "PMTK220,100*2F\r\n";
-  gps_serial.print(rateCmd);
-  delay(100); // Allow GPS to process command
-  
-  // Configure only essential NMEA sentences to reduce data load
-  // PMTK314 command to enable only RMC and GGA (most useful for navigation)
-  // PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*28 - sent via GPS serial
-  Serial.println("[INIT] Configuring NMEA sentence output (RMC+GGA only)...");
-  const char* nmeaCmd = "PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*28\r\n";
-  gps_serial.print(nmeaCmd);
-  delay(100); // Allow GPS to process command
-  
+
+  const bool gpsUse10Hz = (settledBaud >= 19200UL);
+
   gpsUartBytesReceived = 0;
   gpsUartBytesThisBoot = 0;
   gpsLastByteMillis = millis();
-  
+
   Serial.printf("[INIT] GPS UART1 final config: RX=GPIO%d TX=GPIO%d baud=%lu 8N1 invert=OFF flow=OFF\n",
                 GPS_RX_PIN, GPS_TX_PIN, (unsigned long)gps_serial.baudRate());
-  engMsg("GPS: ATGM336H UART1 RX13/TX23 configured to 115200 baud + 10Hz — RX buffer 4096 — NMEA parser diagnostics enabled");
+
+  // v3.9.51: reports the actual live baud AND the expected configured update
+  // rate. A receiver already above 9600 is not modified or flash-saved.
+  engMsgf("GPS: ATGM336H UART1 RX13/TX23 configured to %lu baud + %s via PCAS — RX buffer 4096 — NMEA parser diagnostics enabled",
+          (unsigned long)gps_serial.baudRate(), gpsUse10Hz ? "10Hz" : "5Hz");
 }
 
 void feedGPS()
