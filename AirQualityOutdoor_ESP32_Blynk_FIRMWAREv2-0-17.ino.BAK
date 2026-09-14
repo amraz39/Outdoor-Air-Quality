@@ -5,6 +5,8 @@ struct RtcCheckpoint;
 // Firmware version - printed on boot and sent to Blynk for tracking
 #define FIRMWARE_VERSION "3.9.52"
 
+// v3.9.52 Refactored for ESP-32 Firmware CORE 3.3.11
+//
 // v3.9.50 ATGM336H/AT6558 GPS CONFIGURATION FIX — USE PCAS, NOT PMTK
 //   Field testing proved that this ATGM336H receiver does not respond to the
 //   PMTK251 baud command/PMTK001 ACK scheme used by the previous firmware.
@@ -24,7 +26,7 @@ struct RtcCheckpoint;
 //   PCAS02,100 = *1E, PCAS00 = *01. The supplied reference lists PCAS02,100
 //   as *1D; that checksum is incorrect for the stated XOR algorithm.
 //
-
+//
 // v3.9.51 GPS CONFIGURATION PERSISTENCE POLICY
 //   - Only perform GPS reconfiguration and PCAS00 flash-save when auto-detection
 //     finds the receiver at 9600 baud. This is the known factory/default state
@@ -38,26 +40,6 @@ struct RtcCheckpoint;
 //   - The existing baud ladder is retained as a fallback only if the migration
 //     from 9600 cannot verify 115200; PCAS00 is NOT sent after such a fallback.
 //
-// v3.9.52 ARDUINO-ESP32 CORE 3.3.11 MIGRATION — MINIMAL API-ONLY UPDATE
-//   - Keeps all application behaviour, pins, timing, GPS PCAS persistence policy,
-//     Blynk transport, WiFi recovery, I2C recovery, INAV, diagnostics, and sensor
-//     scheduling unchanged. Only APIs removed/changed by Arduino-ESP32 3.x are
-//     translated to their current equivalents.
-//   - LEDC: replaces the removed 2.x channel-first API (ledcSetup/ledcAttachPin/
-//     channel-first ledcWrite) with the 3.x pin-based API while retaining the
-//     explicit channels 0 and 8 so CO PWM and buzzer remain in separate groups.
-//   - I2S: uses the ESP-IDF 5.5 standard I2S driver (driver/i2s_std.h) already
-//     intended by the v2.2 design notes. The microphone remains 16kHz, 32-bit,
-//     stereo capture on GPIO25/26/33 and the existing two-slot RMS selection is
-//     preserved. This removes the legacy I2S driver dependency completely.
-//   - Task WDT: migrates the old esp_task_wdt_init(10,true) call to the ESP-IDF
-//     5.x esp_task_wdt_config_t API and reconfigures an already-initialized TWDT
-//     to the same 10-second/panic intent. Sensor-task subscription/feed logic is
-//     unchanged.
-//   - Adds a compile-time guard so this exact build is not accidentally flashed
-//     with an older Arduino-ESP32 core.
-// ============================================================================
-
 // v3.9.49 GPS ACK-READ TIMING FIX + CORRECTION OF v3.9.48's CONCLUSION
 //   Field result after v3.9.48: still no ACK ever seen, across every rate,
 //   even with PMTK314 now sent first. This disproves v3.9.48's theory that
@@ -964,7 +946,7 @@ struct RtcCheckpoint;
   #define DBG_PRINTF(...) do {} while (0)
 #endif
 
-#define GPS_DEBUG_PRINTOUT true
+#define GPS_DEBUG_PRINTOUT false
 
 #include <WiFi.h>
 
@@ -1584,17 +1566,8 @@ public:
 #include "ScioSense_ENS160.h"
 #include <Adafruit_AHTX0.h>      // AHT20/AHT21 temp+hum — install: Adafruit AHTX0
 #include <Adafruit_SSD1306.h>
-#include <driver/i2s_std.h>      // ESP-IDF 5.x standard I2S driver used by Arduino-ESP32 3.x
+#include <driver/i2s.h>          // ESP32 Arduino 2.x legacy I2S driver (ESP32 core 2.0.17)
 #include "esp_system.h"
-
-// v3.9.52: this source is intentionally migrated for Arduino-ESP32 3.3.x.
-// Refuse accidental builds with the old 2.x API set.
-#ifndef ESP_ARDUINO_VERSION
-  #error "Arduino-ESP32 core version macros are unavailable; use Arduino-ESP32 3.3.11"
-#endif
-#if ESP_ARDUINO_VERSION < ESP_ARDUINO_VERSION_VAL(3, 3, 0)
-  #error "This firmware requires Arduino-ESP32 core 3.3.x (target: 3.3.11)"
-#endif
 
 // ─── PERFORMANCE / I2C DIAGNOSTICS — declarations must precede PPS ISR ───
 // Internal counters/timers run continuously; V34-V50 are published only
@@ -1650,8 +1623,9 @@ static inline void perfI2cTimeout()
 // I2S driver and the driver_ng ADC API used by analogRead() cannot safely
 // coexist. <driver/i2s_std.h> is the new-generation I2S driver family and
 // does not touch the ADC driver at all — see v2.2 CHANGES note above.
-// NOTE: HISTORICAL ONLY — the following legacy-driver workaround is retained
-// as a changelog note. v3.9.52 now uses driver/i2s_std.h directly on core 3.x:
+// NOTE: Use legacy <driver/i2s.h> not the new ESP-IDF 5.x i2s_std.h —
+// the legacy driver is what the Arduino ESP32 core 3.x still exposes via
+// the compatibility shim. To avoid the "ADC: CONFLICT driver_ng" abort:
 //   1. Call analogReadResolution() + analogSetPinAttenuation() per pin in setup() FIRST.
 //   2. Do NOT call analogSetAttenuation() (global) — it uses driver_ng internally.
 //   3. Call i2s_driver_install() (initINMP441) LAST in setup(), after all ADC config.
@@ -1880,10 +1854,7 @@ Adafruit_AHTX0   aht;
 #define I2S_SD_PIN      33   // SD data in [freed from NO2 analogue]
 #define I2S_SAMPLE_RATE 16000
 #define I2S_BUF_SAMPLES 256
-
-// Arduino-ESP32 3.x / ESP-IDF 5.x standard I2S RX channel.
-static i2s_chan_handle_t inmp441RxHandle = NULL;
-// Arduino-ESP32 3.3.x: microphone uses the standard I2S_NUM_0 driver.
+// Arduino-ESP32 2.0.17: microphone uses the legacy I2S_NUM_0 driver.
 bool inmp441Initialized = false;
 
 // ─── ANALOG PINS (ADC1 only) ─────────────────────────────────────────────────
@@ -3783,63 +3754,61 @@ bool readENS(float& tvoc, float& eco2, float& aqi_out, float& temp_out, float& h
 }
 
 // ============================================================================
-// INMP441 I2S microphone — ESP-IDF 5.x standard driver/i2s_std.h
-// The microphone now uses the ESP-IDF 5.x standard I2S driver. It is independent
-// of the Arduino 3.x ADC driver, so there is no legacy-I2S/ADC ordering dependency.
-// The older driver_ng conflict note is retained in the historical changelog above.
+// INMP441 I2S microphone — legacy driver/i2s.h
+// IMPORTANT: ADC must be fully configured (analogReadResolution +
+// analogSetAttenuation) in setup() BEFORE i2s_driver_install() is called.
+// Calling ADC config AFTER I2S install triggers:
+//   E (321) ADC: CONFLICT! driver_ng is not allowed to be used with the legacy driver
+//
+// v2.2 UPDATE: the above ordering requirement applied to the legacy
+// <driver/i2s.h> API and is now HISTORICAL — initINMP441() below has been
+// migrated to the new <driver/i2s_std.h> driver, which does not use or
+// conflict with the ADC driver at all. The functions can now be called in
+// any order relative to ADC setup. The old comment is kept for context.
 // ============================================================================
 
 bool initINMP441()
 {
-  // Arduino-ESP32 3.x uses the ESP-IDF 5.x standard I2S driver.
-  // Preserve the previous electrical configuration: master RX, 16kHz,
-  // 32-bit stereo slots, GPIO25 BCLK, GPIO26 WS, GPIO33 data-in.
-  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_PORT, I2S_ROLE_MASTER);
-  chan_cfg.dma_desc_num = 8;
-  chan_cfg.dma_frame_num = I2S_BUF_SAMPLES;
+  // Arduino-ESP32 2.0.17 uses the legacy I2S driver.  Keep this path entirely
+  // on that API.  The important compatibility detail is that we capture BOTH
+  // I2S slots and select the slot that actually contains the INMP441 data.
+  // This avoids the 2.x left/right-slot quirk seen with some INMP441 boards,
+  // while leaving the physical L/R wiring unchanged.
+  i2s_config_t i2s_config = {};
+  i2s_config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
+  i2s_config.sample_rate = I2S_SAMPLE_RATE;
+  i2s_config.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
+  i2s_config.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  i2s_config.communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB);
+  i2s_config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  i2s_config.dma_buf_count = 8;
+  i2s_config.dma_buf_len = I2S_BUF_SAMPLES;
+  i2s_config.use_apll = false;
+  i2s_config.tx_desc_auto_clear = false;
+  i2s_config.fixed_mclk = 0;
 
-  esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &inmp441RxHandle);
+  esp_err_t err = i2s_driver_install((i2s_port_t)I2S_PORT, &i2s_config, 0, NULL);
   if (err != ESP_OK) {
-    inmp441RxHandle = NULL;
-    engMsgf("INMP441: i2s_new_channel failed (%d)", (int)err);
+    engMsgf("INMP441: i2s_driver_install failed (%d)", (int)err);
     return false;
   }
 
-  i2s_std_config_t std_cfg = {
-    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE),
-    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
-    .gpio_cfg = {
-      .mclk = I2S_GPIO_UNUSED,
-      .bclk = (gpio_num_t)I2S_SCK_PIN,
-      .ws = (gpio_num_t)I2S_WS_PIN,
-      .dout = I2S_GPIO_UNUSED,
-      .din = (gpio_num_t)I2S_SD_PIN,
-      .invert_flags = {
-        .mclk_inv = false,
-        .bclk_inv = false,
-        .ws_inv = false,
-      },
-    },
-  };
+  i2s_pin_config_t pin_config = {};
+  pin_config.bck_io_num = I2S_SCK_PIN;
+  pin_config.ws_io_num = I2S_WS_PIN;
+  pin_config.data_out_num = I2S_PIN_NO_CHANGE;
+  pin_config.data_in_num = I2S_SD_PIN;
 
-  err = i2s_channel_init_std_mode(inmp441RxHandle, &std_cfg);
+  err = i2s_set_pin((i2s_port_t)I2S_PORT, &pin_config);
   if (err != ESP_OK) {
-    i2s_del_channel(inmp441RxHandle);
-    inmp441RxHandle = NULL;
-    engMsgf("INMP441: i2s_channel_init_std_mode failed (%d)", (int)err);
+    i2s_driver_uninstall((i2s_port_t)I2S_PORT);
+    engMsgf("INMP441: i2s_set_pin failed (%d)", (int)err);
     return false;
   }
 
-  err = i2s_channel_enable(inmp441RxHandle);
-  if (err != ESP_OK) {
-    i2s_del_channel(inmp441RxHandle);
-    inmp441RxHandle = NULL;
-    engMsgf("INMP441: i2s_channel_enable failed (%d)", (int)err);
-    return false;
-  }
-
+  i2s_zero_dma_buffer((i2s_port_t)I2S_PORT);
   inmp441Initialized = true;
-  engMsg("INMP441: I2S mic OK (Arduino-ESP32 3.x / ESP-IDF 5.x standard driver, stereo-slot capture)");
+  engMsg("INMP441: I2S mic OK (legacy 2.0.17 driver, stereo-slot capture)");
   return true;
 }
 
@@ -3855,9 +3824,9 @@ float readINMP441_dB()
   inmpLastReadHadData = false;
   if (!inmp441Initialized) return SENSOR_UNAVAILABLE;
 
-  esp_err_t err = i2s_channel_read(inmp441RxHandle,
-                                   samples, sizeof(samples), &bytes_read,
-                                   pdMS_TO_TICKS(50));
+  esp_err_t err = i2s_read((i2s_port_t)I2S_PORT,
+                           samples, sizeof(samples), &bytes_read,
+                           pdMS_TO_TICKS(50));
   if (err != ESP_OK) return SENSOR_UNAVAILABLE;
 
   int total = bytes_read / sizeof(int32_t);
@@ -4803,7 +4772,6 @@ void sensorTask(void* pvParam)
   // Subscribe the sensor task to the ESP task watchdog. The task feeds it only
   // after a complete sensor cycle, so a genuinely stuck sensor/I2C operation
   // can no longer leave the station silently wedged for an unlimited time.
-  // The subscription/feed API itself is unchanged in ESP-IDF 5.x.
   esp_err_t wdtResult = esp_task_wdt_add(NULL);
   if (wdtResult != ESP_OK && wdtResult != ESP_ERR_INVALID_STATE) {
     Serial.printf("[WATCHDOG] sensorTask registration failed: %d\n", (int)wdtResult);
@@ -5322,47 +5290,61 @@ void ledcGiveLock()
   if (ledcMutex != NULL) xSemaphoreGive(ledcMutex);
 }
 
-// Arduino-ESP32 3.x LEDC wrappers.
-// Keep the application-level pin-based wrapper names unchanged so the buzzer
-// and CO state machines remain byte-for-byte equivalent at their call sites.
-// Explicit channels 0 and 8 are retained: on the original ESP32 these are in
-// different LEDC groups, preserving independent frequency changes.
+// ESP32 Arduino core 2.0.17 LEDC compatibility wrappers.
+// Core 3.x changed the LEDC API from channel-based functions to pin-based
+// functions. The production firmware uses these wrappers everywhere, so keep
+// the application logic unchanged and translate it back to the 2.x API here.
 bool ledcAttachSafe(uint8_t pin, uint32_t freq, uint8_t resolution)
 {
   int channel = (pin == buzzPin) ? LEDC_CHANNEL_BUZZER : LEDC_CHANNEL_CO;
-  return ledcAttachChannelSafe(pin, freq, resolution, channel);
+  if (!ledcTakeLock()) return false;
+  double actual = ledcSetup(channel, freq, resolution);
+  if (actual <= 0) {
+    ledcGiveLock();
+    return false;
+  }
+  ledcAttachPin(pin, channel);
+  ledcGiveLock();
+  return true;
 }
 
 bool ledcAttachChannelSafe(uint8_t pin, uint32_t freq, uint8_t resolution, int8_t channel)
 {
   if (!ledcTakeLock()) return false;
-  bool ok = ledcAttachChannel(pin, freq, resolution, channel);
+  double actual = ledcSetup(channel, freq, resolution);
+  if (actual <= 0) {
+    ledcGiveLock();
+    return false;
+  }
+  ledcAttachPin(pin, channel);
   ledcGiveLock();
-  return ok;
+  return true;
 }
 
 bool ledcChangeFrequencySafe(uint8_t pin, uint32_t freq, uint8_t resolution)
 {
+  int channel = (pin == buzzPin) ? LEDC_CHANNEL_BUZZER : LEDC_CHANNEL_CO;
   if (!ledcTakeLock()) return false;
-  uint32_t actual = ledcChangeFrequency(pin, freq, resolution);
+  double actual = ledcSetup(channel, freq, resolution);
   ledcGiveLock();
-  return actual != 0;
+  return actual > 0;
 }
 
 bool ledcWriteSafe(uint8_t pin, uint32_t duty)
 {
+  int channel = (pin == buzzPin) ? LEDC_CHANNEL_BUZZER : LEDC_CHANNEL_CO;
   if (!ledcTakeLock()) return false;
-  bool ok = ledcWrite(pin, duty);
+  ledcWrite(channel, duty);
   ledcGiveLock();
-  return ok;
+  return true;
 }
 
 bool ledcDetachSafe(uint8_t pin)
 {
   if (!ledcTakeLock()) return false;
-  bool ok = ledcDetach(pin);
+  ledcDetachPin(pin);
   ledcGiveLock();
-  return ok;
+  return true;
 }
 
 // v3.9.23 WiFi fault/event diagnostics and bounded recovery.
@@ -5876,7 +5858,7 @@ void setup()
                 CONNECTION_MODE == 0 ? "BOUNDED (raw non-blocking)" : "SIMPLE (BlynkSimpleEsp32)");
   Serial.printf("[INIT] Blynk timeout: %lums, heartbeat: %us, forced-refresh: OFF\n",
                 (unsigned long)BLYNK_TIMEOUT_MS, (unsigned)BLYNK_HEARTBEAT);
-  Serial.printf("\n[INIT] Air Quality Station ESP32 v3.9.52 — Arduino core %s — GPS 115200 baud + 10Hz config\n", ESP_ARDUINO_VERSION_STR);
+  Serial.println("\n[INIT] Air Quality Station ESP32 v3.9.33 — Arduino core 2.0.17 — GPS 115200 baud + 10Hz config");
   Serial.printf("[INIT] ten_mins_autoreset = %s\n", ten_mins_autoreset ? "ON":"OFF");
   Serial.printf("[INIT] DEBUGON = %s\n", DEBUGON ? "ON" : "OFF");
 
@@ -5890,20 +5872,14 @@ void setup()
   rtcReportPreviousCheckpoint();
 
   // ── Explicit ESP task-watchdog configuration ─────────────────────────────
-  // Arduino-ESP32 3.x / ESP-IDF 5.x changed esp_task_wdt_init() to accept
-  // esp_task_wdt_config_t. Preserve the previous 10-second + panic intent.
-  esp_task_wdt_config_t wdtConfig = {
-    .timeout_ms = 10000,
-    .idle_core_mask = (1U << 0) | (1U << 1),
-    .trigger_panic = true
-  };
-  esp_err_t wdtResult = esp_task_wdt_init(&wdtConfig);
+  // ESP32 Arduino core 2.0.17 uses the older task-WDT API.  Keep the same
+  // 10-second watchdog intent as the newer firmware, but use the API exposed
+  // by the 2.x ESP-IDF underneath the Arduino core.
+  esp_err_t wdtResult = esp_task_wdt_init(10, true);
   if (wdtResult == ESP_ERR_INVALID_STATE) {
-    // Arduino may already have initialized the TWDT. Reconfigure it rather
-    // than silently accepting a different default timeout.
-    wdtResult = esp_task_wdt_reconfigure(&wdtConfig);
+    wdtResult = ESP_OK;  // already initialized by the Arduino core
   }
-  Serial.printf("[WATCHDOG] core-3.x task-WDT config: %s (%d), timeout=10s\n",
+  Serial.printf("[WATCHDOG] core-2.x task-WDT config: %s (%d), timeout=10s\n",
                 wdtResult == ESP_OK ? "OK" : "ERROR", (int)wdtResult);
 
   uint8_t mac[6];
@@ -5981,10 +5957,16 @@ void setup()
   pinMode(UV_REF_PIN,   INPUT);
   pinMode(DUST_ADC_PIN, INPUT);
 
-  // ── ADC configuration ─────────────────────────────────────────────────────
-  // Keep the existing per-pin attenuation calls. They are the current Arduino
-  // 3.x API and avoid the old global attenuation path that was problematic when
-  // this project still used the legacy I2S driver.
+  // ── ADC MUST be configured BEFORE I2S driver install ─────────────────────
+  // On ESP32 Arduino core 3.x, analogSetAttenuation() internally uses the
+  // new adc_oneshot driver (driver_ng). The legacy I2S driver installs its
+  // own ADC handle. When both run, the firmware aborts with:
+  //   E (322) ADC: CONFLICT! driver_ng is not allowed to be used with the legacy driver
+  //
+  // Fix: use analogReadResolution() + analogSetPinAttenuation() per ADC pin
+  // instead of the global analogSetAttenuation(). Per-pin calls do NOT
+  // touch driver_ng and are safe alongside the legacy I2S driver.
+  // ALSO: I2S is installed LAST in setup() so ADC is fully initialised first.
   analogReadResolution(12);
   // Set 0–3.3V range (ADC_11db) individually on every ADC1 pin we use.
   // Do NOT call analogSetAttenuation() — it conflicts with I2S legacy driver.
@@ -5993,7 +5975,7 @@ void setup()
   analogSetPinAttenuation(UV_OUT_PIN,   ADC_11db);
   analogSetPinAttenuation(UV_REF_PIN,   ADC_11db);
   analogSetPinAttenuation(DUST_ADC_PIN, ADC_11db);
-  Serial.println("[INIT] ADC configured (12-bit, per-pin 11dB)");
+  Serial.println("[INIT] ADC configured (12-bit, per-pin 11dB — no driver_ng conflict)");
 
   // ── I2C for ENS160+AHT2x+BMI160 ──────────────────────────────────────────
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);  // SDA=GPIO21, SCL=GPIO22
@@ -6063,9 +6045,12 @@ void setup()
 
   randomSeed(analogRead(0));
 
-  // ── INMP441 I2S ───────────────────────────────────────────────────────────
-  // Arduino-ESP32 3.x uses the ESP-IDF 5.x standard I2S driver. It is independent
-  // of the ADC driver, so the old legacy-I2S ordering restriction no longer applies.
+  // ── INMP441 I2S — installed LAST, AFTER ADC configuration ────────────────
+  // This ordering is critical. i2s_driver_install() and analogRead() use
+  // different internal ADC driver layers. Installing I2S before configuring
+  // ADC with the legacy API causes the driver_ng conflict error.
+  // Keep legacy I2S installation AFTER all ADC configuration.  This is the
+  // safest ordering for Arduino-ESP32 2.0.17, which uses the legacy I2S driver.
   if (INMPsensorThere) initINMP441();
 
   // ── Launch PPS LED task ───────────────────────────────────────────────────
