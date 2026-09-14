@@ -42,6 +42,7 @@ import re
 import gzip
 import queue
 import threading
+import time
 import webbrowser
 from datetime import datetime, timedelta
 
@@ -88,6 +89,14 @@ FAST_POLL_MS = 5000          # matches FAST telemetry tier on the ESP32
 GRAPH_REFRESH_MS = 60000     # how often the 4 history graphs re-fetch
 HTTP_TIMEOUT_S = 4
 
+# V4 is a rolling diagnostic/telemetry counter sent by the ESP32.
+# Blynk can keep returning cached virtual-pin values after hardware disconnects,
+# so a changing V4 value is used as an additional proof that live telemetry is
+# still arriving. Allow a little more than two 5-second polling intervals.
+LIVE_TELEM_PIN = 4
+LIVE_TELEM_TIMEOUT_S = 20.0
+STARTUP_ONLINE_GRACE_S = 20.0
+
 UNAVAILABLE_THRESHOLD = -998.0   # firmware uses -999.0f as SENSOR_UNAVAILABLE
 
 # ============================================================
@@ -102,6 +111,8 @@ SENSOR_PINS = {
     "co_ppm": 2, "co_phase": 6, "co_raw": 7, "co_heater_v": 25,
     "humidity": 15, "temperature": 16,
     "sound_db": 1, "uvi": 3, "tvoc": 5, "dust": 18, "eco2": 23, "aqi": 24,
+    # RSSI/quality are useful only while the ESP32 connection is live.
+    # Blynk may return their last cached values after disconnect.
     "rssi": 21, "wifi_qual": 22,
 }
 
@@ -189,8 +200,52 @@ FONT_SMALL = ("Segoe UI", 10)
 # ============================================================
 # BLYNK HTTP API
 # ============================================================
+# IMPORTANT: Blynk virtual-pin GETs return the server's last known value.
+# They are therefore NOT a valid hardware-online test.  The dashboard uses
+# isHardwareConnected for the CONNECTED/OFFLINE indicator and last-connection
+# timestamp.  The legacy endpoint is tried first; the external API form is
+# also supported for Blynk installations that expose it.
+
 
 _session = requests.Session()
+
+
+def is_device_connected():
+    """Return True/False when Blynk can answer, or None if the endpoint
+    is unavailable/unsupported.
+
+    The local/legacy Blynk server supports:
+        /<auth>/isHardwareConnected
+
+    Some server builds do not expose the endpoint reliably.  In that case
+    the telemetry heartbeat in the poll worker is used as the fallback.
+    """
+    urls = [
+        f"http://{BLYNK_SERVER}:{BLYNK_PORT}/{BLYNK_AUTH}/isHardwareConnected",
+        f"http://{BLYNK_SERVER}:{BLYNK_PORT}/external/api/isHardwareConnected"
+        f"?token={BLYNK_AUTH}",
+    ]
+
+    got_valid_response = False
+
+    for url in urls:
+        try:
+            r = _session.get(url, timeout=HTTP_TIMEOUT_S)
+            if r.status_code != 200:
+                continue
+
+            result = r.text.strip().strip('"').lower()
+            if result in ("true", "1", "yes"):
+                return True
+            if result in ("false", "0", "no"):
+                got_valid_response = True
+                return False
+        except Exception:
+            continue
+
+    # None means "the status endpoint could not be used", not "offline".
+    # This distinction lets the telemetry heartbeat act as a fallback.
+    return False if got_valid_response else None
 
 
 def read_pin(pin):
@@ -321,7 +376,7 @@ label_wifi = ctk.CTkLabel(status_wrap, text="📶  WiFi: —", font=FONT_LABEL,
                            text_color=TXT_DIM)
 label_wifi.pack(side="left", padx=(0, 16))
 
-label_last_update = ctk.CTkLabel(status_wrap, text="Last update: —",
+label_last_update = ctk.CTkLabel(status_wrap, text="Last live data: —",
                                   font=FONT_LABEL, text_color=TXT_DIM)
 label_last_update.pack(side="left")
 
@@ -789,25 +844,182 @@ def _apply_graph_data(results, hours):
 
 _result_queue = queue.Queue()
 
+# Shared live-data watchdog.  This is deliberately separate from the GUI
+# thread so the dashboard can keep rendering values even if a status endpoint
+# is unavailable.
+_activity_lock = threading.Lock()
+_last_data_signature = None
+_last_data_activity = None
+_have_data_sample = False
 
-def _poll_worker():
+
+def _poll_data_worker():
+    """Read all dashboard datastreams exactly as before.
+
+    This worker is deliberately independent of the connection-status check.
+    A broken/unsupported Blynk connection-status endpoint must never prevent
+    sensor values from reaching the dashboard.
+    """
+    global _last_data_signature, _last_data_activity, _have_data_sample
+
     while True:
         values = {}
         for name, pin in ALL_READ_PINS.items():
             values[name] = read_pin(pin)
-        _result_queue.put(values)
+
+        # Any changing datastream proves that fresh data is reaching the
+        # dashboard. This is a fallback for firmware versions where the
+        # dedicated heartbeat pins are not changing.
+        signature = tuple(
+            (name, values.get(name))
+            for name in sorted(values)
+            if values.get(name) is not None
+        )
+        now = time.monotonic()
+
+        with _activity_lock:
+            if _last_data_signature is None:
+                _last_data_signature = signature
+                _have_data_sample = bool(signature)
+            elif signature != _last_data_signature:
+                _last_data_signature = signature
+                _last_data_activity = now
+                _have_data_sample = True
+
+        _result_queue.put(("data", values))
         threading.Event().wait(FAST_POLL_MS / 1000.0)
+
+
+def _parse_blynk_bool(text):
+    """Parse plain, quoted, or JSON-ish Blynk boolean responses."""
+    if text is None:
+        return None
+    s = str(text).strip().strip('"').strip("'").strip()
+    # Legacy servers may wrap the scalar in a one-item JSON array.
+    if s.startswith("[") and s.endswith("]"):
+        s = s[1:-1].strip().strip('"').strip("'").strip()
+    s = s.lower()
+    if s in ("true", "1", "yes", "online"):
+        return True
+    if s in ("false", "0", "no", "offline"):
+        return False
+    return None
+
+
+def _status_endpoint():
+    """Try the local Blynk hardware-status endpoint without blocking data."""
+    urls = (
+        f"http://{BLYNK_SERVER}:{BLYNK_PORT}/{BLYNK_AUTH}/isHardwareConnected",
+        f"http://{BLYNK_SERVER}:{BLYNK_PORT}/external/api/isHardwareConnected"
+        f"?token={BLYNK_AUTH}",
+    )
+    for url in urls:
+        try:
+            r = _session.get(url, timeout=1.5)
+            if r.status_code == 200:
+                result = _parse_blynk_bool(r.text)
+                if result is not None:
+                    return result
+        except Exception:
+            pass
+    return None
+
+
+def _poll_status_worker():
+    """Track real device liveness independently from sensor-value polling.
+
+    Blynk can return cached V-pin values after a device disconnects.  Therefore
+    a changing firmware heartbeat is used as the watchdog.  The Blynk hardware
+    status endpoint is also used when it gives a valid answer, but it can never
+    stop or delay the normal sensor polling worker.
+    """
+    heartbeat_pins = (
+        ("app_telem_rnd", APP_TELEM_RND_PIN),  # V4: App/Telem RND# Alive
+        ("pps_count", DIAG_PINS["pps_count"]),  # V35
+        ("rtc_checkpoint", DIAG_PINS["rtc_checkpoint"]),  # V51
+        ("pps_age_ms", DIAG_PINS["pps_age_ms"]),  # V36
+    )
+
+    previous = {}
+    last_heartbeat_change = None
+    have_heartbeat = False
+    started = time.monotonic()
+
+    while True:
+        now = time.monotonic()
+
+        current = {}
+        for name, pin in heartbeat_pins:
+            current[name] = read_pin(pin)
+
+        changed = False
+        for name, value in current.items():
+            if value is None:
+                continue
+            if name in previous and value != previous[name]:
+                changed = True
+            previous[name] = value
+
+        if changed:
+            last_heartbeat_change = now
+            have_heartbeat = True
+
+        # Ask Blynk separately. A valid TRUE is immediate evidence of a live
+        # hardware connection. A valid FALSE is only accepted after the
+        # heartbeat has also been quiet, because some local/legacy builds can
+        # disagree with the app about connection state.
+        blynk_state = _status_endpoint()
+
+        heartbeat_fresh = (
+            have_heartbeat
+            and last_heartbeat_change is not None
+            and (now - last_heartbeat_change) <= LIVE_TELEM_TIMEOUT_S
+        )
+
+        with _activity_lock:
+            data_fresh = (
+                _last_data_activity is not None
+                and (now - _last_data_activity) <= LIVE_TELEM_TIMEOUT_S
+            )
+            data_sample_seen = _have_data_sample
+
+        startup_grace = (now - started) <= STARTUP_ONLINE_GRACE_S
+
+        if heartbeat_fresh or data_fresh:
+            # Freshly changing telemetry is definitive evidence that the ESP32
+            # is still publishing, even if the local Blynk status endpoint is
+            # unavailable or reports a stale state.
+            device_connected = True
+        elif startup_grace and (blynk_state is True or data_sample_seen):
+            # Give a newly started station a short grace period while the first
+            # changing heartbeat/telemetry value is being observed.
+            device_connected = True
+        else:
+            # A cached Blynk value and a stale isHardwareConnected=True must
+            # NOT keep the dashboard green after the ESP32 is powered off.
+            device_connected = False
+
+        _result_queue.put(("status", device_connected))
+        threading.Event().wait(FAST_POLL_MS / 1000.0)
+
+
+def _poll_worker():
+    """Start independent data and connection workers."""
+    threading.Thread(target=_poll_data_worker, daemon=True).start()
+    threading.Thread(target=_poll_status_worker, daemon=True).start()
 
 
 def _poll_queue():
     try:
         while True:
-            values = _result_queue.get_nowait()
-            _apply_values(values)
+            kind, payload = _result_queue.get_nowait()
+            if kind == "data":
+                _apply_values(payload)
+            elif kind == "status":
+                _apply_connection_status(payload)
     except queue.Empty:
         pass
     app.after(200, _poll_queue)
-
 
 def _as_float(values, key):
     v = values.get(key)
@@ -817,22 +1029,41 @@ def _as_float(values, key):
         return None
 
 
-def _apply_values(values):
-    connected = values.get("temperature") is not None or values.get("co_ppm") is not None
+_device_connected = False
+_last_values = {}
 
-    if connected:
+
+def _apply_connection_status(device_connected):
+    """Update only the connection/WiFi status widgets."""
+    global _device_connected
+    _device_connected = bool(device_connected)
+
+    if _device_connected:
         label_status.configure(text="⬤  CONNECTED", text_color=GREEN)
-        label_last_update.configure(text=f"Last update: {datetime.now().strftime('%H:%M:%S')}")
+        label_last_update.configure(
+            text=f"Last live data: {datetime.now().strftime('%H:%M:%S')}"
+        )
     else:
         label_status.configure(text="⬤  OFFLINE", text_color=RED)
+        label_wifi.configure(text="📶  WiFi: OFFLINE", text_color=RED)
 
+
+def _apply_values(values):
+    global _last_values
+    _last_values = values
+
+    # Connection state is maintained separately. Never infer it from cached
+    # virtual-pin values.
     rssi = _as_float(values, "rssi")
-    if rssi is not None and rssi > UNAVAILABLE_THRESHOLD:
-        quality = rssi_to_quality(int(rssi))
-        label_wifi.configure(text=f"📶  {int(rssi)} dBm ({quality}%)",
-                              text_color=wifi_color_for(quality))
+    if _device_connected:
+        if rssi is not None and rssi > UNAVAILABLE_THRESHOLD:
+            quality = rssi_to_quality(int(rssi))
+            label_wifi.configure(text=f"📶  {int(rssi)} dBm ({quality}%)",
+                                  text_color=wifi_color_for(quality))
+        else:
+            label_wifi.configure(text="📶  WiFi: —", text_color=AMBER)
     else:
-        label_wifi.configure(text="📶  WiFi: —", text_color=TXT_DIM)
+        label_wifi.configure(text="📶  WiFi: OFFLINE", text_color=RED)
 
     # ---- GPS ----
     v_gps_lat.configure(text=fmt(values.get("lat"), decimals=6))

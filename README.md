@@ -4,7 +4,7 @@
 > sound, temperature, humidity, and orientation — with live GPS coordinates
 > streaming to a self-hosted Blynk dashboard for real-time air-quality mapping.*
 
-**ESP32 · FreeRTOS dual-core · Blynk 0.6.1 local server · ATGM336H GPS · 8 sensing subsystems**
+**ESP32 · Arduino-ESP32 Core 3.3.11 · FreeRTOS dual-core · Blynk 0.6.1 local server · ATGM336H GPS · 8 sensing subsystems**
 
 ---
 
@@ -12,7 +12,7 @@
 
 1. [The story](#the-story)
 2. [Sensor suite](#sensor-suite)
-3. [Latest update to v3.7](#latest-update-to-v37)
+3. [Latest firmware update — v3.9.52 / Core 3.3.11](#latest-firmware-update--v3952--core-3311)
 4. [Why the hardware changed](#why-the-hardware-changed)
 5. [Pin mapping](#pin-mapping)
 6. [Wiring and voltage dividers](#wiring-and-voltage-dividers)
@@ -22,12 +22,13 @@
 10. [IMU protocol](#imu-protocol)
 11. [Fault detection and engineering messages](#fault-detection-and-engineering-messages)
 12. [Blynk setup](#blynk-setup)
-13. [Configuration reference](#configuration-reference)
-14. [Required libraries](#required-libraries)
-15. [Air quality mapping](#air-quality-mapping)
-16. [Known limitations and future work](#known-limitations-and-future-work)
-17. [System Health Diagnostics](#system-health-diagnostics)
-18. [V55 remote hard reset](#v55-remote-hard-reset)
+13. [V55 remote hard reset](#v55-remote-hard-reset)
+14. [Blynk server systemd service](#blynk-server-systemd-service)
+15. [Configuration reference](#configuration-reference)
+16. [Required libraries](#required-libraries)
+17. [Air quality mapping](#air-quality-mapping)
+18. [Known limitations and future work](#known-limitations-and-future-work)
+19. [System Health Diagnostics](#system-health-diagnostics)
 
 ---
 
@@ -107,66 +108,154 @@ on local home infrastructure. No data leaves the local network.
 
 ---
 
-## Latest update to v3.7
+## Latest firmware update — v3.9.52 / Core 3.3.11
 
-The current firmware (`AirQualityOutdoor_ESP32_Blynk(5).ino`) adds the following long-term reliability and diagnostic features while preserving the existing sensor, GPS, INAV, CO, Blynk, WiFi, display, LED, buzzer, and status logic:
+The current sketch is:
 
-* Added ESP32 reset-cause diagnostics at startup using `esp_reset_reason()`.
-* Added **Blynk V34** for the human-readable ESP32 reset reason. V34 is a boot diagnostic, not a live sensor-health value.
-* Added explicit ESP32 task-watchdog configuration with a **10-second timeout**.
-* The sensor task is explicitly registered with the task watchdog and feeds it **only after a complete sensor cycle**.
-* Added a sensor-task heartbeat counter and health monitoring for a task that is alive but stops completing its work cycle.
-* Added asynchronous, non-blocking buzzer tones and a three-step buzzer pattern state machine; the existing buzzer calls remain compatible.
-* Added persistent health monitoring and recovery reporting for INMP441, UV, and dust sensors.
-* Added `SENSOR_UNAVAILABLE` handling for persistent invalid/no-data conditions so failed sensors do not silently produce plausible measurements.
-* Added bounded I²C timeout (`Wire.setTimeOut(50)`) and sensor retry behaviour.
-* Added non-blocking WiFi association/reconnect handling and bounded Blynk server probing/handshake handling.
-* Preserved the GPS PPS interrupt and dedicated PPS LED task: every received PPS event produces a fixed **250 ms** pulse on the ESP32 board's D2/GPIO2 LED.
-* Preserved the BMI160-based INAV EKF and the GPS-loss states `NO_FIX_YET`, `GPS_FIX`, `IMU_RECENT`, `IMU_STALE`, and `LOST`.
+`AirQualityOutdoor_ESP32_Blynk_v3.9.52_ATGM336_PCAS_GPS_Core3.3.11.ino`
 
-### Reliability update: V55 and bounded ENS160 I²C handling
+It is specifically migrated for **Arduino-ESP32 Core 3.3.11**. The migration is intentionally minimal: application behaviour, sensor logic, pins, timing, GPS policy, Blynk transport, WiFi recovery, I²C recovery, INAV, diagnostics, and scheduling are preserved. Only APIs that changed between Arduino-ESP32 2.x and 3.x were migrated.
 
-The later reliability work added two important changes beyond the original v3.7
-description:
+### Arduino-ESP32 Core 3.3.11 requirements
 
-* **V55 remote hard reset:** a Blynk V55 Button requests a direct `esp_restart()`.
-  Interrupts remain enabled during the restart sequence to avoid an Interrupt-WDT
-  failure.
-* **ENS160 measurement wait is bounded:** the ScioSense ENS160 `measure(true)` and
-  `measureRaw(true)` calls can poll indefinitely while waiting for new sensor data.
-  The updated firmware uses `measure(false)` inside a **1.5 s deadline**, feeding the
-  task watchdog and yielding during the wait. The raw measurement uses
-  `measureRaw(false)` so it cannot reintroduce the unbounded wait.
-* **I²C transaction timeout remains 50 ms:** `Wire.setTimeOut(50)` bounds individual
-  low-level I²C transactions. This is separate from the 1.5 s ENS160 measurement
-  deadline: the former limits one I²C operation, while the latter limits the sensor
-  driver's repeated status polling.
-* **I²C diagnostics V45–V50** record the last I²C device/operation, cumulative I²C
-  errors, and retained maximum timings for the AHT21, ENS160, and BMI160 paths.
+- Install **ESP32 by Espressif Systems / Arduino-ESP32 Core 3.3.11**.
+- Do **not** compile this sketch with the old Core 2.0.17 package.
+- The sketch contains a compile-time guard that rejects Arduino-ESP32 versions below 3.3.x.
+- Core 3.3.x uses the ESP-IDF 5.x driver/API generation required by this sketch.
 
-This distinction matters because a watchdog backtrace previously showed the sensor
-task inside the ENS160 I²C path (`ENS160.measure()` → `Wire.endTransmission()`).
-The bounded measurement logic prevents the ENS160 driver's repeated new-data polling
-from holding the sensor task indefinitely.
+### Core 3.x API migrations
 
-### Software Reset
+**LEDC / PWM**
 
-* **V55** is the software reset command from the Blynk app.
+The old 2.x channel-first API was removed in Core 3.x. The sketch now uses the pin-based 3.x API:
 
-The device can be onw reset by pressing the reset button on the board or by sending a reset command from the Blynk app (via `V55`). 
+- `ledcAttachChannel()`
+- `ledcChangeFrequency(pin, ...)`
+- `ledcWrite(pin, duty)`
+- `ledcDetach(pin)`
 
-### Important diagnostic distinction
+The original explicit LEDC channel separation is retained:
 
-* **V4** is the changing application/telemetry diagnostic value.
-* **V19** is the latest human-readable engineering/status message generated during operation.
-* **V20** is the live subsystem-status bitmask.
-* **V26** is GPS PPS lock (`0`/`1`).
-* **V27** is the INAV state (`0`–`4`).
-* **V34** is the ESP32 **reset cause from the most recent boot**.
-* **V35–V50** are performance/I²C diagnostics (PPS count/age, retained-max timings, last I²C device/operation, I²C error count) for tracking down stalls.
-* **V51** is the last I²C error code (from `Wire.endTransmission()`) which confirms two FreeRTOS tasks (`sensorTask` pinned to Core 0 and `ppsLedTask` pinned to Core 1).
+- **Channel 0 / group 0:** MQ-7 CO heater PWM
+- **Channel 8 / group 1:** buzzer
 
----
+LEDC access is protected by the existing cross-core mutex because the CO heater is serviced by the sensor task while the buzzer is serviced from the application side.
+
+**INMP441 / I²S**
+
+The microphone was migrated from the legacy `driver/i2s.h` API to the **ESP-IDF 5.x standard I²S driver**:
+
+`driver/i2s_std.h`
+
+The electrical configuration is unchanged:
+
+- BCLK GPIO25
+- WS/LRCLK GPIO26
+- DATA GPIO33
+- 16 kHz
+- 32-bit stereo capture
+
+The existing two-slot RMS processing is retained. This migration is important because the old legacy I²S driver could conflict with the modern ADC driver used by Arduino-ESP32 3.x. The standard I²S driver avoids that legacy-driver/ADC collision.
+
+**Task watchdog**
+
+The old Core-2.x call:
+
+`esp_task_wdt_init(10, true)`
+
+was migrated to the Core-3.x / ESP-IDF 5.x `esp_task_wdt_config_t` API while retaining:
+
+- 10-second timeout
+- panic/reset action
+- explicit sensor-task watchdog subscription
+- watchdog feed only after a completed sensor cycle
+
+### GPS — ATGM336H / AT6558 PCAS configuration
+
+The GPS is **not configured with PMTK commands** in the current firmware. Field testing showed that this ATGM336H/AT6558 receiver responds to the **PCAS** command family instead.
+
+The firmware uses:
+
+- `PCAS03` — NMEA sentence selection
+- `PCAS01` — UART baud rate
+- `PCAS02` — update interval
+- `PCAS00` — save configuration to flash
+
+The intended persistent configuration is:
+
+- **115200 baud**
+- **10 Hz / 100 ms update interval**
+- **GGA + RMC only**
+
+The checksums used by the sketch are:
+
+```text
+PCAS03,1,0,0,0,1,0,0,0*02
+PCAS01,5*19
+PCAS02,100*1E
+PCAS00*01
+```
+
+The `PCAS02,100` checksum is deliberately `*1E`; a reference that lists `*1D` for that exact command is incorrect under the standard XOR checksum calculation.
+
+### GPS persistence policy — important
+
+The firmware deliberately avoids unnecessary flash writes.
+
+1. GPS auto-baud detection runs at startup.
+2. If the GPS is detected at **9600 baud**, it is treated as the known factory/default state and the firmware performs the migration:
+   - reduce NMEA output to GGA+RMC,
+   - request 115200 with `PCAS01`,
+   - verify real NMEA reception at 115200,
+   - request 10 Hz with `PCAS02`,
+   - save once with `PCAS00`.
+3. If the GPS is detected at **any baud above 9600**, it is treated as already configured:
+   - no `PCAS03`,
+   - no `PCAS01`,
+   - no `PCAS02`,
+   - **no `PCAS00`**.
+4. If the 9600 → 115200 migration cannot be verified, the firmware falls back to the confirmed working baud and **does not save** the incomplete configuration.
+5. An unexpected baud below 9600 is left untouched rather than being reconfigured blindly.
+
+This means `PCAS00` is a one-time persistence operation for the deliberate 9600 → 115200 + 10 Hz migration, not a flash write on every ESP32 boot.
+
+### GPS UART and PPS
+
+The ATGM336H is connected as:
+
+- GPS TX → ESP32 GPIO13 (UART1 RX)
+- ESP32 GPIO23 (UART1 TX) → GPS RX
+- GPS 1PPS → GPIO5
+
+The UART RX buffer is enlarged before `begin()` to tolerate bursts of NMEA traffic while the sensor task is busy.
+
+PPS remains independent of the NMEA stream. The PPS interrupt records the event/timing state and the dedicated PPS task generates one fixed **250 ms pulse** on the ESP32 board D2/GPIO2 LED for each PPS event.
+
+**V26** reports PPS lock; the LED is event-driven and does not remain continuously ON merely because PPS is locked.
+
+### Existing reliability fixes retained in v3.9.52
+
+The Core-3.3.11 migration does not remove the reliability work developed in the earlier firmware versions:
+
+- reset-cause diagnostics via V34
+- sensor-task heartbeat
+- explicit task watchdog
+- bounded I²C transactions
+- bounded ENS160 measurement waiting
+- I²C recovery and diagnostics
+- BMI160 health monitoring
+- INMP441/UV/dust persistent fault detection and recovery reporting
+- non-blocking WiFi reconnect state machine
+- disabled duplicate WiFi auto-reconnect
+- bounded/non-blocking Blynk TCP probing
+- raw non-blocking Blynk transport
+- Blynk TX pacing and post-reconnect grace period
+- Blynk transport diagnostics
+- conservative INAV GPS-loss/dead-reckoning state machine
+- asynchronous buzzer state machine
+- V55 remote `esp_restart()` recovery
+
+See the detailed historical changelog inside the `.ino` for the reasoning and field evidence behind these changes.
 
 ## Why the hardware changed
 
@@ -175,7 +264,7 @@ The device can be onw reset by pressing the reset button on the board or by send
 | Single `loop()` — all subsystems compete for time | Two FreeRTOS tasks pinned to separate cores |
 | Separate ESP8266 WiFi module on UART3 | Built-in WiFi — external module removed entirely |
 | 10-bit ADC at 5 V | 12-bit ADC at 3.3 V (ADC1 only with WiFi active) |
-| Timer2 registers for CO PWM — AVR-specific | LEDC peripheral — `ledcSetup()` / `ledcWrite()` |
+| Timer2 registers for CO PWM — AVR-specific | LEDC peripheral — Core 3.x pin-based API |
 | `serialEvent2()` ISR — no equivalent on ESP32 | Manual `pollIMU()` polling per sensor loop cycle |
 | `asm volatile("jmp 0")` watchdog reset | `ESP.restart()` — clean software reset on Xtensa |
 | No fault detection or telemetry | Per-subsystem watchdogs + engineering messages to Blynk V19 |
@@ -377,17 +466,26 @@ sensor — and the exponential moving average is not updated.
 
 ## GPS initialisation
 
-The current GPS is an **ATGM336H** using standard NMEA output at **115200 baud**.
-Auto-baud detection at startup, then configured via PMTK commands to:
-- 115200 baud (highest rate)
-- 10Hz update rate (100ms interval)
-- Only RMC and GGA NMEA sentences (reduced data load)
-TinyGPS++ parses the NMEA stream on Core 0.
+The current GPS is an **ATGM336H / AT6558** using NMEA output. The firmware auto-detects the working UART baud and then applies the PCAS policy described in the [Latest firmware update](#latest-firmware-update--v3952--core-3311).
 
-The GPS also supplies a **1PPS signal on GPIO5**. The PPS ISR records timing/event
-state only; a dedicated FreeRTOS task generates a fixed 250 ms pulse on the ESP32
-board's D2/GPIO2 LED. This makes the LED a direct visual indication that GPS PPS
-events are reaching the ESP32.
+The intended persistent configuration is:
+
+```text
+UART:      115200 baud
+Update:    10 Hz / 100 ms
+Sentences: GGA + RMC
+```
+
+**Do not replace the PCAS commands with PMTK commands.** The current receiver was field-tested and the working configuration path is PCAS-based.
+
+The firmware verifies a baud change using **real NMEA reception** at the new speed rather than relying on a PMTK-style ACK. `115201` may occasionally appear in diagnostic output when 115200 is configured; this is normal ESP32 UART clock-divider rounding and is not a separate GPS setting.
+
+### GPS auto-detection and persistence
+
+- **Detected 9600:** perform the controlled migration to 115200 + 10 Hz and save with PCAS00 only after successful verification.
+- **Detected >9600:** assume the GPS is already configured; leave it alone and do not issue PCAS configuration or save commands.
+- **Detected <9600 but not the expected 9600 state:** leave the receiver untouched.
+- **Migration verification failure:** return to the known working baud; do not issue PCAS00.
 
 ### PPS lock criteria
 
@@ -398,11 +496,9 @@ V26 reports PPS lock as:
 1 = locked
 ```
 
-A PPS lock requires a pulse within the last 2 seconds and a measured PPS interval
-between **0.900 s and 1.100 s**. The LED is event-driven: it does not remain on
-while PPS is locked.
+A PPS lock requires a pulse within the last 2 seconds and a measured PPS interval between **0.900 s and 1.100 s**.
 
----
+The LED is event-driven: every rising-edge PPS event produces a fixed **250 ms** D2/GPIO2 pulse. It does not stay on continuously while PPS is locked.
 
 ## IMU protocol
 
@@ -508,11 +604,11 @@ Serial and/or V19. They are event-driven rather than a fixed enumerated V34 list
 
 ```text
 [ENG] ESP reset reason: POWERON
-[ENG] Setup OK v3.7 — long-term reliability monitoring enabled
+[ENG] Setup OK v3.9.52 — Arduino-ESP32 Core 3.3.11
 [ENG] ENS160+AHT2x: OK
 [ENG] BMI160: init OK (±4g, ±500dps, 100Hz)
 [ENG] INMP441: I2S mic OK (new i2s_std driver, no ADC conflict)
-[ENG] GPS: ATGM336H NMEA 9600 baud — no init needed
+[ENG] GPS: ATGM336H NMEA/PCAS — auto-baud and persistence policy active
 [ENG] INAV: waiting for first GPS fix
 [ENG] INAV: position acquired by GPS
 [ENG] INAV: GPS gap — interpolating from recent GPS+IMU
@@ -705,6 +801,138 @@ unattended operation. It provides a way to restart the ESP32 remotely without
 physically pressing the reset button or removing power. It does not replace the task
 watchdog or sensor fault-recovery mechanisms.
 
+## Blynk server systemd service
+
+The station uses a **self-hosted Blynk 0.6.1 server** on the Raspberry Pi. The ESP32 firmware contains its own bounded/non-blocking Blynk recovery logic, but the server-side Java process must also be configured with enough memory and appropriate G1GC settings.
+
+Field diagnostics identified intermittent Blynk socket stalls as a **server-side JVM allocation/GC pressure issue**, not an ESP32 sensor or WiFi fault. The following `blynk.service` configuration was the server-side stability fix that was applied and field-confirmed.
+
+> Keep this unit in sync with the actual server deployment. The `server-0.41.18-java21.jar` filename must match the installed Blynk server JAR.
+
+```ini
+[Unit]
+Description=Blynk Server
+After=network-online.target
+Wants=network-online.target
+
+StartLimitIntervalSec=120
+StartLimitBurst=5
+# StartLimitAction=none means no additional action beyond the restart logic below.
+StartLimitAction=none
+
+[Service]
+Type=simple
+
+User=ptut
+WorkingDirectory=/opt/blynk
+
+ExecStart=/usr/bin/java \
+    -server \
+    -Xms128m \
+    -Xmx700m \
+    -Xss512k \
+    -XX:+UseG1GC \
+    -XX:G1HeapRegionSize=4m \
+    -XX:MaxGCPauseMillis=300 \
+    -XX:InitiatingHeapOccupancyPercent=45 \
+    -XX:+ExplicitGCInvokesConcurrent \
+    -XX:+UseStringDeduplication \
+    -XX:+ExitOnOutOfMemoryError \
+    -XX:NativeMemoryTracking=summary \
+    -Xlog:gc*:file=/opt/blynk/gc.log:time,uptime,level,tags:filecount=5,filesize=10M \
+    -Djava.security.egd=file:/dev/urandom \
+    --add-opens=java.base/java.lang=ALL-UNNAMED \
+    -jar /opt/blynk/server-0.41.18-java21.jar \
+    -dataFolder /opt/blynk
+
+Restart=always
+RestartSec=15
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=blynk
+# Prevent journal flooding from repeated log lines.
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=1000
+
+MemoryHigh=650M
+MemoryMax=800M
+MemorySwapMax=0
+# Lower OOM score = killed later. Kill Blynk before other critical services under memory pressure.
+OOMScoreAdjust=200
+TasksMax=128
+Nice=5
+
+# Hardening
+NoNewPrivileges=true
+# ProtectSystem=strict was previously "full"; strict is more restrictive.
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/blynk
+PrivateTmp=true
+
+# these added for security
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Why these Blynk server settings matter
+
+The important stability changes are:
+
+| Setting | Value | Purpose |
+|---|---:|---|
+| `-Xms` | 128 MB | Conservative initial Java heap |
+| `-Xmx` | 700 MB | More heap headroom than the previous 500 MB setting |
+| `G1HeapRegionSize` | 4 MB | Valid power-of-two G1 region size; reduces humongous-object pressure compared with the previous 3 MB setting |
+| `InitiatingHeapOccupancyPercent` | 45 | Makes G1 mixed-cycle initiation explicit |
+| `ExplicitGCInvokesConcurrent` | enabled | Avoids unnecessarily disruptive full-heap collection behaviour |
+| `UseStringDeduplication` | enabled | Reduces duplicate String memory |
+| `MaxGCPauseMillis` | 300 ms | Bounds the G1 pause target |
+| `MemoryHigh` | 650 MB | systemd memory-pressure threshold |
+| `MemoryMax` | 800 MB | Hard memory ceiling with headroom above `-Xmx` |
+| `MemorySwapMax` | 0 | Prevents Blynk from moving its memory workload into swap |
+| `Restart=always` | enabled | Restarts the service after an unexpected process exit |
+| `RestartSec` | 15 s | Avoids an immediate restart loop |
+| `OOMScoreAdjust` | 200 | Makes Blynk more expendable than services with a lower OOM score |
+| `TasksMax` | 128 | Limits process/thread count |
+| `Nice` | 5 | Gives the Blynk process a slightly lower CPU scheduling priority |
+| systemd hardening | enabled | Restricts unnecessary kernel/device/namespace capabilities |
+
+The earlier server-side tuning also used explicit `ConcGCThreads=1`, `ParallelGCThreads=4`, and `G1ReservePercent=15` during the investigation. The current unit above is the **actual unit supplied for the stabilized deployment**; do not add those older investigation flags unless deliberately testing another configuration.
+
+### Applying the service
+
+After changing the unit:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart blynk
+sudo systemctl status blynk
+```
+
+For live service logs:
+
+```bash
+journalctl -u blynk -f
+```
+
+For the G1GC log:
+
+```bash
+tail -f /opt/blynk/gc.log
+```
+
+The ESP32 firmware should continue to use the local Blynk server address and port defined in `secrets.h`; the current sketch calls `Blynk.config(BLYNK_AUTH, BLYNK_SERVER, BLYNK_PORT)` and deliberately avoids `Blynk.connect(timeout)` because the latter can block Core 1 long enough to trigger the ESP32 Interrupt WDT.
+
 ## Configuration reference
 
 ### Feature switches
@@ -775,8 +1003,7 @@ float sensor_reading_100_ppm_CO = -1;     // Optional: raw ADC at a known 100 pp
 
 ## Required libraries
 
-Install the following libraries compatible with the ESP32 Arduino core used to
-compile the firmware:
+Install **Arduino-ESP32 Core 3.3.11** first, then install the following libraries compatible with that core:
 
 | Library | Purpose |
 |---|---|
@@ -786,10 +1013,9 @@ compile the firmware:
 | **Adafruit AHTX0** | AHT20/AHT21 temperature/humidity driver |
 | **Adafruit SSD1306** | Optional OLED display |
 | **Adafruit GFX Library** | SSD1306 dependency |
+| **Arduino-ESP32 Core 3.3.11** | ESP32 board package, FreeRTOS, WiFi, UART, ADC, LEDC and ESP-IDF 5.x interfaces |
 
-The BMI160 driver and INMP441 I²S implementation are handled directly in the
-firmware using the ESP32 IDF/Arduino interfaces; no separate BMI160 library is
-required.
+The BMI160 driver is handled directly in the firmware using register-level I²C; no separate BMI160 library is required. The INMP441 uses the ESP-IDF 5.x standard I²S driver (`driver/i2s_std.h`) supplied by Arduino-ESP32 Core 3.3.11.
 
 ## Air quality mapping
 
@@ -808,6 +1034,11 @@ For deeper offline analysis, export the Blynk data CSV and import it into:
 ---
 
 ## Known limitations and future work
+
+### Core 3.3.11 compatibility
+
+This README and the current v3.9.52 sketch describe the **Arduino-ESP32 Core 3.3.11** build. Historical changelog entries inside the `.ino` may mention Core 2.0.17 and legacy APIs; those entries document previous investigation and are not instructions for the current build. The active v3.9.52 code uses the Core-3.x LEDC API, ESP-IDF 5.x standard I²S driver, and ESP-IDF 5.x task-WDT configuration.
+
 
 **MQ-7 humidity sensitivity**
 The MQ-7 resistance changes with ambient humidity and temperature. AHT2x data is
@@ -850,7 +1081,7 @@ heartbeat provide fault recovery without requiring periodic scheduled reboots.
 
 ---
 
-*Firmware: `AirQualityOutdoor_ESP32_Blynk` v3.9.5 · Credentials: `secrets.h` · Backend: self-hosted Blynk 0.6.1 local server*
+*Firmware: `AirQualityOutdoor_ESP32_Blynk` v3.9.52 · Arduino-ESP32 Core 3.3.11 · Credentials: `secrets.h` · Backend: self-hosted Blynk 0.6.1 local server*
 
 ---
 
