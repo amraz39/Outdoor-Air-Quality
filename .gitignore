@@ -8,6 +8,7 @@ backup/
 venv/
 .venv/
 *.h
+!BLYNK_LIB/src/**/*.h
 *.OLD
 *.ico
 *.pptx
@@ -25,6 +26,12 @@ MQ-7*.txt
 HOW_TO_*.txt
 .theia/
 *.BAD
+*.TEST
+*.BAK
 .gitignore
 *.lnk
 ESP32_TEST
+simulation
+library-backups/
+privkey.pem
+user.pem

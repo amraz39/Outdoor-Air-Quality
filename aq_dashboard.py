@@ -1,14 +1,21 @@
 # Outdoor Air Quality Station — ESP32 Dashboard for Windows PC
-# v1.0 — Companion dashboard for AirQualityOutdoor_ESP32_Blynk.ino (v3.9.5)
+# v1.3 — Companion dashboard for AirQualityOutdoor_ESP32_Blynk.ino (v3.9.5)
 #
 # Connects to your local Blynk server and displays every virtual pin
 # published by the ESP32 firmware:
 #
 #   - GPS / IMU / INAV navigation block
 #   - Live environmental + air-quality sensor tiles
+#   - Messages section (V61, V62) shown above Sensor History
 #   - 2x2 history graphs for TVOC / eCO2 / CO / Dust with a shared
 #     selectable time range (1h / 3h / 24h / 48h / 168h)
-#   - Full engineering/diagnostic pin readout (V19, V20, V34, V35-V51)
+#   - Full engineering/diagnostic pin readout (V19, V20, V34, V35-V51),
+#     with V19 (Engineering Message), V34 (Reset Reason), and V51 (RTC
+#     Checkpoint) each shown as their own titled label + single value line
+#   - Local-only CLEAR button + automatic on-startup clear: resets all
+#     displayed numeric values to 0.0 and text values to "NaN" in this
+#     application only (no Blynk/ESP32 traffic; next poll repopulates
+#     real data as usual)
 #   - Remote hard-reset button (V55: 0 -> 1 -> 0)
 #   - Location panel (GPS + fused INAV position) with a simple trail plot
 #     and an "Open in Google Maps" shortcut
@@ -116,7 +123,7 @@ SENSOR_PINS = {
     "rssi": 21, "wifi_qual": 22,
 }
 
-MISC_PINS = {"eng_msg": 19, "status_flags": 20}
+MISC_PINS = {"eng_msg": 19, "status_flags": 20, "msg_v61": 61, "msg_v62": 62}
 
 # V4 is used by the app/telemetry layer as a rolling diagnostic counter.
 # It is displayed in the top-right diagnostic card and is always replaced
@@ -491,6 +498,28 @@ v_co_phase = add_tile(sensor_row3, "🔁", "CO Phase")
 v_co_raw = add_tile(sensor_row3, "📟", "CO Raw ADC")
 
 # ============================================================
+# SECTION 2b — V61 / V62 MESSAGES
+# ============================================================
+
+section_title(body, "💬", "Messages")
+
+msgs_v61_v62_card = make_card(body, fill="x", padx=8, pady=(0, 6))
+
+ctk.CTkLabel(msgs_v61_v62_card, text="📨  Message (V61)", font=FONT_LABEL,
+             text_color=TXT_SUB).pack(anchor="w", padx=12, pady=(10, 2))
+v_msg_v61 = ctk.CTkLabel(msgs_v61_v62_card, text="—", font=("Segoe UI", 13),
+                          text_color=TXT_MAIN, anchor="w", wraplength=900,
+                          justify="left")
+v_msg_v61.pack(anchor="w", padx=12, pady=(0, 8))
+
+ctk.CTkLabel(msgs_v61_v62_card, text="📨  Message (V62)", font=FONT_LABEL,
+             text_color=TXT_SUB).pack(anchor="w", padx=12, pady=(0, 2))
+v_msg_v62 = ctk.CTkLabel(msgs_v61_v62_card, text="—", font=("Segoe UI", 13),
+                          text_color=TXT_MAIN, anchor="w", wraplength=900,
+                          justify="left")
+v_msg_v62.pack(anchor="w", padx=12, pady=(0, 10))
+
+# ============================================================
 # SECTION 3 — HISTORY GRAPHS (2x2) WITH SHARED TIME RANGE
 # ============================================================
 
@@ -573,24 +602,31 @@ v_eng_msg = ctk.CTkLabel(msg_card, text="—", font=("Segoe UI", 13),
                           justify="left")
 v_eng_msg.pack(anchor="w", padx=12, pady=(0, 6))
 
-# V34 is deliberately a single replacement value.
-# The widget is updated with configure(text=...) only, so a new reset reason
-# replaces the previous one instead of creating another label/message below it.
-v_reset_reason = ctk.CTkLabel(msg_card, text="",
-                               font=FONT_SMALL, text_color=TXT_DIM, anchor="w",
-                               wraplength=520, justify="left")
+# V34 and V51 follow the same pattern as V19: a titled label line plus a
+# single-value line below it. The value widget is updated with
+# configure(text=...) only, so a new value replaces the previous one
+# instead of stacking another label/message below it.
+ctk.CTkLabel(msg_card, text="🔧  Reset Reason (V34)", font=FONT_LABEL,
+             text_color=TXT_SUB).pack(anchor="w", padx=12, pady=(6, 2))
+v_reset_reason = ctk.CTkLabel(msg_card, text="—", font=("Segoe UI", 13),
+                               text_color=TXT_MAIN, anchor="w", wraplength=520,
+                               justify="left")
 v_reset_reason.pack(anchor="w", padx=12, pady=(0, 6))
 
-v_rtc_checkpoint = ctk.CTkLabel(msg_card, text="RTC checkpoint (V51): —",
-                                 font=FONT_SMALL, text_color=TXT_DIM, anchor="w",
-                                 wraplength=520, justify="left")
+ctk.CTkLabel(msg_card, text="🕒  RTC Checkpoint (V51)", font=FONT_LABEL,
+             text_color=TXT_SUB).pack(anchor="w", padx=12, pady=(6, 2))
+v_rtc_checkpoint = ctk.CTkLabel(msg_card, text="—", font=("Segoe UI", 13),
+                                 text_color=TXT_MAIN, anchor="w", wraplength=520,
+                                 justify="left")
 v_rtc_checkpoint.pack(anchor="w", padx=12, pady=(0, 10))
 
 # Right-side controls are kept in their own vertical column so the diagnostic
 # value stays at the top and the hard-reset control is clearly separated below.
+# No fixed height/propagation lock: the column sizes itself to its three
+# stacked cards, and msg_card (fill="both") on the left matches that height
+# dynamically, so the left card's bottom always lines up with Reset Station.
 diag_right = ctk.CTkFrame(diag_top, fg_color="transparent", width=250)
-diag_right.pack(side="left", fill="y", padx=(6, 0))
-diag_right.pack_propagate(False)
+diag_right.pack(side="left", fill="y", padx=(6, 0), pady=6)
 
 # App / telemetry diagnostic card (V4)
 diag_rnd_card = ctk.CTkFrame(diag_right, fg_color=CARD, corner_radius=14,
@@ -608,10 +644,24 @@ v_app_telem_rnd = ctk.CTkLabel(
 )
 v_app_telem_rnd.pack(anchor="w", padx=12, pady=(0, 14))
 
+# Clear card — resets all displayed values to their blank state, locally only.
+# Placed above the hard-reset card, below the DIAG (App/Telem. RND# Alive) card.
+clear_card = ctk.CTkFrame(diag_right, fg_color=CARD, corner_radius=14,
+                          border_width=1, border_color=BORDER)
+clear_card.pack(fill="x", pady=(5, 6), after=diag_rnd_card)
+
+ctk.CTkLabel(clear_card, text="🧹  Clear Displayed Values", font=FONT_LABEL,
+             text_color=TXT_SUB).pack(anchor="w", padx=12, pady=(10, 6))
+
+button_clear = ctk.CTkButton(clear_card, text="🧹  Clear", command=lambda: clear_dashboard(),
+                              fg_color="#1e3a5f", hover_color="#2a4a75",
+                              font=FONT_LABEL, corner_radius=8, width=180)
+button_clear.pack(padx=12, pady=(0, 14))
+
 # Remote hard reset is intentionally lower on the right side.
 reset_card = ctk.CTkFrame(diag_right, fg_color=CARD, corner_radius=14,
                           border_width=1, border_color=BORDER)
-reset_card.pack(fill="x", pady=(5, 6), after=diag_rnd_card)
+reset_card.pack(fill="x", pady=(5, 6), after=clear_card)
 
 ctk.CTkLabel(reset_card, text="🔁  Remote Hard Reset (V55)", font=FONT_LABEL,
              text_color=TXT_SUB).pack(anchor="w", padx=12, pady=(10, 6))
@@ -1032,6 +1082,49 @@ def _as_float(values, key):
 _device_connected = False
 _last_values = {}
 
+# V61 and V62 are independent Blynk pins. A poll can read one before its
+# update and the other after it. Cache both halves and change both labels only
+# after the embedded gpsUnix/deviceMs record keys match.
+_pending_message_pair = {"msg_v61": None, "msg_v62": None}
+_displayed_message_pair_key = None
+
+
+def _message_pair_key(value):
+    """Return the canonical (gpsUnix, deviceMs) key from a telemetry CSV."""
+    if value is None:
+        return None
+    fields = str(value).split(",", 2)
+    if len(fields) < 2:
+        return None
+    try:
+        return str(int(fields[0].strip())), str(int(fields[1].strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_message_pair(values):
+    """Display only a complete V61/V62 record; never show mixed cycles."""
+    global _displayed_message_pair_key
+
+    for name in ("msg_v61", "msg_v62"):
+        value = values.get(name)
+        if value:
+            _pending_message_pair[name] = str(value)
+
+    value61 = _pending_message_pair["msg_v61"]
+    value62 = _pending_message_pair["msg_v62"]
+    key61 = _message_pair_key(value61)
+    key62 = _message_pair_key(value62)
+    if key61 is None or key61 != key62:
+        # One pin advanced first. Keep displaying the previous complete pair.
+        return
+    if key61 == _displayed_message_pair_key:
+        return
+
+    v_msg_v61.configure(text=value61)
+    v_msg_v62.configure(text=value62)
+    _displayed_message_pair_key = key61
+
 
 def _apply_connection_status(device_connected):
     """Update only the connection/WiFi status widgets."""
@@ -1110,6 +1203,7 @@ def _apply_values(values):
     # ---- Debug / diagnostics ----
     # Replace the current widgets in-place. Do not append new messages/labels.
     v_eng_msg.configure(text=values.get("eng_msg") or "—")
+    _apply_message_pair(values)
 
     # V34 is a single current reset-reason value. If the server ever returns
     # a multiline value, keep only the newest non-empty line so old messages
@@ -1117,18 +1211,14 @@ def _apply_values(values):
     reset_reason = values.get("reset_reason")
     if reset_reason is None:
         # Keep V34 visually empty until the first actual value is read.
-        reset_reason_text = ""
+        reset_reason_text = "—"
     else:
         reset_reason_lines = [line.strip() for line in str(reset_reason).splitlines()
                               if line.strip()]
-        reset_reason_text = reset_reason_lines[-1] if reset_reason_lines else ""
-    v_reset_reason.configure(
-        text=f"Reset reason (V34): {reset_reason_text}" if reset_reason_text else ""
-    )
+        reset_reason_text = reset_reason_lines[-1] if reset_reason_lines else "—"
+    v_reset_reason.configure(text=reset_reason_text)
 
-    v_rtc_checkpoint.configure(
-        text=f"RTC checkpoint (V51): {values.get('rtc_checkpoint') or '—'}"
-    )
+    v_rtc_checkpoint.configure(text=values.get("rtc_checkpoint") or "—")
 
     # V4 diagnostic value is also replacement-only: each poll overwrites the
     # previous value in the same widget.
@@ -1201,9 +1291,66 @@ def _update_map(lat, lng):
 
 
 # ============================================================
+# CLEAR (LOCAL-ONLY RESET OF DISPLAYED VALUES)
+# ============================================================
+# Resets every value shown in the dashboard back to a blank state.
+# This never talks to Blynk or the ESP32 — it only changes what is
+# currently displayed in this running application. The next successful
+# poll will immediately repopulate real values as usual.
+
+NUM0 = "0.0"
+TXT_NA = "NaN"
+
+_NUMERIC_TILES = [
+    v_gps_lat, v_gps_lng, v_gps_sats, v_gps_hdop,
+    v_imu_roll, v_imu_pitch, v_imu_yaw, v_imu_temp,
+    v_inav_speed, v_inav_heading, v_inav_alt,
+    v_temp, v_hum, v_co, v_uvi, v_tvoc, v_eco2, v_aqi, v_dust,
+    v_sound, v_heater, v_co_raw,
+]
+
+_TEXT_LABELS = [
+    v_gps_pps, v_inav_state, v_co_phase,
+    v_eng_msg, v_msg_v61, v_msg_v62, v_app_telem_rnd,
+    v_reset_reason, v_rtc_checkpoint,
+]
+
+
+def clear_dashboard():
+    """Reset all displayed values to 0.0 (numeric) / NaN (text) locally."""
+    global _displayed_message_pair_key
+    _pending_message_pair["msg_v61"] = None
+    _pending_message_pair["msg_v62"] = None
+    _displayed_message_pair_key = None
+    for tile in _NUMERIC_TILES:
+        tile.configure(text=NUM0, text_color=TXT_MAIN)
+
+    for label in _TEXT_LABELS:
+        label.configure(text=TXT_NA, text_color=TXT_MAIN)
+
+    for bit, chip in flag_chip_labels:
+        chip.configure(fg_color=TXT_DIM)
+
+    for key, (label_widget, unit) in diag_value_labels.items():
+        if key in ("i2c_device", "i2c_op"):
+            label_widget.configure(text=TXT_NA)
+        else:
+            label_widget.configure(text=NUM0)
+
+    v_map_source.configure(text=f"Source: {TXT_NA}")
+    v_map_coords.configure(text=f"Lat: {TXT_NA}\nLng: {TXT_NA}")
+    v_map_extra.configure(
+        text=f"Sats: {NUM0}   HDOP: {NUM0}   Speed: {NUM0}   Heading: {NUM0}")
+
+    label_wifi.configure(text=f"📶  WiFi: {TXT_NA}", text_color=TXT_SUB)
+    label_last_update.configure(text=f"Last live data: {TXT_NA}")
+
+
+# ============================================================
 # STARTUP
 # ============================================================
 
+clear_dashboard()
 threading.Thread(target=_poll_worker, daemon=True).start()
 app.after(200, _poll_queue)
 app.after(500, trigger_graph_refresh)
