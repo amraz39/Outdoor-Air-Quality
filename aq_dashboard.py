@@ -1,4 +1,48 @@
 # Outdoor Air Quality Station — ESP32 Dashboard for Windows PC
+# v1.9 — Four-second V4 loss indication and clean connected text
+#
+# v1.9 changes:
+#   - A reachable but non-advancing V4 is authoritative evidence of a stalled
+#     stream; the slower V61/V62 path can no longer mask it for 12 seconds.
+#   - V61/V62 is used only when the V4 HTTP read itself is unavailable.
+#   - CONNECTED no longer displays the internal ``check: ...`` evidence text.
+#
+# v1.8 — Isolated one-second V4 diagnostic display
+#
+# v1.8 changes:
+#   - The one-second health worker now sends V4 through its own GUI queue item.
+#   - Only DIAG (App/Telem. RND# Alive) is redrawn from that one-second value.
+#   - V4 is removed from the five-second full-data sweep, preventing duplicate
+#     reads and preventing the general UI refresh from overwriting the widget.
+#
+# v1.7 — One-second V4 heartbeat with V61/V62 fallback
+#
+# v1.7 changes:
+#   - A dedicated health worker polls deterministic V4 once per second.
+#   - Three consecutive V4 arrivals are buffered; the first is a baseline and
+#     the next two confirm that the stream continues to advance.
+#   - An advancing V4 is the primary live-stream proof; a newly matched
+#     V61/V62 record key is the fallback if V4 is delayed or unavailable.
+#   - CONNECTED still requires isHardwareConnected=TRUE as an independent
+#     condition. Cached values or either liveness signal alone are insufficient.
+#
+# v1.6 — Strict Blynk-link AND live-telemetry connection health
+#
+# v1.6 changes:
+#   - CONNECTED now requires BOTH isHardwareConnected=TRUE from the Blynk
+#     server AND a changing ESP32 datastream within its freshness window.
+#   - Cached virtual-pin values and a server TRUE response alone can no longer
+#     make a stalled device appear connected.
+#   - The UI distinguishes an unavailable/offline Blynk link from a connected
+#     Blynk session that is not delivering fresh ESP32 telemetry.
+#   - Live graph samples are recorded only when the ESP32 stream advances.
+#
+# v1.5 — Safe edge-armed V55 reset sequence for ESP32 firmware v3.9.212
+#
+# v1.5 changes:
+#   - Remote reset now sends 0 -> 1 -> 0. The leading LOW arms the firmware,
+#     preventing a retained/replayed V55 HIGH from causing a reset loop.
+#
 # v1.4 — Live-graph and connection-health refactor
 #
 # v1.4 changes:
@@ -103,18 +147,23 @@ BLYNK_PORT = _read_secrets_value("BLYNK_PORT", quoted=False)
 # ============================================================
 
 FAST_POLL_MS = 5000          # matches FAST telemetry tier on the ESP32
+HEALTH_POLL_MS = 1000        # lightweight V4 + Blynk status check
 GRAPH_REFRESH_MS = 60000     # how often server-side history is re-fetched
 LIVE_GRAPH_DRAW_MS = 5000    # redraw cached history + current session samples
 LIVE_GRAPH_SAMPLE_S = 30.0   # bound graph memory while preserving trends
 HTTP_TIMEOUT_S = 4
+HEALTH_HTTP_TIMEOUT_S = 1.0
 
 # V4 is a rolling diagnostic/telemetry counter sent by the ESP32.
-# Blynk can keep returning cached virtual-pin values after hardware disconnects,
-# so a changing V4 value is used as an additional proof that live telemetry is
-# still arriving. Allow a little more than two 5-second polling intervals.
+# Firmware v3.9.213 publishes a deterministic V4 heartbeat once per second.
+# The dashboard checks it once per second and allows normal LAN/poll jitter.
+# The full data worker polls every five seconds, so matching V61/V62 keys use a
+# wider fallback window. A successful GET or an initial cached value is never
+# sufficient: the observed value/key must advance after its baseline.
 LIVE_TELEM_PIN = 4
-LIVE_TELEM_TIMEOUT_S = 20.0
-STARTUP_ONLINE_GRACE_S = 20.0
+HEARTBEAT_TIMEOUT_S = 3.5
+HEARTBEAT_CONFIRM_WINDOW_S = 4.0
+PAIR_FALLBACK_TIMEOUT_S = 12.0
 
 UNAVAILABLE_THRESHOLD = -998.0   # firmware uses -999.0f as SENSOR_UNAVAILABLE
 
@@ -140,7 +189,7 @@ MISC_PINS = {"eng_msg": 19, "status_flags": 20, "msg_v61": 61, "msg_v62": 62}
 # V4 is used by the app/telemetry layer as a rolling diagnostic counter.
 # It is displayed in the top-right diagnostic card and is always replaced
 # with the newest value rather than accumulated as history.
-APP_TELEM_RND_PIN = 4
+APP_TELEM_RND_PIN = LIVE_TELEM_PIN
 
 DIAG_PINS = {
     "reset_reason": 34,
@@ -174,7 +223,6 @@ for k, v in INAV_PINS.items():
     ALL_READ_PINS[f"inav_{k}"] = v
 ALL_READ_PINS.update(SENSOR_PINS)
 ALL_READ_PINS.update(MISC_PINS)
-ALL_READ_PINS["app_telem_rnd"] = APP_TELEM_RND_PIN
 ALL_READ_PINS.update(DIAG_PINS)
 
 INAV_STATE_NAMES = {
@@ -225,10 +273,10 @@ FONT_SMALL = ("Segoe UI", 10)
 # BLYNK HTTP API
 # ============================================================
 # IMPORTANT: Blynk virtual-pin GETs return the server's last known value.
-# They are therefore NOT a valid hardware-online test.  The dashboard uses
-# isHardwareConnected for the CONNECTED/OFFLINE indicator and last-connection
-# timestamp.  The legacy endpoint is tried first; the external API form is
-# also supported for Blynk installations that expose it.
+# They are therefore NOT a valid hardware-online test. CONNECTED requires the
+# logical AND of isHardwareConnected=TRUE and a recently changing ESP32
+# datastream. The legacy endpoint is tried first; the external API form is also
+# supported for Blynk installations that expose it.
 
 
 _http_local = threading.local()
@@ -248,48 +296,10 @@ def _session():
     return session
 
 
-def is_device_connected():
-    """Return True/False when Blynk can answer, or None if the endpoint
-    is unavailable/unsupported.
-
-    The local/legacy Blynk server supports:
-        /<auth>/isHardwareConnected
-
-    Some server builds do not expose the endpoint reliably.  In that case
-    the telemetry heartbeat in the poll worker is used as the fallback.
-    """
-    urls = [
-        f"http://{BLYNK_SERVER}:{BLYNK_PORT}/{BLYNK_AUTH}/isHardwareConnected",
-        f"http://{BLYNK_SERVER}:{BLYNK_PORT}/external/api/isHardwareConnected"
-        f"?token={BLYNK_AUTH}",
-    ]
-
-    got_valid_response = False
-
-    for url in urls:
-        try:
-            r = _session().get(url, timeout=HTTP_TIMEOUT_S)
-            if r.status_code != 200:
-                continue
-
-            result = r.text.strip().strip('"').lower()
-            if result in ("true", "1", "yes"):
-                return True
-            if result in ("false", "0", "no"):
-                got_valid_response = True
-                return False
-        except Exception:
-            continue
-
-    # None means "the status endpoint could not be used", not "offline".
-    # This distinction lets the telemetry heartbeat act as a fallback.
-    return False if got_valid_response else None
-
-
-def read_pin(pin):
+def read_pin(pin, timeout=HTTP_TIMEOUT_S):
     url = f"http://{BLYNK_SERVER}:{BLYNK_PORT}/{BLYNK_AUTH}/get/V{pin}"
     try:
-        r = _session().get(url, timeout=HTTP_TIMEOUT_S)
+        r = _session().get(url, timeout=timeout)
         if r.status_code != 200:
             return None
         text = r.text.strip()
@@ -724,13 +734,16 @@ def do_remote_reset():
         return
 
     def _worker():
-        # Press software button (set pin HIGH)
-        write_pin(RESET_PIN, 1)
-        import time
-        # Hold HIGH for 0.5 s to trigger reset
-        time.sleep(0.5)
-        # Release button (set pin LOW)
+        # v1.5 / firmware v3.9.212: explicitly arm the edge-triggered reset.
+        # LOW-before-HIGH also clears a stale server-side HIGH left by an
+        # interrupted earlier request. The trailing LOW prepares the next use.
         write_pin(RESET_PIN, 0)
+        time.sleep(0.2)
+        try:
+            write_pin(RESET_PIN, 1)
+            time.sleep(0.5)
+        finally:
+            write_pin(RESET_PIN, 0)
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -1037,10 +1050,11 @@ _result_queue = queue.Queue()
 # is unavailable.
 _activity_lock = threading.Lock()
 _last_data_signature = None
-_last_data_activity = None
+_heartbeat_samples = deque(maxlen=3)
+_last_heartbeat_activity = None
+_last_pair_key = None
+_last_pair_activity = None
 _last_data_wallclock = None
-_have_data_sample = False
-_server_connected_state = None
 
 
 def _poll_data_worker():
@@ -1050,8 +1064,8 @@ def _poll_data_worker():
     A broken/unsupported Blynk connection-status endpoint must never prevent
     sensor values from reaching the dashboard.
     """
-    global _last_data_signature, _last_data_activity
-    global _last_data_wallclock, _have_data_sample
+    global _last_data_signature, _last_pair_key, _last_pair_activity
+    global _last_data_wallclock
 
     while True:
         values = {}
@@ -1067,23 +1081,30 @@ def _poll_data_worker():
             if values.get(name) is not None
         )
         now = time.monotonic()
+        key61 = _message_pair_key(values.get("msg_v61"))
+        key62 = _message_pair_key(values.get("msg_v62"))
+        matched_pair_key = key61 if key61 is not None and key61 == key62 else None
 
         changed = False
         with _activity_lock:
             if _last_data_signature is None:
                 _last_data_signature = signature
-                _have_data_sample = bool(signature)
             elif signature != _last_data_signature:
                 _last_data_signature = signature
-                _last_data_activity = now
-                _last_data_wallclock = datetime.now()
-                _have_data_sample = True
                 changed = True
-            connected_hint = _server_connected_state is True
 
-        # A changing snapshot is proof of new telemetry. A TRUE server state
-        # also lets perfectly flat sensor values be plotted at a steady cadence.
-        if changed or connected_hint:
+            # V61/V62 are fallback stream evidence only after both halves have
+            # the same record key. A mixed pair must never refresh liveness.
+            if matched_pair_key is not None:
+                if _last_pair_key is None:
+                    _last_pair_key = matched_pair_key
+                elif matched_pair_key != _last_pair_key:
+                    _last_pair_key = matched_pair_key
+                    _last_pair_activity = now
+                    _last_data_wallclock = datetime.now()
+        # Record graph samples only when the stream advances. A server TRUE
+        # response by itself is not data and must not duplicate cached values.
+        if changed:
             _record_live_graph_samples(values, now)
 
         _result_queue.put(("data", values))
@@ -1115,7 +1136,7 @@ def _status_endpoint():
     )
     for url in urls:
         try:
-            r = _session().get(url, timeout=1.5)
+            r = _session().get(url, timeout=HEALTH_HTTP_TIMEOUT_S)
             if r.status_code == 200:
                 result = _parse_blynk_bool(r.text)
                 if result is not None:
@@ -1125,61 +1146,110 @@ def _status_endpoint():
     return None
 
 
-def _decide_connection(blynk_state, data_fresh, data_sample_seen,
-                       startup_grace):
-    """Return ``(connected, evidence)`` from independent liveness signals."""
-    if blynk_state is True:
-        return True, "server"
-    if data_fresh:
-        return True, "telemetry"
-    if startup_grace and blynk_state is None and data_sample_seen:
-        return True, "startup grace"
-    return False, "server" if blynk_state is False else "no live telemetry"
+def _decide_connection(blynk_state, heartbeat_available,
+                       heartbeat_fresh, pair_fresh):
+    """Return ``(connected, evidence)`` using a strict two-factor test.
 
+    Factor 1: Blynk says the ESP32 hardware session is connected.
+    Factor 2: V4 advanced recently. A matched V61/V62 key is fallback only
+    when V4 cannot be read at all; it must not mask a reachable, stale V4.
 
-def _poll_status_worker():
-    """Track real device liveness independently from sensor-value polling.
-
-    The server's isHardwareConnected endpoint is authoritative when available.
-    Changing telemetry remains a fallback and also protects against a briefly
-    stale FALSE response. Cached V-pin values alone never prove liveness.
+    Neither factor is sufficient alone: isHardwareConnected can outlive a
+    stalled data plane briefly, while cached V-pin reads can remain available
+    after the ESP32 session has disappeared.
     """
-    global _server_connected_state
-    started = time.monotonic()
+    if blynk_state is None:
+        return False, "server status unavailable"
+    if blynk_state is False:
+        return False, "device not connected to Blynk"
+    if heartbeat_fresh:
+        return True, "Blynk + V4 heartbeat"
+    if not heartbeat_available and pair_fresh:
+        return True, "Blynk + V61/V62 fallback"
+    return False, "Blynk connected; no live telemetry"
+
+
+def _poll_health_worker():
+    """Poll primary V4 liveness and Blynk status once per second.
+
+    CONNECTED is deliberately strict: the server must report the ESP32 session
+    connected AND V4 must have advanced. V61/V62 is fallback only if the V4
+    GET itself is unavailable; a readable but unchanged V4 is stale evidence
+    and becomes NO LIVE DATA after the short heartbeat freshness deadline.
+    """
+    global _last_heartbeat_activity
+    global _last_data_wallclock
 
     while True:
-        now = time.monotonic()
+        cycle_started = time.monotonic()
+        # Read the smallest, fastest stream marker first. This call has a short
+        # independent timeout so a health cycle cannot block the full data poll.
+        heartbeat_value = read_pin(LIVE_TELEM_PIN, timeout=HEALTH_HTTP_TIMEOUT_S)
+        heartbeat_available = heartbeat_value is not None
         blynk_state = _status_endpoint()
+        now = time.monotonic()
 
         with _activity_lock:
-            _server_connected_state = blynk_state
-            data_fresh = (
-                _last_data_activity is not None
-                and (now - _last_data_activity) <= LIVE_TELEM_TIMEOUT_S
+            if heartbeat_value is None:
+                # The next successful value must establish a new baseline;
+                # do not join observations across a failed HTTP read.
+                _heartbeat_samples.clear()
+            else:
+                heartbeat_value = str(heartbeat_value).strip()
+                while (_heartbeat_samples and
+                       now - _heartbeat_samples[0][1] > HEARTBEAT_CONFIRM_WINDOW_S):
+                    _heartbeat_samples.popleft()
+                if not _heartbeat_samples:
+                    _heartbeat_samples.append((heartbeat_value, now))
+                elif heartbeat_value != _heartbeat_samples[-1][0]:
+                    _heartbeat_samples.append((heartbeat_value, now))
+                    # Three arrivals (baseline + two subsequent transitions)
+                    # must fit in one bounded window before V4 proves a
+                    # continuing live stream.
+                    if (len(_heartbeat_samples) == 3 and
+                            now - _heartbeat_samples[0][1]
+                            <= HEARTBEAT_CONFIRM_WINDOW_S):
+                        _last_heartbeat_activity = now
+                        _last_data_wallclock = datetime.now()
+
+            heartbeat_fresh = (
+                _last_heartbeat_activity is not None
+                and (now - _last_heartbeat_activity) <= HEARTBEAT_TIMEOUT_S
             )
-            data_sample_seen = _have_data_sample
+            pair_fresh = (
+                _last_pair_activity is not None
+                and (now - _last_pair_activity) <= PAIR_FALLBACK_TIMEOUT_S
+            )
             last_live = _last_data_wallclock
 
-        startup_grace = (now - started) <= STARTUP_ONLINE_GRACE_S
-
-        # TRUE from the server is authoritative at all times (the old code
-        # accepted it only during startup). A fresh changing snapshot can
-        # temporarily override FALSE during a server-side reconnect race.
         device_connected, source = _decide_connection(
-            blynk_state, data_fresh, data_sample_seen, startup_grace)
+            blynk_state, heartbeat_available, heartbeat_fresh, pair_fresh)
+
+        # This is the only one-second data-widget update. It is applied on the
+        # Tk main thread by _poll_queue; no other dashboard value is included.
+        if heartbeat_value is not None:
+            _result_queue.put(("heartbeat", heartbeat_value))
 
         _result_queue.put(("status", {
             "connected": device_connected,
             "source": source,
             "last_live": last_live,
+            "server_connected": blynk_state,
+            "data_fresh": heartbeat_fresh or
+                          (not heartbeat_available and pair_fresh),
+            "heartbeat_available": heartbeat_available,
+            "heartbeat_fresh": heartbeat_fresh,
+            "pair_fresh": pair_fresh,
         }))
-        threading.Event().wait(FAST_POLL_MS / 1000.0)
+
+        elapsed = time.monotonic() - cycle_started
+        threading.Event().wait(max(0.0, HEALTH_POLL_MS / 1000.0 - elapsed))
 
 
 def _poll_worker():
-    """Start independent data and connection workers."""
+    """Start independent full-data and one-second health workers."""
     threading.Thread(target=_poll_data_worker, daemon=True).start()
-    threading.Thread(target=_poll_status_worker, daemon=True).start()
+    threading.Thread(target=_poll_health_worker, daemon=True).start()
 
 
 def _poll_queue():
@@ -1188,6 +1258,8 @@ def _poll_queue():
             kind, payload = _result_queue.get_nowait()
             if kind == "data":
                 _apply_values(payload)
+            elif kind == "heartbeat":
+                _apply_heartbeat(payload)
             elif kind == "status":
                 _apply_connection_status(payload)
             elif kind == "graph":
@@ -1208,6 +1280,7 @@ def _as_float(values, key):
 
 
 _device_connected = False
+_server_link_state = None
 _last_values = {}
 
 # V61 and V62 are independent Blynk pins. A poll can read one before its
@@ -1215,6 +1288,11 @@ _last_values = {}
 # after the embedded gpsUnix/deviceMs record keys match.
 _pending_message_pair = {"msg_v61": None, "msg_v62": None}
 _displayed_message_pair_key = None
+
+
+def _apply_heartbeat(value):
+    """Update only the dedicated V4 Alive widget from the one-second worker."""
+    v_app_telem_rnd.configure(text=str(value) if value is not None else "—")
 
 
 def _message_pair_key(value):
@@ -1256,32 +1334,43 @@ def _apply_message_pair(values):
 
 def _apply_connection_status(status):
     """Update connection widgets without inventing a fresh-data timestamp."""
-    global _device_connected
+    global _device_connected, _server_link_state
     if isinstance(status, dict):
         _device_connected = bool(status.get("connected"))
         source = status.get("source", "unknown")
         last_live = status.get("last_live")
+        _server_link_state = status.get("server_connected")
     else:
         # Compatibility for any already-queued result during a code reload.
         _device_connected = bool(status)
         source = "unknown"
         last_live = None
+        _server_link_state = None
 
     if _device_connected:
         label_status.configure(text="⬤  CONNECTED", text_color=GREEN)
         if last_live is not None:
             live_text = last_live.strftime("%H:%M:%S")
             label_last_update.configure(
-                text=f"Last telemetry change: {live_text}  ·  check: {source}")
+                text=f"Last telemetry change: {live_text}")
         else:
-            label_last_update.configure(
-                text=f"Device link confirmed  ·  check: {source}")
+            label_last_update.configure(text="Live telemetry confirmed")
     else:
-        label_status.configure(text="⬤  OFFLINE", text_color=RED)
-        label_wifi.configure(text="📶  WiFi: OFFLINE", text_color=RED)
+        if _server_link_state is True:
+            label_status.configure(text="⬤  NO LIVE DATA", text_color=AMBER)
+            label_wifi.configure(text="📶  WiFi: NO LIVE DATA", text_color=AMBER)
+        elif _server_link_state is False:
+            label_status.configure(text="⬤  DEVICE OFFLINE", text_color=RED)
+            label_wifi.configure(text="📶  WiFi: OFFLINE", text_color=RED)
+        else:
+            label_status.configure(text="⬤  SERVER UNAVAILABLE", text_color=RED)
+            label_wifi.configure(text="📶  WiFi: UNKNOWN", text_color=RED)
         if last_live is not None:
             label_last_update.configure(
-                text=f"Last telemetry change: {last_live.strftime('%H:%M:%S')}")
+                text=f"Last telemetry change: {last_live.strftime('%H:%M:%S')}"
+                     f"  ·  check: {source}")
+        else:
+            label_last_update.configure(text=f"No live telemetry yet  ·  check: {source}")
 
 
 def _apply_values(values):
@@ -1298,6 +1387,10 @@ def _apply_values(values):
                                   text_color=wifi_color_for(quality))
         else:
             label_wifi.configure(text="📶  WiFi: —", text_color=AMBER)
+    elif _server_link_state is True:
+        label_wifi.configure(text="📶  WiFi: NO LIVE DATA", text_color=AMBER)
+    elif _server_link_state is None:
+        label_wifi.configure(text="📶  WiFi: UNKNOWN", text_color=RED)
     else:
         label_wifi.configure(text="📶  WiFi: OFFLINE", text_color=RED)
 
@@ -1362,10 +1455,6 @@ def _apply_values(values):
     v_reset_reason.configure(text=reset_reason_text)
 
     v_rtc_checkpoint.configure(text=values.get("rtc_checkpoint") or "—")
-
-    # V4 diagnostic value is also replacement-only: each poll overwrites the
-    # previous value in the same widget.
-    v_app_telem_rnd.configure(text=values.get("app_telem_rnd") or "—")
 
     status_flags = _as_float(values, "status_flags")
     flags_int = int(status_flags) if status_flags is not None else 0

@@ -1,6 +1,7 @@
 # Outdoor Air Quality Station — ESP32
 
-Current firmware: **v3.9.211**
+Current firmware: **v3.9.213**
+Current Windows dashboard: **v1.9** (`aq_dashboard.py`)
 Target board package: **Arduino-ESP32 3.3.12**
 Backend: **self-hosted Blynk 0.41.18 / legacy Blynk protocol 0.6.1**
 Primary sketch: `AirQualityOutdoor_ESP32_Blynk.ino`
@@ -11,19 +12,20 @@ The current design deliberately separates sensor acquisition from networking. It
 
 ## Current status
 
-v3.9.211 is the current validated build. The important behavior is:
+v3.9.213 is the current validated build. The important behavior is:
 
 - Core 0 exclusively owns WiFi, lwIP-facing TCP work, `Blynk.run()`, the coherent HTTP client and physical Serial output.
 - Core 1 owns sensor initialization, sensor sampling, GPS parsing, IMU/INAV processing and immutable snapshot production. Core 1 never opens or drives a TCP socket.
 - V61 and V62 are produced as one coherent pair from the same snapshot and uploaded every second through `PUT /{token}/telemetry/coherent`.
 - Ordinary Blynk virtual pins use a coalescing, paced queue. Stale values are replaced instead of creating an unbounded backlog.
+- V4 is a small random-looking, non-repeating application heartbeat queued once per second. It does not read or lock the sensor snapshot.
 - Exact Blynk PING responses and application checkpoints provide end-to-end receive-path evidence.
 - HTTP is paused immediately when the exact Blynk PING becomes overdue. It resumes only after a 60-second stable quiet window.
 - A Blynk-only sequence hole receives socket-first recovery. A sequence hole corroborated by an independent recent HTTP transport failure is treated as a shared TCP/lwIP-path failure and performs one bounded full MCU restart.
 - WiFi teardown is not used as a generic Blynk repair. WiFi recovery is reserved for actual association/IP failures.
 - The optional ten-minute periodic reset remains disabled.
 
-The field trace that validated v3.9.211 showed one proven shared-path reset, a return to Blynk in about 14 seconds, and continued operation without repeated Blynk restarts or WiFi teardowns.
+The v3.9.211 field trace showed one proven shared-path reset, a return to Blynk in about 14 seconds, and continued operation without repeated Blynk restarts or WiFi teardowns. v3.9.212 refined reset-domain corroboration and startup behavior; v3.9.213 adds the observable one-second V4 heartbeat used by dashboard v1.9.
 
 ## Why v3.9.211 changed recovery scope
 
@@ -109,7 +111,7 @@ gpsUnix,deviceMs,temp,hum,ensFault,roll,pitch,yaw,imuTemp,imuOk,
 pps,inavState,inavLat,inavLng,inavAlt,inavSpeed,inavHeading,status,rssi,wifiQuality
 ```
 
-The server stores both values under one request timestamp and does not reflect them back to the hardware connection. The HTTP client reuses a connection for at most 120 requests, then rotates it preventively. Its transaction timeout is 5 seconds; repeated failures open a 90-second circuit breaker. Blynk health always has priority over bulk HTTP.
+The server stores both values under one request timestamp and does not reflect them back to the hardware connection. The HTTP client reuses a connection for at most 60 requests, then rotates it preventively. Its transaction timeout is 5 seconds; repeated failures open a 90-second circuit breaker. Blynk health always has priority over bulk HTTP.
 
 ## Patched Blynk library
 
@@ -184,6 +186,64 @@ Create `secrets.h` beside the INO and do not commit it:
 
 This firmware targets the self-hosted legacy server, not current Blynk Cloud. Do not add Blynk IoT template definitions.
 
+## Windows dashboard (`aq_dashboard.py`)
+
+Dashboard v1.9 is a read-mostly Windows monitoring application for the local legacy Blynk server. It displays the current sensor/navigation values, the coherent V61/V62 record, diagnostics, maps and bounded history graphs. All Tk widget changes are applied on the main GUI thread; independent HTTP workers have their own `requests.Session` instances.
+
+Install the required packages:
+
+```powershell
+python -m pip install requests customtkinter matplotlib numpy tkintermapview
+```
+
+Run the dashboard from the project directory so it can read the same `secrets.h` used by the firmware:
+
+```powershell
+cd C:\Users\PTuT\Documents\Arduino\AirQualityOutdoor_ESP32_Blynk
+python .\aq_dashboard.py
+```
+
+### Connection-state rules
+
+`CONNECTED` is deliberately a two-factor state. Both conditions must be true:
+
+1. the Blynk `isHardwareConnected` endpoint reports that the ESP32 hardware session is connected; and
+2. the V4 application heartbeat is actively advancing.
+
+The firmware queues a non-repeating V4 value once per second. The dashboard polls V4 once per second and continuously keeps a moving three-arrival window. The first value is a baseline and the next two must arrive within four seconds to confirm the live stream. After confirmation, V4 evidence expires 3.5 seconds after the last observed transition, so a powered-off or stalled ESP32 normally changes from green `CONNECTED` to yellow `NO LIVE DATA` on the next approximately four-second health check even if the server has not yet closed the hardware session.
+
+An HTTP GET can return a cached V-pin value after the device stops. Receiving an HTTP response is therefore not heartbeat evidence; the observed V4 value must advance. V61/V62 is used as fallback liveness evidence only when the V4 HTTP read itself is unavailable. A readable but stale V4 cannot be masked by the slower V61/V62 path.
+
+Dashboard states:
+
+| Display | Meaning |
+|---|---|
+| `CONNECTED` | Blynk reports the ESP32 connected and live telemetry is confirmed. |
+| `NO LIVE DATA` | Blynk still reports a hardware session, but V4 is no longer advancing. |
+| `DEVICE OFFLINE` | Blynk explicitly reports the ESP32 hardware session disconnected. |
+| `SERVER UNAVAILABLE` | The dashboard cannot obtain a valid Blynk hardware-status response. |
+
+Internal evidence such as `Blynk + V4 heartbeat` is used by the worker but is not displayed while the dashboard is connected. The header shows only the most recent live-telemetry time.
+
+### Dashboard refresh rates
+
+| Dashboard activity | Rate | Scope |
+|---|---:|---|
+| V4 health poll and `DIAG (App/Telem. RND# Alive)` | 1 second | This is the only data widget redrawn by the one-second path. |
+| Full virtual-pin data sweep | 5 seconds plus HTTP duration | All ordinary sensor, navigation, message and diagnostic widgets. |
+| Live graph drawing | 5 seconds | Redraws already cached samples. |
+| Server history refresh | 60 seconds | Retrieves historical graph data. |
+
+V4 is intentionally removed from the five-second full-data sweep to avoid duplicate reads and competing widget updates. Other firmware publication rates remain independent; a dashboard poll reads the newest value cached by Blynk and does not imply that every intermediate publication was observed.
+
+### Coherent messages and reset control
+
+V61 and V62 are read independently by the HTTP API. The dashboard caches both halves and changes the two message widgets only when their embedded `(gpsUnix, deviceMs)` keys match. It never intentionally displays a mixed record.
+
+The remote-reset button sends V55 as `0 -> 1 -> 0`. Firmware requires the leading LOW to arm the edge and blocks V55 reset requests during the first 30 seconds after boot. This prevents a retained or replayed HIGH value from causing a reset loop.
+
+`secrets.h` contains WiFi and Blynk credentials. Keep it out of source control and do not include credentials in screenshots, logs or bug reports.
+
 ## Active feature defaults
 
 ```cpp
@@ -227,14 +287,14 @@ All ADC inputs use 12-bit resolution and per-pin 11 dB attenuation. The 5 V anal
 | Path | Current cadence | Notes |
 |---|---:|---|
 | Coherent V61/V62 HTTP record | 1 second | newest complete snapshot; no backlog replay |
-| V4 application liveness | 15 seconds | priority Blynk value |
+| V4 application liveness | 1 second | priority, non-repeating Blynk heartbeat value |
 | Dashboard round robin | 4 seconds per selected pin | spreads V1–V32 load |
 | Diagnostic round robin | 15 seconds per selected pin | spreads V34–V65 load |
 | Map V33 | 120 seconds | avoids excessive map points |
 | Protocol PING target | 10 seconds | exact response tracked; 15-second proof deadline |
 | Blynk heartbeat hard deadline | 189 seconds | final library-level backstop |
 
-V55 is a remote hard-reset control. A nonzero write requests `esp_restart()` and the next boot reports `SOFTWARE` on V34.
+V55 is an edge-armed remote hard-reset control. After the 30-second boot lockout, a LOW arms the input and the following HIGH requests `esp_restart()`; the dashboard sends `0 -> 1 -> 0`. The next boot reports `SOFTWARE` on V34.
 
 ## Important diagnostics
 
@@ -274,10 +334,10 @@ Raw PCB aborts are disabled in the normal Blynk cleanup path. Owner-managed sock
 
 ## Build and validation
 
-The v3.9.211 reference build used Arduino-ESP32 3.3.12 and compiled successfully:
+The v3.9.213 build used Arduino-ESP32 3.3.12 and compiled successfully:
 
 ```text
-Sketch:           1,056,010 bytes (80%)
+Sketch:           1,056,770 bytes (80%)
 Global variables:    75,888 bytes (23%)
 Dynamic RAM left:   251,792 bytes
 ```
@@ -309,6 +369,7 @@ The copy inside the release folder is archival; its relative source lookup assum
 ## Related files
 
 - `AirQualityOutdoor_ESP32_Blynk.ino` — current firmware.
+- `aq_dashboard.py` — Windows dashboard v1.9 with strict Blynk + live-data connection health.
 - `BLYNK_LIB/` — only the two modified Blynk library files.
 - `ESP32_CORE_PATCH/3.3.12/` — targeted ESP32-only WiFi status patch.
 - `blynk.service` — current Raspberry Pi 5 Java 21 service unit.
