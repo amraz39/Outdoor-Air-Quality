@@ -1,37 +1,55 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
-*.log
-reports/
-backup/
-.env/
 venv/
 .venv/
-*.h
-!BLYNK_LIB/src/**/*.h
-*.OLD
-*.ico
-*.pptx
-*.pdf
-*.png
-*.cddx
-*.docx
+.env/
+
+# Build and distribution
 build/
 dist/
 *.spec
-blynk_history_*.csv
-*.service
-blynk_history_*.txt
-MQ-7*.txt
-HOW_TO_*.txt
+
+# IDE and editors
 .theia/
+*.lnk
+
+# Backup and temporary files
+*.OLD
 *.BAD
 *.TEST
 *.BAK
-.gitignore
-*.lnk
-ESP32_TEST
-simulation
+backup/
 library-backups/
+
+# Logs and reports
+*.log
+reports/
+blynk_history_*.csv
+blynk_history_*.txt
+MQ-7*.txt
+
+# Documentation
+*.pptx
+*.pdf
+*.docx
+HOW_TO_*.txt
+
+# Assets
+*.ico
+*.png
+*.cddx
+
+# Security keys
 privkey.pem
 user.pem
+
+# Project-specific
+ESP32_TEST
+simulation
+*.service
+
+# Exception: Keep Blynk library headers
+*.h
+!BLYNK_LIB/src/**/*.h
