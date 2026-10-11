@@ -1,0 +1,5 @@
+timestamp_utc,episode_id,event_phase,event_type,severity,duration_seconds,blynk_status,v4_available,v4_fresh,v4_value,pair_gps_unix,pair_device_ms,reset_reason,status_flags,rssi_dbm,confidence,details
+2026-10-11T14:36:54.645Z,1f5424b4ba894902b0ebb8884c81f3d6,OBSERVED,DASHBOARD_STARTED,INFO,,,,,,,,,,,confirmed,Dashboard v2.0; journal=aq_station_events.csv
+2026-10-11T14:36:56.864Z,15994886b033483c91f84a6ad75298c2,OBSERVED,ENGINEERING_MESSAGE,INFO,,connected,true,false,5,1791729384,2359113,POWERON,269,-52,observed,Blynk SIMPLE connected - FW 3.9.214
+2026-10-11T14:37:12.491Z,ede528a250a743e19ccd79c3c19bca43,START,COHERENT_STREAM_STALL,WARNING,,connected,true,true,7,1791729384,2359113,POWERON,269,-52,observed,Matched V61/V62 record key did not advance
+2026-10-11T14:37:17.777Z,ede528a250a743e19ccd79c3c19bca43,END,COHERENT_STREAM_STALL,INFO,5.281,connected,true,true,9,1791729391,2366467,POWERON,269,-52,observed,Recovered: Matched V61/V62 record key did not advance

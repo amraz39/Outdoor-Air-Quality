@@ -432,7 +432,26 @@ struct Core1TelemetryPair;
 //   - Reduces post-connect telemetry holdoff to 2s and slow-write backoff to 3s.
 //   - Retains the 3s WiFiClient timeout: the field log proved a 1.952s write
 //     can still complete, so a 1s timeout would create a new disconnect.
-#define FIRMWARE_VERSION "3.9.213"
+// v3.9.214 EVENT-DRIVEN TCP QUIET RECOVERY
+//   - Root cause in the v3.9.213 trace: every failure was an exact application
+//     checkpoint RESPONSE loss. While that checkpoint was pending, the Blynk
+//     library correctly suppressed its ordinary protocol PING, but the bulk
+//     HTTP isolation gate watched only that suppressed protocol PING. HTTP
+//     therefore kept sending/retrying on the same degraded ESP32 WiFi/lwIP
+//     path (diagnostic `isolations=0`) until both sockets failed.
+//   - Treat either exact proof (application checkpoint or protocol PING) as a
+//     health threat after 3 seconds. Close/pause HTTP immediately and allow
+//     only the already-buffered Blynk/TCP retransmission to use the path.
+//   - Extend the application/generic sequence-hole deadline to 70 seconds.
+//     Earlier packet captures measured successful ESP32 TCP retransmission at
+//     47-58 seconds; the old 25-second deadline destroyed recoverable sockets.
+//   - An open HTTP circuit is no longer proof by itself. A circuit lasts 90
+//     seconds and the trace showed it was still causing MCU resets with only
+//     one recovered failure 49-63 seconds old. Full shared-path recovery now
+//     requires a fresh unresolved streak of at least two HTTP failures.
+//   - V4 remains 1 second, V61/V62 remain an immutable timestamp pair, normal
+//     802.11b/g/n remains enabled, and Core 1 remains free of network calls.
+#define FIRMWARE_VERSION "3.9.214"
 
 // v3.9.198 EARLY SESSION-PATH RECOVERY + FIRST-DISCONNECT OWNERSHIP
 //   - The v3.9.197 trace lost RESPONSE 691 while WiFi, heap and both cores were
@@ -2376,14 +2395,16 @@ static void diagnosticResetRequest(const char *reason) {
 #define BLYNK_STOCK_DEFERRED_TX_BYTES 2048U
 // v3.9.185: the v3.9.184 field run proved that a fresh socket authenticates in
 // about one second while preserving the old sequence space causes a 65s outage.
-// The largest healthy observed RESPONSE gap was 20.042s. After 25s, discard only
+// Normal RESPONSE gaps remain below about 20s, but packet captures also proved
+// that an accepted ESP32 TCP segment can need 47-58s of retransmission before
+// its RESPONSE returns.  Allow 70s with bulk HTTP quiesced before discarding
 // the affected Blynk socket; lower reset domains remain separately gated.
-#define BLYNK_SERVER_STALL_GRACE_MS           60000UL
+#define BLYNK_SERVER_STALL_GRACE_MS           70000UL
 #define BLYNK_STOCK_PATH_RECOVERY_ESCALATE_MS BLYNK_SERVER_STALL_GRACE_MS
-#define BLYNK_APPLICATION_PROBE_TIMEOUT_MS    25000UL
-// v3.9.209: HTTP is already fully isolated after a PING has been unanswered
-// for 3s. Field PING replies normally arrive within 0-2s; waiting 25s allowed
-// the shared path to deteriorate until replacement TCP SYNs also timed out.
+#define BLYNK_APPLICATION_PROBE_TIMEOUT_MS    70000UL
+// HTTP is isolated after either exact application or protocol proof has been
+// unanswered for 3s. That early isolation provides the quiet interval needed
+// for the longer evidence-based TCP retransmission allowance above.
 #define BLYNK_PROTOCOL_PROBE_TIMEOUT_MS       15000UL
 #define BLYNK_STOCK_PATH_RECOVERY_VERIFY_MS   30000UL
 #define BLYNK_SEQUENCE_HOLE_MAX_SOCKET_TRIALS 3U
@@ -12142,17 +12163,32 @@ static inline bool blynkRunGuardCheck(uint32_t elapsedMs, const char* path)
 static void telemetryNetworkUpdateBlynkGate()
 {
   const uint32_t now = millis();
-  const bool exactPingOverdue =
+  // An application checkpoint and a protocol PING are the same end-to-end
+  // ordered-stream proof. While the former is pending BlynkProtocol does not
+  // send the latter, so watching only protocolPingPending() left HTTP active
+  // throughout every v3.9.213 failure. Quiesce the bulk stream for either
+  // exact proof and leave the Blynk socket alone to retransmit.
+  const bool exactApplicationAckOverdue =
+      Blynk.connected() &&
+      blynkStockSessionState == BLYNK_STOCK_SESSION_ONLINE &&
+      Blynk.applicationAckPending() && Blynk.applicationAckAge() >= 3000UL;
+  const bool exactProtocolPingOverdue =
       Blynk.connected() &&
       blynkStockSessionState == BLYNK_STOCK_SESSION_ONLINE &&
       Blynk.protocolPingPending() && Blynk.protocolPingAge() >= 3000UL;
+  const bool exactProbeOverdue =
+      exactApplicationAckOverdue || exactProtocolPingOverdue;
 
-  if (exactPingOverdue) {
+  if (exactProbeOverdue) {
     if (!telemetryHttpHealthThreatActive) {
       telemetryHttpHealthThreatActive = true;
       telemetryHttpHealthPauseLatched = true;
       ++telemetryHttpHealthIsolationCount;
-      Serial.printf("[Blynk/HTTP ISOLATION] exact protocol PING overdue after post-run processing; closing HTTP PCB pingId=%u pingAge=%lums count=%lu\n",
+      Serial.printf("[Blynk/HTTP ISOLATION] exact Blynk proof overdue; closing HTTP PCB appPending=%d appId=%u appAge=%lums protocolPending=%d pingId=%u pingAge=%lums count=%lu\n",
+                    Blynk.applicationAckPending() ? 1 : 0,
+                    (unsigned)Blynk.applicationAckPingId(),
+                    (unsigned long)Blynk.applicationAckAge(),
+                    Blynk.protocolPingPending() ? 1 : 0,
                     (unsigned)Blynk.protocolPingId(),
                     (unsigned long)Blynk.protocolPingAge(),
                     (unsigned long)telemetryHttpHealthIsolationCount);
@@ -12161,7 +12197,7 @@ static void telemetryNetworkUpdateBlynkGate()
     telemetryHttpHealthThreatActive = false;
     telemetryHttpHealthResumeNotBeforeMs =
         now + TELEMETRY_HTTP_HEALTH_HOLDOFF_MS;
-    Serial.printf("[Blynk/HTTP ISOLATION] exact PING recovered; starting %lums stable quiet window\n",
+    Serial.printf("[Blynk/HTTP ISOLATION] exact Blynk proof recovered; starting %lums stable quiet window\n",
                   (unsigned long)TELEMETRY_HTTP_HEALTH_HOLDOFF_MS);
   }
 
@@ -12174,7 +12210,7 @@ static void telemetryNetworkUpdateBlynkGate()
 
   telemetryHttpPauseRequested =
       sharedPathRecoveryState != SHARED_PATH_IDLE ||
-      !Blynk.connected() || exactPingOverdue ||
+      !Blynk.connected() || exactProbeOverdue ||
       telemetryHttpHealthPauseLatched;
 }
 
@@ -12759,7 +12795,10 @@ void loop()
     const bool activeHttpCircuit =
         telemetryHttpCircuitOpenUntilMs != 0 &&
         (int32_t)(telemetryHttpCircuitOpenUntilMs - sequenceHoleNow) > 0;
-    if (unresolvedRecentHttpFailure || activeHttpCircuit) {
+    // A circuit is a pause timer, not fresh failure evidence. It deliberately
+    // remains open for 90 seconds, so using it alone made a single recovered
+    // timeout force an unrelated Blynk hole directly into esp_restart().
+    if (unresolvedRecentHttpFailure) {
       blynkSequenceHoleSocketTrialCount = 0;
       blynkSequenceHoleRecentGenerations = 2U;
       const uint32_t httpFailureAge = telemetryHttpLastFailureMs

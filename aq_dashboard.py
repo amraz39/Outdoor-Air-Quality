@@ -1,4 +1,14 @@
 # Outdoor Air Quality Station — ESP32 Dashboard for Windows PC
+# v2.0 — Rolling 24-hour diagnostic event journal
+#
+# v2.0 changes:
+#   - Creates diag/aq_station_events.csv beside the script/executable.
+#   - Records transition episodes for server, Blynk-session, V4 telemetry,
+#     coherent-record, ESP32 reset, status-flag, RSSI and reset-command events.
+#   - Uses UTC timestamps, confidence labels and START/END episode IDs so a
+#     telemetry pause is not mislabeled as a Blynk reconnect.
+#   - Retains only the newest 24 hours through periodic atomic CSV pruning.
+#
 # v1.9 — Four-second V4 loss indication and clean connected text
 #
 # v1.9 changes:
@@ -98,14 +108,18 @@
 
 import os
 import re
+import csv
 import gzip
 import json
 import queue
+import sys
 import threading
 import time
+import uuid
 import webbrowser
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import requests
 import numpy as np
@@ -154,8 +168,28 @@ LIVE_GRAPH_SAMPLE_S = 30.0   # bound graph memory while preserving trends
 HTTP_TIMEOUT_S = 4
 HEALTH_HTTP_TIMEOUT_S = 1.0
 
+# Rolling diagnostic journal. Event rows are retained for exactly 24 hours;
+# continuous telemetry samples are intentionally not written here.
+EVENT_RETENTION_HOURS = 24
+EVENT_PRUNE_INTERVAL_S = 300.0
+EVENT_STARTUP_GRACE_S = 5.0
+EVENT_RSSI_WEAK_DBM = -72
+EVENT_RSSI_RECOVER_DBM = -68
+EVENT_PAIR_MISMATCH_POLLS = 2
+
+
+def _application_directory():
+    """Return a stable writable directory for script and packaged-EXE runs."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+DIAG_DIRECTORY = _application_directory() / "diag"
+EVENT_CSV_PATH = DIAG_DIRECTORY / "aq_station_events.csv"
+
 # V4 is a rolling diagnostic/telemetry counter sent by the ESP32.
-# Firmware v3.9.213 publishes a deterministic V4 heartbeat once per second.
+# Firmware v3.9.214 publishes a deterministic V4 heartbeat once per second.
 # The dashboard checks it once per second and allows normal LAN/poll jitter.
 # The full data worker polls every five seconds, so matching V61/V62 keys use a
 # wider fallback window. A successful GET or an initial cached value is never
@@ -247,6 +281,335 @@ STATUS_FLAGS = [
 ]
 # Flags where the bit being SET is a good/OK condition (green when set).
 STATUS_GOOD_WHEN_SET = {1 << 0, 1 << 1, 1 << 2, 1 << 3}
+
+# ============================================================
+# ROLLING 24-HOUR DIAGNOSTIC EVENT JOURNAL
+# ============================================================
+
+EVENT_CSV_FIELDS = (
+    "timestamp_utc", "episode_id", "event_phase", "event_type", "severity",
+    "duration_seconds", "blynk_status", "v4_available", "v4_fresh",
+    "v4_value", "pair_gps_unix", "pair_device_ms", "reset_reason",
+    "status_flags", "rssi_dbm", "confidence", "details",
+)
+
+
+def _utc_now_text():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z")
+
+
+def _parse_utc_text(value):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+class EventJournal:
+    """Serialize diagnostic events and atomically enforce 24-hour retention."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self._queue = queue.Queue()
+        self._accepting = True
+        self._close_lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._run, name="aq-event-journal", daemon=True)
+        self._thread.start()
+
+    def log(self, event_type, event_phase="OBSERVED", severity="INFO",
+            episode_id="", duration_seconds="", confidence="confirmed",
+            **context):
+        if not self._accepting:
+            return
+        row = {name: "" for name in EVENT_CSV_FIELDS}
+        row.update({
+            "timestamp_utc": _utc_now_text(),
+            "episode_id": episode_id or uuid.uuid4().hex,
+            "event_phase": event_phase,
+            "event_type": event_type,
+            "severity": severity,
+            "duration_seconds": duration_seconds,
+            "confidence": confidence,
+        })
+        for key in EVENT_CSV_FIELDS:
+            if key in context and context[key] is not None:
+                value = context[key]
+                if isinstance(value, bool):
+                    value = "true" if value else "false"
+                row[key] = str(value).replace("\r", " ").replace("\n", " ")
+        self._queue.put(row)
+
+    def close(self):
+        """Flush a final shutdown event without delaying normal GUI work."""
+        with self._close_lock:
+            if not self._accepting:
+                return
+            self.log("DASHBOARD_STOPPED", details="Normal GUI shutdown")
+            self._accepting = False
+            self._queue.put(None)
+        self._thread.join(timeout=2.0)
+
+    def _prepare_file(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists() and self.path.stat().st_size:
+            try:
+                with self.path.open("r", newline="", encoding="utf-8") as handle:
+                    header = next(csv.reader(handle), [])
+                if tuple(header) != EVENT_CSV_FIELDS:
+                    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    self.path.replace(
+                        self.path.with_name(f"{self.path.stem}.incompatible-{stamp}.csv"))
+            except OSError:
+                pass
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            with self.path.open("w", newline="", encoding="utf-8") as handle:
+                csv.DictWriter(handle, fieldnames=EVENT_CSV_FIELDS).writeheader()
+        self._prune()
+
+    def _append(self, row):
+        with self.path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=EVENT_CSV_FIELDS)
+            writer.writerow(row)
+            handle.flush()
+
+    def _prune(self):
+        if not self.path.exists():
+            return
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=EVENT_RETENTION_HOURS)
+        retained = []
+        try:
+            with self.path.open("r", newline="", encoding="utf-8") as handle:
+                for row in csv.DictReader(handle):
+                    stamp = _parse_utc_text(row.get("timestamp_utc"))
+                    if stamp is not None and stamp >= cutoff:
+                        retained.append({key: row.get(key, "") for key in EVENT_CSV_FIELDS})
+            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+            with temporary.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=EVENT_CSV_FIELDS)
+                writer.writeheader()
+                writer.writerows(retained)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+        except OSError as exc:
+            print(f"Diagnostic event journal prune failed: {exc}", file=sys.stderr)
+
+    def _run(self):
+        try:
+            self._prepare_file()
+            next_prune = time.monotonic() + EVENT_PRUNE_INTERVAL_S
+            while True:
+                timeout = max(0.1, next_prune - time.monotonic())
+                try:
+                    row = self._queue.get(timeout=timeout)
+                except queue.Empty:
+                    row = "PRUNE"
+                if row is None:
+                    break
+                if row == "PRUNE":
+                    self._prune()
+                    next_prune = time.monotonic() + EVENT_PRUNE_INTERVAL_S
+                    continue
+                self._append(row)
+                if time.monotonic() >= next_prune:
+                    self._prune()
+                    next_prune = time.monotonic() + EVENT_PRUNE_INTERVAL_S
+            self._prune()
+        except Exception as exc:
+            # Diagnostics must never take down the monitoring dashboard.
+            print(f"Diagnostic event journal disabled: {exc}", file=sys.stderr)
+
+
+class DiagnosticEventMonitor:
+    """Convert polled values into clearly classified transition episodes."""
+
+    def __init__(self, journal):
+        self.journal = journal
+        self.lock = threading.Lock()
+        self.started_at = time.monotonic()
+        self.health_enabled = False
+        self.active = {}
+        self.context = {
+            "blynk_status": "unknown", "v4_available": "", "v4_fresh": "",
+            "v4_value": "", "pair_gps_unix": "", "pair_device_ms": "",
+            "reset_reason": "", "status_flags": "", "rssi_dbm": "",
+        }
+        self.last_device_ms = None
+        self.last_reset_reason = None
+        self.last_status_flags = None
+        self.last_pair_key = None
+        self.last_pair_change = None
+        self.pair_mismatch_polls = 0
+        self.last_engineering_event = None
+
+    def _snapshot(self, details=""):
+        result = dict(self.context)
+        result["details"] = details
+        return result
+
+    def _episode(self, event_type, condition, severity, confidence, details):
+        current = self.active.get(event_type)
+        if condition and current is None:
+            episode_id = uuid.uuid4().hex
+            started = time.monotonic()
+            self.active[event_type] = (episode_id, started)
+            self.journal.log(event_type, "START", severity, episode_id=episode_id,
+                             confidence=confidence, **self._snapshot(details))
+        elif not condition and current is not None:
+            episode_id, started = self.active.pop(event_type)
+            duration = f"{max(0.0, time.monotonic() - started):.3f}"
+            self.journal.log(event_type, "END", "INFO", episode_id=episode_id,
+                             duration_seconds=duration, confidence=confidence,
+                             **self._snapshot(f"Recovered: {details}"))
+
+    def close_all(self):
+        """Close open episodes so the CSV remains easy to analyse."""
+        with self.lock:
+            for event_type, (episode_id, started) in list(self.active.items()):
+                duration = f"{max(0.0, time.monotonic() - started):.3f}"
+                self.journal.log(
+                    event_type, "END", "INFO", episode_id=episode_id,
+                    duration_seconds=duration, confidence="observed",
+                    **self._snapshot("Dashboard stopped while episode was active"))
+            self.active.clear()
+
+    def observe_health(self, blynk_state, heartbeat_available,
+                       heartbeat_fresh, heartbeat_value, pair_fresh, source):
+        with self.lock:
+            self.context.update({
+                "blynk_status": ("unknown" if blynk_state is None
+                                  else "connected" if blynk_state else "offline"),
+                "v4_available": heartbeat_available,
+                "v4_fresh": heartbeat_fresh,
+                "v4_value": heartbeat_value if heartbeat_value is not None else "",
+            })
+            if not self.health_enabled:
+                if time.monotonic() - self.started_at < EVENT_STARTUP_GRACE_S:
+                    return
+                self.health_enabled = True
+
+            data_fresh = heartbeat_fresh or (
+                not heartbeat_available and pair_fresh)
+            self._episode(
+                "BLYNK_STATUS_UNAVAILABLE", blynk_state is None, "ERROR",
+                "confirmed", f"Hardware-status endpoint unavailable; {source}")
+            self._episode(
+                "BLYNK_SESSION_OFFLINE", blynk_state is False, "ERROR",
+                "confirmed", "Blynk isHardwareConnected reported false")
+            self._episode(
+                "V4_READ_UNAVAILABLE", not heartbeat_available, "WARNING",
+                "confirmed", "V4 HTTP read unavailable")
+            self._episode(
+                "TELEMETRY_STALL", blynk_state is True and not data_fresh,
+                "WARNING", "confirmed",
+                "Blynk session present but V4/V61-V62 liveness is stale")
+
+    def observe_data(self, values, key61, key62, matched_pair_key):
+        with self.lock:
+            reset_reason = values.get("reset_reason")
+            status_flags = values.get("status_flags")
+            rssi = values.get("rssi")
+            self.context.update({
+                "reset_reason": reset_reason or "",
+                "status_flags": status_flags or "",
+                "rssi_dbm": rssi or "",
+            })
+
+            if reset_reason is not None:
+                reset_text = str(reset_reason).strip()
+                if (self.last_reset_reason is not None and reset_text and
+                        reset_text != self.last_reset_reason):
+                    self.journal.log(
+                        "RESET_REASON_CHANGED", severity="WARNING",
+                        confidence="confirmed",
+                        **self._snapshot(
+                            f"V34 changed {self.last_reset_reason!r} -> {reset_text!r}"))
+                if reset_text:
+                    self.last_reset_reason = reset_text
+
+            if status_flags is not None:
+                try:
+                    flags = int(float(status_flags))
+                except (TypeError, ValueError):
+                    flags = None
+                if flags is not None:
+                    if self.last_status_flags is not None and flags != self.last_status_flags:
+                        changed = self.last_status_flags ^ flags
+                        self.journal.log(
+                            "STATUS_FLAGS_CHANGED", severity="WARNING",
+                            confidence="confirmed",
+                            **self._snapshot(
+                                f"V20 {self.last_status_flags} -> {flags}; changedMask=0x{changed:X}"))
+                    self.last_status_flags = flags
+
+            try:
+                rssi_number = float(rssi) if rssi is not None else None
+            except (TypeError, ValueError):
+                rssi_number = None
+            weak_active = "WEAK_WIFI_SIGNAL" in self.active
+            weak_now = (rssi_number is not None and
+                        (rssi_number <= EVENT_RSSI_WEAK_DBM or
+                         (weak_active and rssi_number < EVENT_RSSI_RECOVER_DBM)))
+            self._episode("WEAK_WIFI_SIGNAL", weak_now, "WARNING", "observed",
+                          f"RSSI={rssi_number} dBm")
+
+            pair_mismatch = key61 is not None and key62 is not None and key61 != key62
+            self.pair_mismatch_polls = (
+                self.pair_mismatch_polls + 1 if pair_mismatch else 0)
+            self._episode(
+                "V61_V62_MISMATCH",
+                self.pair_mismatch_polls >= EVENT_PAIR_MISMATCH_POLLS,
+                "WARNING", "observed",
+                f"V61 key={key61}; V62 key={key62}")
+
+            if matched_pair_key is not None:
+                gps_unix, device_ms_text = matched_pair_key
+                self.context["pair_gps_unix"] = gps_unix
+                self.context["pair_device_ms"] = device_ms_text
+                try:
+                    device_ms = int(device_ms_text)
+                except (TypeError, ValueError):
+                    device_ms = None
+                if device_ms is not None:
+                    if (self.last_device_ms is not None and
+                            device_ms + 5000 < self.last_device_ms):
+                        rollover = (self.last_device_ms >= 0xF0000000 and
+                                    device_ms <= 0x0FFFFFFF)
+                        self.journal.log(
+                            "DEVICE_MILLIS_ROLLOVER" if rollover else "ESP32_RESET",
+                            severity="INFO" if rollover else "ERROR",
+                            confidence="confirmed",
+                            **self._snapshot(
+                                f"deviceMs {self.last_device_ms} -> {device_ms}"))
+                    self.last_device_ms = device_ms
+
+                if matched_pair_key != self.last_pair_key:
+                    self.last_pair_key = matched_pair_key
+                    self.last_pair_change = time.monotonic()
+
+            pair_stalled = (
+                self.last_pair_change is not None and
+                time.monotonic() - self.last_pair_change > PAIR_FALLBACK_TIMEOUT_S)
+            self._episode(
+                "COHERENT_STREAM_STALL", pair_stalled, "WARNING", "observed",
+                "Matched V61/V62 record key did not advance")
+
+            eng_msg = str(values.get("eng_msg") or "").strip()
+            if eng_msg and eng_msg != self.last_engineering_event and re.search(
+                    r"disconnect|timeout|reset|failed|recovery|connected", eng_msg,
+                    flags=re.IGNORECASE):
+                self.last_engineering_event = eng_msg
+                self.journal.log(
+                    "ENGINEERING_MESSAGE", severity="INFO", confidence="observed",
+                    **self._snapshot(eng_msg))
+
+
+_event_journal = EventJournal(EVENT_CSV_PATH)
+_event_monitor = DiagnosticEventMonitor(_event_journal)
+_event_journal.log(
+    "DASHBOARD_STARTED", details=f"Dashboard v2.0; journal={EVENT_CSV_PATH.name}")
 
 # ============================================================
 # COLOR THEME
@@ -737,13 +1100,23 @@ def do_remote_reset():
         # v1.5 / firmware v3.9.212: explicitly arm the edge-triggered reset.
         # LOW-before-HIGH also clears a stale server-side HIGH left by an
         # interrupted earlier request. The trailing LOW prepares the next use.
-        write_pin(RESET_PIN, 0)
+        armed = write_pin(RESET_PIN, 0)
         time.sleep(0.2)
+        triggered = False
+        released = False
         try:
-            write_pin(RESET_PIN, 1)
+            triggered = write_pin(RESET_PIN, 1)
             time.sleep(0.5)
         finally:
-            write_pin(RESET_PIN, 0)
+            released = write_pin(RESET_PIN, 0)
+        delivered = armed and triggered and released
+        _event_journal.log(
+            "REMOTE_RESET_COMMAND", severity="WARNING",
+            confidence="confirmed" if delivered else "observed",
+            details=("V55 LOW-HIGH-LOW delivered"
+                     if delivered else
+                     f"V55 delivery incomplete: arm={armed}, "
+                     f"trigger={triggered}, release={released}"))
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -1102,6 +1475,9 @@ def _poll_data_worker():
                     _last_pair_key = matched_pair_key
                     _last_pair_activity = now
                     _last_data_wallclock = datetime.now()
+
+        _event_monitor.observe_data(values, key61, key62, matched_pair_key)
+
         # Record graph samples only when the stream advances. A server TRUE
         # response by itself is not data and must not duplicate cached values.
         if changed:
@@ -1224,6 +1600,10 @@ def _poll_health_worker():
 
         device_connected, source = _decide_connection(
             blynk_state, heartbeat_available, heartbeat_fresh, pair_fresh)
+
+        _event_monitor.observe_health(
+            blynk_state, heartbeat_available, heartbeat_fresh,
+            heartbeat_value, pair_fresh, source)
 
         # This is the only one-second data-widget update. It is applied on the
         # Tk main thread by _poll_queue; no other dashboard value is included.
@@ -1601,4 +1981,15 @@ def _schedule_graph_refresh():
 app.after(LIVE_GRAPH_DRAW_MS, _schedule_live_graph_redraw)
 app.after(GRAPH_REFRESH_MS, _schedule_graph_refresh)
 
-app.mainloop()
+
+def _on_dashboard_close():
+    # app.mainloop()'s finally block performs the ordered journal flush.
+    app.destroy()
+
+
+app.protocol("WM_DELETE_WINDOW", _on_dashboard_close)
+try:
+    app.mainloop()
+finally:
+    _event_monitor.close_all()
+    _event_journal.close()
