@@ -1,5 +1,13 @@
 # Outdoor Air Quality Station — ESP32 Dashboard for Windows PC
-# v1.3 — Companion dashboard for AirQualityOutdoor_ESP32_Blynk.ino (v3.9.5)
+# v1.4 — Live-graph and connection-health refactor
+#
+# v1.4 changes:
+#   - Graphs merge server history with bounded live samples from this session.
+#   - Connection state honors isHardwareConnected beyond startup and falls
+#     back to actual telemetry changes when the endpoint is unavailable.
+#   - Data, status, graph, and control workers use separate HTTP sessions.
+#   - Tk variables are no longer read from background threads, and a graph
+#     exception can no longer permanently suppress future refreshes.
 #
 # Connects to your local Blynk server and displays every virtual pin
 # published by the ESP32 firmware:
@@ -47,10 +55,12 @@
 import os
 import re
 import gzip
+import json
 import queue
 import threading
 import time
 import webbrowser
+from collections import deque
 from datetime import datetime, timedelta
 
 import requests
@@ -93,7 +103,9 @@ BLYNK_PORT = _read_secrets_value("BLYNK_PORT", quoted=False)
 # ============================================================
 
 FAST_POLL_MS = 5000          # matches FAST telemetry tier on the ESP32
-GRAPH_REFRESH_MS = 60000     # how often the 4 history graphs re-fetch
+GRAPH_REFRESH_MS = 60000     # how often server-side history is re-fetched
+LIVE_GRAPH_DRAW_MS = 5000    # redraw cached history + current session samples
+LIVE_GRAPH_SAMPLE_S = 30.0   # bound graph memory while preserving trends
 HTTP_TIMEOUT_S = 4
 
 # V4 is a rolling diagnostic/telemetry counter sent by the ESP32.
@@ -145,6 +157,11 @@ GRAPH_PINS = {
     "eCO2 (ppm)": SENSOR_PINS["eco2"],
     "CO (ppm)": SENSOR_PINS["co_ppm"],
     "Dust (mg/m³)": SENSOR_PINS["dust"],
+}
+
+# Reverse lookup used when live polled values are added to the graphs.
+GRAPH_VALUE_KEYS = {
+    pin: key for key, pin in SENSOR_PINS.items() if pin in GRAPH_PINS.values()
 }
 
 RESET_PIN = 55
@@ -214,7 +231,21 @@ FONT_SMALL = ("Segoe UI", 10)
 # also supported for Blynk installations that expose it.
 
 
-_session = requests.Session()
+_http_local = threading.local()
+
+
+def _session():
+    """Return one persistent HTTP session per worker thread.
+
+    ``requests.Session`` is not guaranteed to be thread-safe. The dashboard
+    has independent data, status, graph, and reset workers, so each gets its
+    own connection pool.
+    """
+    session = getattr(_http_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        _http_local.session = session
+    return session
 
 
 def is_device_connected():
@@ -237,7 +268,7 @@ def is_device_connected():
 
     for url in urls:
         try:
-            r = _session.get(url, timeout=HTTP_TIMEOUT_S)
+            r = _session().get(url, timeout=HTTP_TIMEOUT_S)
             if r.status_code != 200:
                 continue
 
@@ -258,11 +289,18 @@ def is_device_connected():
 def read_pin(pin):
     url = f"http://{BLYNK_SERVER}:{BLYNK_PORT}/{BLYNK_AUTH}/get/V{pin}"
     try:
-        r = _session.get(url, timeout=HTTP_TIMEOUT_S)
+        r = _session().get(url, timeout=HTTP_TIMEOUT_S)
         if r.status_code != 200:
             return None
-        text = r.text.strip().replace('["', "").replace('"]', "")
-        return text
+        text = r.text.strip()
+        try:
+            decoded = json.loads(text)
+            if isinstance(decoded, list):
+                return str(decoded[0]) if decoded else None
+            return str(decoded)
+        except (ValueError, TypeError):
+            # Compatibility with older/non-standard local-server responses.
+            return text.replace('["', "").replace('"]', "")
     except Exception:
         return None
 
@@ -270,25 +308,38 @@ def read_pin(pin):
 def write_pin(pin, value):
     url = f"http://{BLYNK_SERVER}:{BLYNK_PORT}/{BLYNK_AUTH}/update/V{pin}?value={value}"
     try:
-        r = _session.get(url, timeout=HTTP_TIMEOUT_S)
+        r = _session().get(url, timeout=HTTP_TIMEOUT_S)
         return r.status_code == 200
     except Exception:
         return False
 
 
+def _timestamp_from_server(raw_timestamp):
+    """Accept Unix seconds, milliseconds, microseconds, or nanoseconds."""
+    value = float(raw_timestamp)
+    magnitude = abs(value)
+    if magnitude >= 1e17:
+        value /= 1e9
+    elif magnitude >= 1e14:
+        value /= 1e6
+    elif magnitude >= 1e11:
+        value /= 1e3
+    return datetime.fromtimestamp(value)
+
+
 def fetch_history(pin, hours):
-    """Return list of (datetime, float) tuples for the last `hours` hours."""
+    """Return ``(points, error)`` for the requested server-side history."""
     url = f"http://{BLYNK_SERVER}:{BLYNK_PORT}/{BLYNK_AUTH}/data/V{pin}"
     try:
-        r = _session.get(url, timeout=30)
+        r = _session().get(url, timeout=15)
         if r.status_code != 200:
-            return []
+            return [], f"HTTP {r.status_code}"
         try:
             text = gzip.decompress(r.content).decode("utf-8", errors="ignore")
         except Exception:
             text = r.text
-    except Exception:
-        return []
+    except Exception as exc:
+        return [], type(exc).__name__
 
     cutoff = datetime.now() - timedelta(hours=hours)
     points = []
@@ -301,13 +352,13 @@ def fetch_history(pin, hours):
             continue
         try:
             value = float(parts[0])
-            ts = datetime.fromtimestamp(int(parts[1]) / 1000)
+            ts = _timestamp_from_server(parts[1])
             if ts >= cutoff:
                 points.append((ts, value))
         except Exception:
             continue
     points.sort(key=lambda p: p[0])
-    return points
+    return points, None
 
 
 # ============================================================
@@ -834,30 +885,115 @@ _map_has_centered = False
 
 _graph_lock = threading.Lock()
 _graph_busy = False
+_graph_history_cache = {pin: [] for pin in GRAPH_PINS.values()}
+_live_graph_lock = threading.Lock()
+# 168 hours sampled every 30 seconds, plus margin for scheduler jitter.
+_live_graph_points = {
+    pin: deque(maxlen=22000) for pin in GRAPH_PINS.values()
+}
+_last_live_graph_sample = 0.0
+_graph_source_note = "waiting for data"
 
 
 def trigger_graph_refresh():
     global _graph_busy
+    # Tk variables are main-thread objects. Pass this value into the worker.
+    hours = int(history_var.get())
     with _graph_lock:
         if _graph_busy:
             return
         _graph_busy = True
-    threading.Thread(target=_graph_worker, daemon=True).start()
+    label_graph_status.configure(text="Refreshing…", text_color=TXT_DIM)
+    threading.Thread(target=_graph_worker, args=(hours,), daemon=True).start()
 
 
-def _graph_worker():
-    global _graph_busy
-    hours = int(history_var.get())
-    app.after(0, lambda: label_graph_status.configure(text="Refreshing…"))
-    results = []
-    for name, pin in GRAPH_ORDER:
-        results.append((name, fetch_history(pin, hours)))
-    app.after(0, lambda: _apply_graph_data(results, hours))
+def _combined_graph_points(pin, hours):
+    """Merge archived server history with live samples from this app run."""
+    cutoff = datetime.now() - timedelta(hours=hours)
     with _graph_lock:
-        _graph_busy = False
+        archived = list(_graph_history_cache.get(pin, ()))
+    with _live_graph_lock:
+        live = list(_live_graph_points.get(pin, ()))
+
+    merged = {
+        int(point_time.timestamp() * 1000): (point_time, value)
+        for point_time, value in archived + live
+        if point_time >= cutoff
+    }
+    return sorted(merged.values(), key=lambda point: point[0])
 
 
-def _apply_graph_data(results, hours):
+def _record_live_graph_samples(values, now_monotonic):
+    """Store one bounded, in-memory graph sample while telemetry is live."""
+    global _last_live_graph_sample
+    if now_monotonic - _last_live_graph_sample < LIVE_GRAPH_SAMPLE_S:
+        return
+
+    sample_time = datetime.now()
+    pending = []
+    for pin, key in GRAPH_VALUE_KEYS.items():
+        try:
+            value = float(values.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value <= UNAVAILABLE_THRESHOLD:
+            continue
+        pending.append((pin, (sample_time, value)))
+
+    if not pending:
+        return
+    with _live_graph_lock:
+        for pin, point in pending:
+            _live_graph_points[pin].append(point)
+    _last_live_graph_sample = now_monotonic
+
+
+def _graph_worker(hours):
+    global _graph_busy, _graph_source_note
+    fetched = {}
+    errors = []
+    try:
+        for name, pin in GRAPH_ORDER:
+            points, error = fetch_history(pin, hours)
+            fetched[pin] = points
+            if error:
+                errors.append(f"{name}: {error}")
+
+        with _graph_lock:
+            _graph_history_cache.update(fetched)
+
+        results = [
+            (name, _combined_graph_points(pin, hours))
+            for name, pin in GRAPH_ORDER
+        ]
+        archived_count = sum(len(points) for points in fetched.values())
+        if errors:
+            _graph_source_note = "live data; server history unavailable"
+        elif archived_count == 0:
+            _graph_source_note = "live data; server history has no recent points"
+        else:
+            _graph_source_note = "server history + live data"
+        _result_queue.put(("graph", (results, hours, _graph_source_note)))
+    except Exception as exc:
+        _graph_source_note = f"graph refresh failed: {type(exc).__name__}"
+        _result_queue.put(("graph_error", _graph_source_note))
+    finally:
+        # An exception must not leave all future graph refreshes suppressed.
+        with _graph_lock:
+            _graph_busy = False
+
+
+def _redraw_graph_from_cache():
+    """Fast UI-only redraw; no HTTP requests are made here."""
+    hours = int(history_var.get())
+    results = [
+        (name, _combined_graph_points(pin, hours))
+        for name, pin in GRAPH_ORDER
+    ]
+    _apply_graph_data(results, hours, _graph_source_note)
+
+
+def _apply_graph_data(results, hours, source_note=""):
     for idx, (name, points) in enumerate(results):
         ax = axes.flat[idx]
         ax.clear()
@@ -884,8 +1020,10 @@ def _apply_graph_data(results, hours):
                     color=TXT_DIM, transform=ax.transAxes)
     fig.tight_layout(pad=2.4)
     graph_canvas.draw()
+    suffix = f" — {source_note}" if source_note else ""
     label_graph_status.configure(
-        text=f"Updated {datetime.now().strftime('%H:%M:%S')}")
+        text=f"Updated {datetime.now().strftime('%H:%M:%S')}{suffix}",
+        text_color=TXT_DIM)
 
 
 # ============================================================
@@ -900,7 +1038,9 @@ _result_queue = queue.Queue()
 _activity_lock = threading.Lock()
 _last_data_signature = None
 _last_data_activity = None
+_last_data_wallclock = None
 _have_data_sample = False
+_server_connected_state = None
 
 
 def _poll_data_worker():
@@ -910,7 +1050,8 @@ def _poll_data_worker():
     A broken/unsupported Blynk connection-status endpoint must never prevent
     sensor values from reaching the dashboard.
     """
-    global _last_data_signature, _last_data_activity, _have_data_sample
+    global _last_data_signature, _last_data_activity
+    global _last_data_wallclock, _have_data_sample
 
     while True:
         values = {}
@@ -927,6 +1068,7 @@ def _poll_data_worker():
         )
         now = time.monotonic()
 
+        changed = False
         with _activity_lock:
             if _last_data_signature is None:
                 _last_data_signature = signature
@@ -934,7 +1076,15 @@ def _poll_data_worker():
             elif signature != _last_data_signature:
                 _last_data_signature = signature
                 _last_data_activity = now
+                _last_data_wallclock = datetime.now()
                 _have_data_sample = True
+                changed = True
+            connected_hint = _server_connected_state is True
+
+        # A changing snapshot is proof of new telemetry. A TRUE server state
+        # also lets perfectly flat sensor values be plotted at a steady cadence.
+        if changed or connected_hint:
+            _record_live_graph_samples(values, now)
 
         _result_queue.put(("data", values))
         threading.Event().wait(FAST_POLL_MS / 1000.0)
@@ -965,7 +1115,7 @@ def _status_endpoint():
     )
     for url in urls:
         try:
-            r = _session.get(url, timeout=1.5)
+            r = _session().get(url, timeout=1.5)
             if r.status_code == 200:
                 result = _parse_blynk_bool(r.text)
                 if result is not None:
@@ -975,81 +1125,54 @@ def _status_endpoint():
     return None
 
 
+def _decide_connection(blynk_state, data_fresh, data_sample_seen,
+                       startup_grace):
+    """Return ``(connected, evidence)`` from independent liveness signals."""
+    if blynk_state is True:
+        return True, "server"
+    if data_fresh:
+        return True, "telemetry"
+    if startup_grace and blynk_state is None and data_sample_seen:
+        return True, "startup grace"
+    return False, "server" if blynk_state is False else "no live telemetry"
+
+
 def _poll_status_worker():
     """Track real device liveness independently from sensor-value polling.
 
-    Blynk can return cached V-pin values after a device disconnects.  Therefore
-    a changing firmware heartbeat is used as the watchdog.  The Blynk hardware
-    status endpoint is also used when it gives a valid answer, but it can never
-    stop or delay the normal sensor polling worker.
+    The server's isHardwareConnected endpoint is authoritative when available.
+    Changing telemetry remains a fallback and also protects against a briefly
+    stale FALSE response. Cached V-pin values alone never prove liveness.
     """
-    heartbeat_pins = (
-        ("app_telem_rnd", APP_TELEM_RND_PIN),  # V4: App/Telem RND# Alive
-        ("pps_count", DIAG_PINS["pps_count"]),  # V35
-        ("rtc_checkpoint", DIAG_PINS["rtc_checkpoint"]),  # V51
-        ("pps_age_ms", DIAG_PINS["pps_age_ms"]),  # V36
-    )
-
-    previous = {}
-    last_heartbeat_change = None
-    have_heartbeat = False
+    global _server_connected_state
     started = time.monotonic()
 
     while True:
         now = time.monotonic()
-
-        current = {}
-        for name, pin in heartbeat_pins:
-            current[name] = read_pin(pin)
-
-        changed = False
-        for name, value in current.items():
-            if value is None:
-                continue
-            if name in previous and value != previous[name]:
-                changed = True
-            previous[name] = value
-
-        if changed:
-            last_heartbeat_change = now
-            have_heartbeat = True
-
-        # Ask Blynk separately. A valid TRUE is immediate evidence of a live
-        # hardware connection. A valid FALSE is only accepted after the
-        # heartbeat has also been quiet, because some local/legacy builds can
-        # disagree with the app about connection state.
         blynk_state = _status_endpoint()
 
-        heartbeat_fresh = (
-            have_heartbeat
-            and last_heartbeat_change is not None
-            and (now - last_heartbeat_change) <= LIVE_TELEM_TIMEOUT_S
-        )
-
         with _activity_lock:
+            _server_connected_state = blynk_state
             data_fresh = (
                 _last_data_activity is not None
                 and (now - _last_data_activity) <= LIVE_TELEM_TIMEOUT_S
             )
             data_sample_seen = _have_data_sample
+            last_live = _last_data_wallclock
 
         startup_grace = (now - started) <= STARTUP_ONLINE_GRACE_S
 
-        if heartbeat_fresh or data_fresh:
-            # Freshly changing telemetry is definitive evidence that the ESP32
-            # is still publishing, even if the local Blynk status endpoint is
-            # unavailable or reports a stale state.
-            device_connected = True
-        elif startup_grace and (blynk_state is True or data_sample_seen):
-            # Give a newly started station a short grace period while the first
-            # changing heartbeat/telemetry value is being observed.
-            device_connected = True
-        else:
-            # A cached Blynk value and a stale isHardwareConnected=True must
-            # NOT keep the dashboard green after the ESP32 is powered off.
-            device_connected = False
+        # TRUE from the server is authoritative at all times (the old code
+        # accepted it only during startup). A fresh changing snapshot can
+        # temporarily override FALSE during a server-side reconnect race.
+        device_connected, source = _decide_connection(
+            blynk_state, data_fresh, data_sample_seen, startup_grace)
 
-        _result_queue.put(("status", device_connected))
+        _result_queue.put(("status", {
+            "connected": device_connected,
+            "source": source,
+            "last_live": last_live,
+        }))
         threading.Event().wait(FAST_POLL_MS / 1000.0)
 
 
@@ -1067,6 +1190,11 @@ def _poll_queue():
                 _apply_values(payload)
             elif kind == "status":
                 _apply_connection_status(payload)
+            elif kind == "graph":
+                results, hours, source_note = payload
+                _apply_graph_data(results, hours, source_note)
+            elif kind == "graph_error":
+                label_graph_status.configure(text=payload, text_color=RED)
     except queue.Empty:
         pass
     app.after(200, _poll_queue)
@@ -1126,19 +1254,34 @@ def _apply_message_pair(values):
     _displayed_message_pair_key = key61
 
 
-def _apply_connection_status(device_connected):
-    """Update only the connection/WiFi status widgets."""
+def _apply_connection_status(status):
+    """Update connection widgets without inventing a fresh-data timestamp."""
     global _device_connected
-    _device_connected = bool(device_connected)
+    if isinstance(status, dict):
+        _device_connected = bool(status.get("connected"))
+        source = status.get("source", "unknown")
+        last_live = status.get("last_live")
+    else:
+        # Compatibility for any already-queued result during a code reload.
+        _device_connected = bool(status)
+        source = "unknown"
+        last_live = None
 
     if _device_connected:
         label_status.configure(text="⬤  CONNECTED", text_color=GREEN)
-        label_last_update.configure(
-            text=f"Last live data: {datetime.now().strftime('%H:%M:%S')}"
-        )
+        if last_live is not None:
+            live_text = last_live.strftime("%H:%M:%S")
+            label_last_update.configure(
+                text=f"Last telemetry change: {live_text}  ·  check: {source}")
+        else:
+            label_last_update.configure(
+                text=f"Device link confirmed  ·  check: {source}")
     else:
         label_status.configure(text="⬤  OFFLINE", text_color=RED)
         label_wifi.configure(text="📶  WiFi: OFFLINE", text_color=RED)
+        if last_live is not None:
+            label_last_update.configure(
+                text=f"Last telemetry change: {last_live.strftime('%H:%M:%S')}")
 
 
 def _apply_values(values):
@@ -1356,11 +1499,17 @@ app.after(200, _poll_queue)
 app.after(500, trigger_graph_refresh)
 
 
+def _schedule_live_graph_redraw():
+    _redraw_graph_from_cache()
+    app.after(LIVE_GRAPH_DRAW_MS, _schedule_live_graph_redraw)
+
+
 def _schedule_graph_refresh():
     trigger_graph_refresh()
     app.after(GRAPH_REFRESH_MS, _schedule_graph_refresh)
 
 
+app.after(LIVE_GRAPH_DRAW_MS, _schedule_live_graph_redraw)
 app.after(GRAPH_REFRESH_MS, _schedule_graph_refresh)
 
 app.mainloop()
