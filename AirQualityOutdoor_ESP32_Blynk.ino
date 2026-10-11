@@ -17,6 +17,28 @@ struct Core1TelemetryPair;
 #define ESP32_RX_ISOLATION_TEST 0
 #endif
 
+// v3.9.213 ONE-SECOND OBSERVABLE LINK HEARTBEAT
+//   - V4 remains a small random-looking 1..9 value, published once per second,
+//     but consecutive values are forced to differ. Every successful
+//     publication is therefore observable through the Blynk HTTP value API,
+//     which exposes the current value but no per-write timestamp.
+//   - V61/V62 remain the authoritative coherent sensor record and independent
+//     fallback evidence. No sensor, HTTP-pair, or Blynk reconnect ownership is
+//     moved or combined with the heartbeat.
+//
+// v3.9.212 RESET-CHURN REDUCTION EXPERIMENT
+//   - A recent HTTP failure corroborates a Blynk sequence hole only while at
+//     least two HTTP failures remain consecutive, or while the HTTP circuit
+//     breaker is open. A recovered one-off HTTP timeout can no longer turn the
+//     first Blynk hole into an immediate whole-MCU reset.
+//   - First WiFi association waits three seconds after GOT_IP before opening
+//     the Blynk socket. Re-association recovery remains immediate. This avoids
+//     the repeatable first post-reset TCP timeout without delaying recovery.
+//   - Proactively rotate the persistent HTTP telemetry socket after 60 requests
+//     (previously 120), before the field-observed long-lived-PCB degradation.
+//   - V55 is boot-locked for 30 seconds and edge-armed by a preceding LOW, so a
+//     retained/replayed HIGH cannot cause another reset after reconnection.
+//
 // v3.9.211 CORROBORATED RESET-DOMAIN RECOVERY
 //   - The v3.9.210 field trace proves why a Blynk-only reset often cannot
 //     recover: the HTTP data plane timed out first, the established Blynk
@@ -410,7 +432,7 @@ struct Core1TelemetryPair;
 //   - Reduces post-connect telemetry holdoff to 2s and slow-write backoff to 3s.
 //   - Retains the 3s WiFiClient timeout: the field log proved a 1.952s write
 //     can still complete, so a 1s timeout would create a new disconnect.
-#define FIRMWARE_VERSION "3.9.211"
+#define FIRMWARE_VERSION "3.9.213"
 
 // v3.9.198 EARLY SESSION-PATH RECOVERY + FIRST-DISCONNECT OWNERSHIP
 //   - The v3.9.197 trace lost RESPONSE 691 while WiFi, heap and both cores were
@@ -4812,7 +4834,7 @@ static volatile uint32_t telemetryHttpPreventiveRotationCount = 0;
 #define TELEMETRY_HTTP_CIRCUIT_WINDOW_MS 60000UL
 #define TELEMETRY_HTTP_CIRCUIT_OPEN_MS 90000UL
 #define TELEMETRY_HTTP_HEALTH_HOLDOFF_MS 60000UL
-#define TELEMETRY_HTTP_MAX_REQUESTS_PER_SOCKET 120UL
+#define TELEMETRY_HTTP_MAX_REQUESTS_PER_SOCKET 60UL
 QueueHandle_t connectionSnapshotQueue = NULL;  // Core 0 -> Core 1
 static uint32_t core1TelemetrySequence = 0;
 
@@ -6368,8 +6390,8 @@ static uint32_t blynkWeakLinkEntries = 0;
 #define BLYNK_DASHBOARD_ROUNDROBIN_MS 4000UL
 // Diagnostics are also spread out instead of publishing V34-V65 as one burst.
 #define BLYNK_DIAG_ROUNDROBIN_MS      15000UL
-#define BLYNK_COHERENT_RECORD_MS      4000UL
-#define BLYNK_V4_INTERVAL_MS          15000UL
+#define BLYNK_COHERENT_RECORD_MS      1000UL
+#define BLYNK_V4_INTERVAL_MS          1000UL
 // A stock NetworkClient write can still return slowly. Pause application
 // telemetry after such a write, but do not destroy a still-connected session;
 // Blynk.run() remains responsible for deciding whether the session is alive.
@@ -6398,6 +6420,10 @@ static uint32_t blynkWeakLinkEntries = 0;
 #define BLYNK_STOCK_REFRESH_HOLDOFF_MS         5000UL
 #define BLYNK_STOCK_LONG_HOLDOFF_MS           30000UL
 #define BLYNK_STOCK_REFRESHES_BEFORE_LONG_HOLDOFF 3U
+// v3.9.212: boot-only grace after the first GOT_IP. The previous immediate
+// attempt repeatedly hit a full 1s TCP timeout, while the next attempt worked.
+// True WiFi re-association/recovery does not use this delay.
+#define BLYNK_FIRST_ASSOCIATION_GRACE_MS        3000UL
 static unsigned long blynkStockNextRunMillis = 0;
 unsigned long blynkOfflineSince = 0;
 
@@ -9644,17 +9670,21 @@ void blynkSendV4()
   core1StageBegin(CORE1_STAGE_BLYNK_TIMER);
   uint32_t perfV4StartUs = micros();
 
-  // V4 uses the prevention profile's 10-second cadence. V61/V62 retain a
-  // coherent two-second record cadence. V4 is queued,
-  // but the TX scheduler gives V4 priority at each due interval so it gets
-  // the next available transmit opportunity instead of waiting behind the
-  // ordinary sensor queue without increasing the steady packet rate.
+  // v3.9.213: V4 is the lightweight application heartbeat. It may remain
+  // random-looking, but it must differ from the previous value: the HTTP GET
+  // endpoint exposes no write timestamp, so an equal consecutive value would
+  // be indistinguishable from stale cached data.
+  // The queue coalesces delayed V4 writes, so congestion cannot create a
+  // heartbeat backlog; the next transmitted value is always the newest one.
   if (WiFi.status() != WL_CONNECTED) { core1StageEnd(); return; }
   if (!Blynk.connected()) { core1StageEnd(); return; }
-  SensorData snap;
-  if (!blynkGetSensorSnapshot(snap)) { core1StageEnd(); return; }
-
-  safeWriteI(V4, snap.rand_num);
+  static uint8_t heartbeat = 0;
+  uint8_t nextHeartbeat = (uint8_t)random(1, 10);
+  if (nextHeartbeat == heartbeat) {
+    nextHeartbeat = (uint8_t)((heartbeat % 9U) + 1U);
+  }
+  heartbeat = nextHeartbeat;
+  safeWriteI(V4, heartbeat);
 
   perfRecordMax(perfMaxSlowSendMs,
                 (uint32_t)((micros() - perfV4StartUs) / 1000UL));
@@ -10762,12 +10792,15 @@ void wifiMarkConnected()
   blynkOfflineSince = 0;
   blynkLastConnectedMillis = 0;
   blynkLastRxMillis = millis();
-  // v3.9.38: both first boot and WiFi recovery request an explicit immediate
-  // bounded TCP probe. This avoids the old 10-second startup gap and avoids
-  // unsigned-millis wraparound tricks near boot.
-  blynkConnectImmediate = true;
+  // v3.9.212: a clean boot waits briefly after its first GOT_IP. Field traces
+  // repeatedly show that the immediate attempt consumes its full one-second
+  // TCP budget, while the following attempt succeeds. A true re-association
+  // remains immediate because outage recovery should not incur boot grace.
+  const uint32_t blynkEligibleAt = millis() +
+      (firstWifiAssociation ? BLYNK_FIRST_ASSOCIATION_GRACE_MS : 0UL);
+  blynkConnectImmediate = !firstWifiAssociation;
   lastBlynkConnectAttempt = millis();
-  blynkStockNextRunMillis = millis();
+  blynkStockNextRunMillis = blynkEligibleAt;
 
   // Blynk.config() sets server address only — does NOT block or spin.
   // STOCK BlynkSimpleEsp32 establishes the session from Blynk.run(); the loop
@@ -10782,12 +10815,11 @@ void wifiMarkConnected()
 #endif
   blynkHandshakeActive = false;
   blynkHandshakeStarted = 0;
-  // v3.9.36: the raw Blynk transport was explicitly closed above, so do not
-  // add a 15-second startup holdoff here. A software reset must recover Blynk
-  // immediately just like a power-on. If the old TCP FIN is still being
-  // processed by the server, the new bounded TCP probe/handshake will fail
-  // cleanly and retry without blocking Core 1.
-  blynkStartupHoldoffUntil = 0;
+  blynkStartupHoldoffUntil = blynkEligibleAt;
+  if (firstWifiAssociation) {
+    Serial.printf("[Blynk STARTUP GRACE] first GOT_IP; delaying initial socket %lums\n",
+                  (unsigned long)BLYNK_FIRST_ASSOCIATION_GRACE_MS);
+  }
   if (firstWifiAssociation) {
     engMsgf("WiFi OK — Blynk config set %s:%d (initial handshake pending)", BLYNK_SERVER, BLYNK_PORT);
   } else {
@@ -12717,23 +12749,37 @@ void loop()
         telemetryHttpLastFailureMs != 0 &&
         sequenceHoleNow - telemetryHttpLastFailureMs <=
             BLYNK_SHARED_PATH_CORROBORATION_MS;
+    // v3.9.212: telemetryHttpLastFailureMs intentionally remains available for
+    // diagnostics after HTTP recovers. It must therefore not, by itself, prove
+    // that the second path is still broken. Require an unresolved failure
+    // streak; a recovered one-off timeout receives socket-first Blynk repair.
+    const bool unresolvedRecentHttpFailure =
+        recentHttpTransportTimeout &&
+        telemetryHttpConsecutiveFailures >= 2U;
     const bool activeHttpCircuit =
         telemetryHttpCircuitOpenUntilMs != 0 &&
         (int32_t)(telemetryHttpCircuitOpenUntilMs - sequenceHoleNow) > 0;
-    if (recentHttpTransportTimeout || activeHttpCircuit) {
+    if (unresolvedRecentHttpFailure || activeHttpCircuit) {
       blynkSequenceHoleSocketTrialCount = 0;
       blynkSequenceHoleRecentGenerations = 2U;
       const uint32_t httpFailureAge = telemetryHttpLastFailureMs
           ? sequenceHoleNow - telemetryHttpLastFailureMs : 0UL;
       blynkSequenceHoleLastGenerationMillis = sequenceHoleNow;
-      Serial.printf("[Blynk SHARED PATH PROOF] exact Blynk sequence hole plus HTTP transport evidence: httpRecent=%d httpAge=%lums circuit=%d httpFailures=%lu; bypassing ineffective Blynk-only reset\n",
+      Serial.printf("[Blynk SHARED PATH PROOF] exact Blynk sequence hole plus unresolved HTTP evidence: httpRecent=%d consecutive=%u httpAge=%lums circuit=%d httpFailures=%lu; bypassing ineffective Blynk-only reset\n",
                     recentHttpTransportTimeout ? 1 : 0,
+                    (unsigned)telemetryHttpConsecutiveFailures,
                     (unsigned long)httpFailureAge,
                     activeHttpCircuit ? 1 : 0,
                     (unsigned long)telemetryHttpFailureCount);
       blynkSequenceHoleRequestBoundedRestart(
           "blynk-hole-plus-http-transport-failure");
       return;
+    }
+
+    if (recentHttpTransportTimeout && !unresolvedRecentHttpFailure) {
+      Serial.printf("[Blynk SHARED PATH NOT PROVEN] recent HTTP failure recovered/isolated (consecutive=%u age=%lums); trying Blynk socket-only repair first\n",
+                    (unsigned)telemetryHttpConsecutiveFailures,
+                    (unsigned long)(sequenceHoleNow - telemetryHttpLastFailureMs));
     }
 
     // This is a genuinely new failure generation only when neither heartbeat
