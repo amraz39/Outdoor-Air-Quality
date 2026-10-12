@@ -1,4 +1,26 @@
 # Outdoor Air Quality Station — ESP32 Dashboard for Windows PC
+# v2.2 — Lock-safe durable diagnostic journal
+#
+# v2.2 changes:
+#   - A viewer such as Excel can lock the main CSV without terminating the
+#     journal worker. Rows are durably spooled to aq_station_events.pending.csv
+#     and merged, in order, when the main CSV becomes writable again.
+#   - The GUI warns once when primary-CSV writing is blocked and confirms when
+#     normal writing resumes and the pending backlog has been merged.
+#   - Retry occurs during every event and maintenance cycle; closing the
+#     dashboard leaves any unmerged sidecar intact for the next launch.
+#
+# v2.1 — Complete Blynk/server disruption timing
+#
+# v2.1 changes:
+#   - Every diagnostic episode now carries explicit started_utc and ended_utc
+#     fields; its END row contains the measured duration in seconds.
+#   - Adds CONNECTION_DISRUPTION, matching the dashboard's strict connection
+#     indication, while retaining separate server-status, Blynk-session,
+#     V4-read, live-telemetry and coherent-stream episodes for root-cause work.
+#   - Adds outage_cause and migrates the existing v2.0 CSV schema in place so
+#     the current rolling 24-hour history is not discarded.
+#
 # v2.0 — Rolling 24-hour diagnostic event journal
 #
 # v2.0 changes:
@@ -176,6 +198,7 @@ EVENT_STARTUP_GRACE_S = 5.0
 EVENT_RSSI_WEAK_DBM = -72
 EVENT_RSSI_RECOVER_DBM = -68
 EVENT_PAIR_MISMATCH_POLLS = 2
+JOURNAL_ALERT_QUEUE = queue.Queue()
 
 
 def _application_directory():
@@ -288,9 +311,10 @@ STATUS_GOOD_WHEN_SET = {1 << 0, 1 << 1, 1 << 2, 1 << 3}
 
 EVENT_CSV_FIELDS = (
     "timestamp_utc", "episode_id", "event_phase", "event_type", "severity",
-    "duration_seconds", "blynk_status", "v4_available", "v4_fresh",
-    "v4_value", "pair_gps_unix", "pair_device_ms", "reset_reason",
-    "status_flags", "rssi_dbm", "confidence", "details",
+    "started_utc", "ended_utc", "duration_seconds", "outage_cause",
+    "blynk_status", "v4_available", "v4_fresh", "v4_value",
+    "pair_gps_unix", "pair_device_ms", "reset_reason", "status_flags",
+    "rssi_dbm", "confidence", "details",
 )
 
 
@@ -309,14 +333,22 @@ def _parse_utc_text(value):
 class EventJournal:
     """Serialize diagnostic events and atomically enforce 24-hour retention."""
 
-    def __init__(self, path):
+    def __init__(self, path, alert_queue=None):
         self.path = Path(path)
+        self.pending_path = self.path.with_name(
+            f"{self.path.stem}.pending{self.path.suffix}")
+        self._main_blocked = False
+        self._alert_queue = alert_queue
         self._queue = queue.Queue()
         self._accepting = True
         self._close_lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._run, name="aq-event-journal", daemon=True)
         self._thread.start()
+
+    def _notify(self, state, message):
+        if self._alert_queue is not None:
+            self._alert_queue.put((state, message))
 
     def log(self, event_type, event_phase="OBSERVED", severity="INFO",
             episode_id="", duration_seconds="", confidence="confirmed",
@@ -356,23 +388,111 @@ class EventJournal:
         if self.path.exists() and self.path.stat().st_size:
             try:
                 with self.path.open("r", newline="", encoding="utf-8") as handle:
-                    header = next(csv.reader(handle), [])
+                    reader = csv.DictReader(handle)
+                    header = reader.fieldnames or []
+                    existing_rows = list(reader)
                 if tuple(header) != EVENT_CSV_FIELDS:
-                    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-                    self.path.replace(
-                        self.path.with_name(f"{self.path.stem}.incompatible-{stamp}.csv"))
+                    # v2.1 is an additive schema. Preserve older journal rows
+                    # in place when all their columns are still recognized.
+                    if header and set(header).issubset(set(EVENT_CSV_FIELDS)):
+                        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+                        with temporary.open(
+                                "w", newline="", encoding="utf-8") as handle:
+                            writer = csv.DictWriter(
+                                handle, fieldnames=EVENT_CSV_FIELDS)
+                            writer.writeheader()
+                            for old_row in existing_rows:
+                                writer.writerow({
+                                    key: old_row.get(key, "")
+                                    for key in EVENT_CSV_FIELDS
+                                })
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        os.replace(temporary, self.path)
+                    else:
+                        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                        self.path.replace(self.path.with_name(
+                            f"{self.path.stem}.incompatible-{stamp}.csv"))
             except OSError:
                 pass
         if not self.path.exists() or self.path.stat().st_size == 0:
             with self.path.open("w", newline="", encoding="utf-8") as handle:
                 csv.DictWriter(handle, fieldnames=EVENT_CSV_FIELDS).writeheader()
+        self._flush_pending()
         self._prune()
 
-    def _append(self, row):
+    def _append_main(self, rows):
         with self.path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=EVENT_CSV_FIELDS)
+            writer.writerows(rows)
+            handle.flush()
+
+    def _spool(self, row):
+        """Durably retain a row when another application locks the main CSV."""
+        needs_header = (
+            not self.pending_path.exists() or
+            self.pending_path.stat().st_size == 0)
+        with self.pending_path.open(
+                "a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=EVENT_CSV_FIELDS)
+            if needs_header:
+                writer.writeheader()
             writer.writerow(row)
             handle.flush()
+            os.fsync(handle.fileno())
+
+    def _flush_pending(self):
+        """Merge the durable sidecar once the primary CSV is writable."""
+        if (not self.pending_path.exists() or
+                self.pending_path.stat().st_size == 0):
+            return True
+        try:
+            with self.pending_path.open(
+                    "r", newline="", encoding="utf-8") as handle:
+                rows = [
+                    {key: row.get(key, "") for key in EVENT_CSV_FIELDS}
+                    for row in csv.DictReader(handle)
+                ]
+            if rows:
+                self._append_main(rows)
+            self.pending_path.unlink(missing_ok=True)
+            if self._main_blocked:
+                message = "Diagnostic event journal resumed; pending rows merged."
+                print(message, file=sys.stderr)
+                self._notify("resumed", message)
+            self._main_blocked = False
+            return True
+        except OSError as exc:
+            if not self._main_blocked:
+                message = (f"Diagnostic CSV cannot currently be written. "
+                           f"Events remain safely retained in "
+                           f"{self.pending_path.name} and will be merged "
+                           f"automatically after the file is unlocked.\n\n{exc}")
+                print(message, file=sys.stderr)
+                self._notify("blocked", message)
+            self._main_blocked = True
+            return False
+
+    def _append(self, row):
+        # Preserve ordering: once a sidecar exists, append the new row there
+        # before attempting to merge the complete backlog.
+        if self.pending_path.exists():
+            self._spool(row)
+            self._flush_pending()
+            return
+        try:
+            self._append_main([row])
+            self._main_blocked = False
+        except OSError as exc:
+            self._spool(row)
+            if not self._main_blocked:
+                message = (f"Diagnostic CSV cannot currently be written. "
+                           f"Events are safely retained in "
+                           f"{self.pending_path.name} and will be merged "
+                           f"automatically after the file is unlocked.\n\n{exc}")
+                print(message, file=sys.stderr)
+                self._notify("blocked", message)
+            self._main_blocked = True
 
     def _prune(self):
         if not self.path.exists():
@@ -409,13 +529,16 @@ class EventJournal:
                 if row is None:
                     break
                 if row == "PRUNE":
+                    self._flush_pending()
                     self._prune()
                     next_prune = time.monotonic() + EVENT_PRUNE_INTERVAL_S
                     continue
                 self._append(row)
                 if time.monotonic() >= next_prune:
+                    self._flush_pending()
                     self._prune()
                     next_prune = time.monotonic() + EVENT_PRUNE_INTERVAL_S
+            self._flush_pending()
             self._prune()
         except Exception as exc:
             # Diagnostics must never take down the monitoring dashboard.
@@ -444,35 +567,50 @@ class DiagnosticEventMonitor:
         self.pair_mismatch_polls = 0
         self.last_engineering_event = None
 
-    def _snapshot(self, details=""):
+    def _snapshot(self, details="", outage_cause=""):
         result = dict(self.context)
         result["details"] = details
+        result["outage_cause"] = outage_cause
         return result
 
-    def _episode(self, event_type, condition, severity, confidence, details):
+    def _episode(self, event_type, condition, severity, confidence, details,
+                 outage_cause=""):
         current = self.active.get(event_type)
         if condition and current is None:
             episode_id = uuid.uuid4().hex
             started = time.monotonic()
-            self.active[event_type] = (episode_id, started)
+            started_utc = _utc_now_text()
+            self.active[event_type] = (
+                episode_id, started, started_utc, outage_cause)
             self.journal.log(event_type, "START", severity, episode_id=episode_id,
-                             confidence=confidence, **self._snapshot(details))
+                             started_utc=started_utc, confidence=confidence,
+                             **self._snapshot(details, outage_cause))
         elif not condition and current is not None:
-            episode_id, started = self.active.pop(event_type)
+            episode_id, started, started_utc, started_cause = self.active.pop(
+                event_type)
+            ended_utc = _utc_now_text()
             duration = f"{max(0.0, time.monotonic() - started):.3f}"
             self.journal.log(event_type, "END", "INFO", episode_id=episode_id,
+                             started_utc=started_utc, ended_utc=ended_utc,
                              duration_seconds=duration, confidence=confidence,
-                             **self._snapshot(f"Recovered: {details}"))
+                             **self._snapshot(
+                                 f"Recovered: {details}",
+                                 started_cause or outage_cause))
 
     def close_all(self):
         """Close open episodes so the CSV remains easy to analyse."""
         with self.lock:
-            for event_type, (episode_id, started) in list(self.active.items()):
+            for event_type, (episode_id, started, started_utc,
+                             started_cause) in list(self.active.items()):
+                ended_utc = _utc_now_text()
                 duration = f"{max(0.0, time.monotonic() - started):.3f}"
                 self.journal.log(
                     event_type, "END", "INFO", episode_id=episode_id,
+                    started_utc=started_utc, ended_utc=ended_utc,
                     duration_seconds=duration, confidence="observed",
-                    **self._snapshot("Dashboard stopped while episode was active"))
+                    **self._snapshot(
+                        "Dashboard stopped while episode was active",
+                        started_cause))
             self.active.clear()
 
     def observe_health(self, blynk_state, heartbeat_available,
@@ -492,19 +630,37 @@ class DiagnosticEventMonitor:
 
             data_fresh = heartbeat_fresh or (
                 not heartbeat_available and pair_fresh)
+            connection_ok = blynk_state is True and data_fresh
+            if blynk_state is None:
+                overall_cause = "server_status_unavailable"
+            elif blynk_state is False:
+                overall_cause = "blynk_session_offline"
+            elif not data_fresh:
+                overall_cause = "live_telemetry_stalled"
+            else:
+                overall_cause = ""
+            self._episode(
+                "CONNECTION_DISRUPTION", not connection_ok, "ERROR",
+                "confirmed",
+                f"Dashboard connection state unavailable; {source}",
+                overall_cause)
             self._episode(
                 "BLYNK_STATUS_UNAVAILABLE", blynk_state is None, "ERROR",
-                "confirmed", f"Hardware-status endpoint unavailable; {source}")
+                "confirmed", f"Hardware-status endpoint unavailable; {source}",
+                "server_status_unavailable")
             self._episode(
                 "BLYNK_SESSION_OFFLINE", blynk_state is False, "ERROR",
-                "confirmed", "Blynk isHardwareConnected reported false")
+                "confirmed", "Blynk isHardwareConnected reported false",
+                "blynk_session_offline")
             self._episode(
                 "V4_READ_UNAVAILABLE", not heartbeat_available, "WARNING",
-                "confirmed", "V4 HTTP read unavailable")
+                "confirmed", "V4 HTTP read unavailable",
+                "v4_read_unavailable")
             self._episode(
                 "TELEMETRY_STALL", blynk_state is True and not data_fresh,
                 "WARNING", "confirmed",
-                "Blynk session present but V4/V61-V62 liveness is stale")
+                "Blynk session present but V4/V61-V62 liveness is stale",
+                "live_telemetry_stalled")
 
     def observe_data(self, values, key61, key62, matched_pair_key):
         with self.lock:
@@ -606,10 +762,10 @@ class DiagnosticEventMonitor:
                     **self._snapshot(eng_msg))
 
 
-_event_journal = EventJournal(EVENT_CSV_PATH)
+_event_journal = EventJournal(EVENT_CSV_PATH, JOURNAL_ALERT_QUEUE)
 _event_monitor = DiagnosticEventMonitor(_event_journal)
 _event_journal.log(
-    "DASHBOARD_STARTED", details=f"Dashboard v2.0; journal={EVENT_CSV_PATH.name}")
+    "DASHBOARD_STARTED", details=f"Dashboard v2.2; journal={EVENT_CSV_PATH.name}")
 
 # ============================================================
 # COLOR THEME
@@ -1633,6 +1789,16 @@ def _poll_worker():
 
 
 def _poll_queue():
+    try:
+        while True:
+            state, message = JOURNAL_ALERT_QUEUE.get_nowait()
+            if state == "blocked":
+                messagebox.showwarning("Diagnostic CSV write warning", message)
+            elif state == "resumed":
+                messagebox.showinfo("Diagnostic CSV writing resumed", message)
+    except queue.Empty:
+        pass
+
     try:
         while True:
             kind, payload = _result_queue.get_nowait()
