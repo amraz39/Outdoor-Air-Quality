@@ -1,6 +1,6 @@
 # Outdoor Air Quality Station — ESP32
 
-Current firmware: **v3.9.214**
+Current firmware: **v3.9.217**
 Current Windows dashboard: **v1.9** (`aq_dashboard.py`)
 Target board package: **Arduino-ESP32 3.3.12**
 Backend: **self-hosted Blynk 0.41.18 / legacy Blynk protocol 0.6.1**
@@ -8,31 +8,40 @@ Primary sketch: `AirQualityOutdoor_ESP32_Blynk.ino`
 
 This project is a dual-core ESP32 outdoor air-quality and navigation station. It acquires GPS, environmental, inertial and acoustic data while maintaining a resilient local connection to a Raspberry Pi 5 Blynk server.
 
-The current design deliberately separates sensor acquisition from networking. It also separates bulk V61/V62 records from the ordinary Blynk hardware socket so that a large string upload cannot block Blynk control, heartbeat or dashboard traffic.
+The current design separates sensor acquisition from networking and now also
+separates the complete outbound telemetry data plane from the persistent Blynk
+control connection.
 
 ## Current status
 
-v3.9.214 is the current compiled and simulation-validated build. Initial field
-testing has also confirmed recovery from a delayed application checkpoint
-without ending the Blynk session. The important behavior is:
+v3.9.217 is the current compiled and simulation-validated build. The supplied
+v3.9.216 trace showed a 24.179-second delayed application acknowledgement,
+then 10.879-second and 4-second delays, followed by one unrecovered checkpoint.
+WiFi remained associated, Blynk writes returned in at most 13 ms, heap stayed
+stable, and HTTP had 83/83 successful transactions. This is ordered TCP
+head-of-line blocking after an ESP32-to-server segment is delayed or lost.
+Recovery can detect that event, but only data-plane separation removes routine
+telemetry from the affected persistent control stream.
+
+The important behavior is:
 
 - Core 0 exclusively owns WiFi, lwIP-facing TCP work, `Blynk.run()`, the coherent HTTP client and physical Serial output.
 - Core 1 owns sensor initialization, sensor sampling, GPS parsing, IMU/INAV processing and immutable snapshot production. Core 1 never opens or drives a TCP socket.
-- V61 and V62 are produced as one coherent pair from the same snapshot and uploaded every second through `PUT /{token}/telemetry/coherent`.
-- Ordinary Blynk virtual pins use a coalescing, paced queue. Stale values are replaced instead of creating an unbounded backlog.
-- V4 is a small random-looking, non-repeating application heartbeat queued once per second. It does not read or lock the sensor snapshot.
-- Exact Blynk PING responses and application checkpoints provide end-to-end receive-path evidence.
-- HTTP is closed and paused when either exact Blynk proof--an application ACK checkpoint or a protocol PING--is overdue by 3 seconds. It resumes only after the proof recovers and a 60-second stable quiet window completes.
-- A delayed application checkpoint is allowed up to 70 seconds to recover through normal TCP retransmission. Earlier packet captures measured successful ESP32 retransmission after 47-58 seconds, so the former 25-second deadline was prematurely destroying recoverable sessions.
+- The Blynk TCP connection is control-only: login, inbound widget commands and protocol PING/PONG. Normal firmware operation sends zero application `virtualWrite()` frames on it.
+- V4, V1-V65 outbound dashboard/diagnostic values, map updates, and V61/V62 use `PUT /{token}/telemetry/batch` on an independent persistent HTTP connection.
+- Ordinary virtual pins retain the bounded 64-slot coalescing queue. Stale values are replaced, and one HTTP request can commit several due pins with one server timestamp.
+- V4 remains a small non-repeating value generated every second. It is given first priority in each HTTP batch.
+- V61 and V62 are still produced from one immutable Core-1 snapshot. They are added to the same HTTP batch every five seconds and retain an identical GPS/device timestamp key.
+- Blynk control PING responses provide end-to-end control-stream evidence. Their exact timeout is 30 seconds, above the measured 24.179-second recovered delay.
+- A Blynk control-path warning no longer closes a healthy HTTP telemetry connection; the two paths are independent failure domains.
 - A Blynk-only sequence hole receives socket-first recovery. Full shared-path recovery requires a fresh unresolved streak of at least two HTTP transport failures within 60 seconds. The HTTP circuit-breaker timer alone is not failure proof.
 - WiFi teardown is not used as a generic Blynk repair. WiFi recovery is reserved for actual association/IP failures.
 - The optional ten-minute periodic reset remains disabled.
 
-The first v3.9.214 field trace remained in one authenticated Blynk session. At
-application checkpoint 622, the ACK became 3 seconds late, HTTP isolation
-activated, and the ACK arrived about 35 ms later. Publishing continued without
-a sequence hole, Blynk session end, WiFi teardown or ESP32 reset. A later
-12.001-second response gap also recovered without disconnecting.
+The 7,200-second model runs at 100-ms resolution with the measured 24.179 s,
+10.879 s and 4 s delays plus independent HTTP outages. It produced 720 control
+PINGs, zero Blynk application frames, zero control disconnects, 7,040 successful
+HTTP batches, 1,409 coherent V61/V62 records and zero timestamp mismatches.
 
 ## Why v3.9.214 changed the quiet-recovery policy
 
@@ -76,8 +85,8 @@ This is prevention-oriented: application writes stop early, HTTP is isolated at 
 Core 0 — communications owner
   Arduino setup()/loop()
   ESP32 WiFi events and recovery state machine
-  Blynk protocol, PINGs, callbacks and paced virtual writes
-  Persistent nonblocking HTTP client for V61/V62
+  Blynk control protocol, PING/PONG and inbound callbacks
+  Persistent nonblocking HTTP batch client for all outbound virtual pins
   Serial output and network health diagnostics
 
 Core 1 — sensor and processing owner
@@ -99,28 +108,30 @@ The two cores monitor each other's progress. Recovery requests are cooperative; 
 
 ## Data paths
 
-### Blynk control and dashboard socket
+### Blynk control socket
 
-The persistent Blynk 0.6.1 hardware socket carries:
+The persistent Blynk 0.6.1 hardware socket carries only:
 
 - Blynk login, INFO and protocol PING/RESPONSE traffic;
-- application callbacks, including V55 remote restart;
-- V4 application-liveness value;
-- dashboard pins V1–V60 and V63–V65 at paced, round-robin rates;
-- V33 map updates.
+- inbound application callbacks, including V55 remote restart.
 
-The queue sends at most one application item per pass and normally spaces writes by 500 ms. Weak links use a slower interval. Application writes pause when inbound responses become stale, but `Blynk.run()` and exact PING recovery continue.
+Normal operation sends no outbound hardware/application frames on this stream.
+This removes routine telemetry packets from the TCP sequence space whose one
+missing segment previously blocked all later Blynk commands.
 
-### Coherent V61/V62 HTTP stream
+### Outbound telemetry HTTP batch stream
 
-Core 1 seals both strings from the same snapshot. Core 0 uploads the newest available pair once per second as a JSON array:
+The existing per-pin queue is now an HTTP latest-value queue. V4 is queued once
+per second; dashboard, diagnostic and map values retain their existing timer
+cadences. Core 1 seals V61/V62 from the same snapshot and Core 0 adds both to
+one batch every five seconds.
 
 ```http
-PUT /<token>/telemetry/coherent HTTP/1.1
+PUT /<token>/telemetry/batch HTTP/1.1
 Connection: keep-alive
 Content-Type: application/json
 
-["<V61 CSV>","<V62 CSV>"]
+["4","7","21","-54","61","<V61 CSV>","62","<V62 CSV>"]
 ```
 
 V61 fields:
@@ -137,7 +148,13 @@ gpsUnix,deviceMs,temp,hum,ensFault,roll,pitch,yaw,imuTemp,imuOk,
 pps,inavState,inavLat,inavLng,inavAlt,inavSpeed,inavHeading,status,rssi,wifiQuality
 ```
 
-The server stores both values under one request timestamp and does not reflect them back to the hardware connection. The HTTP client reuses a connection for at most 60 requests, then rotates it preventively. Its transaction timeout is 5 seconds; repeated failures open a 90-second circuit breaker. Blynk health always has priority over bulk HTTP.
+The server validates up to 64 pin/value pairs, stores the complete request under
+one timestamp, and pushes updates to active applications without reflecting
+them back to the hardware connection. The HTTP client reuses a connection for
+at most 60 requests, then rotates it preventively. Its transaction timeout is
+5 seconds; repeated failures open a 90-second circuit breaker. HTTP failure
+does not pause or reset the Blynk control stream, and Blynk control warnings do
+not close a healthy telemetry socket.
 
 ## Patched Blynk library
 
@@ -180,7 +197,7 @@ Use Arduino-ESP32 **3.3.12** with:
 - WiFi/lwIP task affinity: Core 0, as supplied by the selected 3.3.12 configuration;
 - partition large enough for the approximately 1.06 MB application.
 
-The v3.9.214 application compiles for the classic ESP32 with QIO/40 MHz flash,
+The v3.9.217 application compiles for the classic ESP32 with QIO/40 MHz flash,
 Core-0 Arduino loop and Core-0 Arduino events. Rebuilding with another flash
 mode or frequency produces a different binary and should be treated as a
 separate test build.
@@ -379,8 +396,8 @@ The v3.9.214 build used Arduino-ESP32 3.3.12, QIO/40 MHz flash,
 Arduino Runs On Core 0 and Events Run On Core 0. It compiled successfully:
 
 ```text
-Sketch:           1,056,878 bytes (80%)
-Global variables:    75,888 bytes (23%)
+Sketch:           1,057,142 bytes (80%)
+Global variables:    78,536 bytes (23%)
 Dynamic RAM left:   251,792 bytes
 ```
 
