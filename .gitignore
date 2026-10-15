@@ -47,7 +47,8 @@ user.pem
 
 # Project-specific
 ESP32_TEST
-simulation
+simulation/
+diag/
 *.service
 
 # Exception: Keep Blynk library headers

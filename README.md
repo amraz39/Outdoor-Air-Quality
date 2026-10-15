@@ -1,49 +1,101 @@
 # Outdoor Air Quality Station — ESP32
 
-Current firmware: **v3.9.217**
-Current Windows dashboard: **v1.9** (`aq_dashboard.py`)
+Current firmware: **v3.9.229**
+Current Windows dashboard: **v2.3** (`aq_dashboard.py`)
 Target board package: **Arduino-ESP32 3.3.12**
 Backend: **self-hosted Blynk 0.41.18 / legacy Blynk protocol 0.6.1**
 Primary sketch: `AirQualityOutdoor_ESP32_Blynk.ino`
 
 This project is a dual-core ESP32 outdoor air-quality and navigation station. It acquires GPS, environmental, inertial and acoustic data while maintaining a resilient local connection to a Raspberry Pi 5 Blynk server.
 
-The current design separates sensor acquisition from networking and now also
-separates the complete outbound telemetry data plane from the persistent Blynk
-control connection.
+The current design separates sensor acquisition from networking. Core 0 owns
+all WiFi/lwIP work, Blynk protocol traffic and the independent HTTP record
+stream; Core 1 owns sensors and immutable snapshot production.
 
 ## Current status
 
-v3.9.217 is the current compiled and simulation-validated build. The supplied
-v3.9.216 trace showed a 24.179-second delayed application acknowledgement,
-then 10.879-second and 4-second delays, followed by one unrecovered checkpoint.
-WiFi remained associated, Blynk writes returned in at most 13 ms, heap stayed
-stable, and HTTP had 83/83 successful transactions. This is ordered TCP
-head-of-line blocking after an ESP32-to-server segment is delayed or lost.
-Recovery can detect that event, but only data-plane separation removes routine
-telemetry from the affected persistent control stream.
+v3.9.229 is the retained field baseline. The underlying intermittent one-way
+ESP32-to-server TCP loss is not fixed, but this version has produced the best
+operational result: it detects an exact unanswered Blynk application or
+protocol checkpoint at 12 seconds and immediately performs a controlled full
+MCU restart. This avoids spending additional time on a Blynk-only socket
+rotation which did not restore the affected path in the v3.9.228 field run.
+
+The paired v3.9.229 capture on 2026-10-15 verified the complete decision path:
+
+- application checkpoint ID 402 remained unanswered;
+- HTTP was isolated when the exact checkpoint reached 10,000 ms;
+- at 12,002 ms the firmware reported `[Blynk FAST LOSS RECOVERY]` and requested
+  `esp_restart()` immediately;
+- at the decision point WiFi was still `WL_CONNECTED`, RSSI was -55 dBm, the
+  WiFi disconnect-event sequence was unchanged, and local pending-byte,
+  `EAGAIN` and socket-error counters were all zero;
+- the next boot reported reset reason `SOFTWARE`, firmware 3.9.229 and
+  Arduino-ESP32 3.3.12; and
+- the server accepted the replacement connection as session generation 2.
+
+This confirms that v3.9.229 mitigates the outage duration; it does not claim to
+remove the lower-level failure. Data generated while the MCU reboots cannot be
+sent live, but eliminating the failed socket-only trial minimizes that gap.
 
 The important behavior is:
 
 - Core 0 exclusively owns WiFi, lwIP-facing TCP work, `Blynk.run()`, the coherent HTTP client and physical Serial output.
 - Core 1 owns sensor initialization, sensor sampling, GPS parsing, IMU/INAV processing and immutable snapshot production. Core 1 never opens or drives a TCP socket.
-- The Blynk TCP connection is control-only: login, inbound widget commands and protocol PING/PONG. Normal firmware operation sends zero application `virtualWrite()` frames on it.
-- V4, V1-V65 outbound dashboard/diagnostic values, map updates, and V61/V62 use `PUT /{token}/telemetry/batch` on an independent persistent HTTP connection.
-- Ordinary virtual pins retain the bounded 64-slot coalescing queue. Stale values are replaced, and one HTTP request can commit several due pins with one server timestamp.
-- V4 remains a small non-repeating value generated every second. It is given first priority in each HTTP batch.
-- V61 and V62 are still produced from one immutable Core-1 snapshot. They are added to the same HTTP batch every five seconds and retain an identical GPS/device timestamp key.
-- Blynk control PING responses provide end-to-end control-stream evidence. Their exact timeout is 30 seconds, above the measured 24.179-second recovered delay.
-- A Blynk control-path warning no longer closes a healthy HTTP telemetry connection; the two paths are independent failure domains.
-- A Blynk-only sequence hole receives socket-first recovery. Full shared-path recovery requires a fresh unresolved streak of at least two HTTP transport failures within 60 seconds. The HTTP circuit-breaker timer alone is not failure proof.
+- The persistent Blynk TCP connection carries login, inbound commands,
+  PING/PONG and paced application `virtualWrite()` traffic.
+- V4, dashboard and diagnostic pins use the bounded Blynk transmit queue;
+  V61/V62 use `PUT /{token}/telemetry/batch` on an independent persistent HTTP
+  connection.
+- Ordinary virtual pins retain the bounded 64-slot coalescing queue. Stale
+  same-pin values are replaced before paced delivery through Blynk.
+- V4 remains a small non-repeating value generated every second and receives
+  first priority in the Blynk transmit queue.
+- V61 and V62 are produced from one immutable Core-1 snapshot, committed
+  together by HTTP every second, and retain an identical GPS/device timestamp
+  key.
+- Exact tracked Blynk application acknowledgements and protocol PING responses
+  provide end-to-end evidence. Either exact request remaining unanswered for
+  12 seconds triggers the bounded full-MCU restart.
+- At 10 seconds, an overdue exact Blynk request pauses application writes and
+  isolates HTTP so recovery is not delayed by additional traffic.
+- Generic inbound silence without an exact outstanding request retains the
+  conservative 70-second and socket-first recovery path.
 - WiFi teardown is not used as a generic Blynk repair. WiFi recovery is reserved for actual association/IP failures.
 - The optional ten-minute periodic reset remains disabled.
 
-The 7,200-second model runs at 100-ms resolution with the measured 24.179 s,
-10.879 s and 4 s delays plus independent HTTP outages. It produced 720 control
-PINGs, zero Blynk application frames, zero control disconnects, 7,040 successful
-HTTP batches, 1,409 coherent V61/V62 records and zero timestamp mismatches.
+### Why this baseline is being kept
 
-## Why v3.9.214 changed the quiet-recovery policy
+v3.9.228 forced HT20 before association and verified HT20 again after `GOT_IP`.
+The same failure still occurred, so v3.9.229 removed the bandwidth override
+entirely and restored the normal driver/AP bandwidth negotiation. The HT20
+experiment is closed unless new evidence specifically implicates channel width.
+
+Arduino-ESP32 4.0.0-RC1 was also tried and showed the same communication issue.
+It therefore did not provide a recovery benefit, while moving the project from
+the established ESP-IDF 5.5.5 base to the pre-release ESP-IDF 6.1 base adds a
+second variable and possible compatibility regressions. The deployed baseline
+will remain:
+
+```text
+Air-quality firmware: 3.9.229
+Arduino-ESP32 board package: 3.3.12
+WiFi bandwidth: driver/AP default (no forced HT20 or HT40)
+Recovery: exact request timeout at 12 seconds -> controlled MCU restart
+```
+
+Do not continue speculative WiFi-mode, bandwidth or socket-recovery changes
+while this combination remains the fastest observed recovery. Revisit the core
+only after the final Arduino-ESP32 4.0 release is available. At that point,
+compile and field-test a separate 4.0 candidate without changing the 3.9.229
+recovery policy, and preserve the 3.3.12 binary as the rollback baseline. This
+keeps any result attributable to the board-package change.
+
+## Historical: why v3.9.214 changed the quiet-recovery policy
+
+This section records an earlier stage of the investigation. Its 70-second
+exact-request policy is superseded by the validated v3.9.229 12-second fast
+restart described above; the generic-silence fallback remains 70 seconds.
 
 The v3.9.213 logs exposed two policy defects around a real but transient ESP32
 TCP/WiFi delay:
@@ -62,7 +114,11 @@ late immediately removes HTTP from the shared path. Blynk then has a quiet
 70-second retransmission window. An open HTTP circuit is retained as a pause
 mechanism but cannot by itself authorize an MCU restart.
 
-## Why v3.9.211 changed recovery scope
+## Historical: why v3.9.211 changed recovery scope
+
+This section describes the evidence progression that led to the current
+v3.9.229 policy. Exact established-session request loss no longer waits for
+HTTP corroboration before restarting; generic silence still does.
 
 Earlier firmware repeatedly restarted only the Blynk protocol object after the established stream became one-way. That did not help when both independent transports were already affected:
 
@@ -86,7 +142,7 @@ Core 0 — communications owner
   Arduino setup()/loop()
   ESP32 WiFi events and recovery state machine
   Blynk control protocol, PING/PONG and inbound callbacks
-  Persistent nonblocking HTTP batch client for all outbound virtual pins
+  Persistent nonblocking HTTP batch client for coherent V61/V62 records
   Serial output and network health diagnostics
 
 Core 1 — sensor and processing owner
@@ -110,28 +166,30 @@ The two cores monitor each other's progress. Recovery requests are cooperative; 
 
 ### Blynk control socket
 
-The persistent Blynk 0.6.1 hardware socket carries only:
+The persistent Blynk 0.6.1 hardware socket carries:
 
-- Blynk login, INFO and protocol PING/RESPONSE traffic;
-- inbound application callbacks, including V55 remote restart.
+- login, INFO and protocol PING/RESPONSE traffic;
+- inbound application callbacks, including V55 remote restart;
+- paced V4 liveness, dashboard, diagnostic and map `virtualWrite()` frames.
 
-Normal operation sends no outbound hardware/application frames on this stream.
-This removes routine telemetry packets from the TCP sequence space whose one
-missing segment previously blocked all later Blynk commands.
+The bounded coalescing queue retains the newest value for each pin and avoids
+large bursts. One exact application acknowledgement is tracked at a time. If
+that request remains unanswered, later application writes are stopped so the
+failure can be measured without growing the TCP backlog.
 
 ### Outbound telemetry HTTP batch stream
 
-The existing per-pin queue is now an HTTP latest-value queue. V4 is queued once
-per second; dashboard, diagnostic and map values retain their existing timer
-cadences. Core 1 seals V61/V62 from the same snapshot and Core 0 adds both to
-one batch every five seconds.
+Core 1 seals V61/V62 from the same immutable snapshot. Core 0 sends the pair on
+the independent persistent HTTP connection once per second. This stream also
+provides independent evidence about whether a failure is Blynk-only or affects
+the wider ESP32 TCP transmit path.
 
 ```http
 PUT /<token>/telemetry/batch HTTP/1.1
 Connection: keep-alive
 Content-Type: application/json
 
-["4","7","21","-54","61","<V61 CSV>","62","<V62 CSV>"]
+["61","<V61 CSV>","62","<V62 CSV>"]
 ```
 
 V61 fields:
@@ -148,13 +206,14 @@ gpsUnix,deviceMs,temp,hum,ensFault,roll,pitch,yaw,imuTemp,imuOk,
 pps,inavState,inavLat,inavLng,inavAlt,inavSpeed,inavHeading,status,rssi,wifiQuality
 ```
 
-The server validates up to 64 pin/value pairs, stores the complete request under
-one timestamp, and pushes updates to active applications without reflecting
-them back to the hardware connection. The HTTP client reuses a connection for
-at most 60 requests, then rotates it preventively. Its transaction timeout is
-5 seconds; repeated failures open a 90-second circuit breaker. HTTP failure
-does not pause or reset the Blynk control stream, and Blynk control warnings do
-not close a healthy telemetry socket.
+The server validates the pair, stores the complete request under one timestamp,
+and pushes updates to active applications without reflecting them back to the
+hardware connection. The HTTP client reuses a connection for at most 60
+requests, then rotates it preventively. Its transaction timeout is 5 seconds;
+repeated failures open a 90-second circuit breaker. An exact Blynk request
+overdue by 10 seconds temporarily isolates this HTTP path; after the v3.9.229
+restart and reconnect, normal publication resumes from the newest snapshot
+without replaying a stale backlog.
 
 ## Patched Blynk library
 
@@ -191,16 +250,17 @@ C:\Users\<user>\Documents\Arduino\libraries\Blynk\src\Blynk\BlynkProtocol.h
 Use Arduino-ESP32 **3.3.12** with:
 
 - board: ESP32 Dev Module or the matching classic ESP32 target;
-- flash mode: QIO at 40 MHz (the setting used for the validated v3.9.214 build);
+- flash mode: QIO at 40 MHz (the setting retained for the v3.9.229 baseline);
 - Arduino loop: Core 0;
 - Arduino events: Core 0;
 - WiFi/lwIP task affinity: Core 0, as supplied by the selected 3.3.12 configuration;
 - partition large enough for the approximately 1.06 MB application.
 
-The v3.9.217 application compiles for the classic ESP32 with QIO/40 MHz flash,
-Core-0 Arduino loop and Core-0 Arduino events. Rebuilding with another flash
-mode or frequency produces a different binary and should be treated as a
-separate test build.
+The v3.9.229 application targets the classic ESP32 with QIO/40 MHz flash,
+Core-0 Arduino loop and Core-0 Arduino events. Rebuilding with another board
+package, flash mode or frequency produces a different binary and must be
+treated as a separate test build. Keep the known 3.3.12 binary before testing
+the final Arduino-ESP32 4.0 release.
 
 `ESP32_CORE_PATCH/3.3.12/libraries/WiFi/src/STA.cpp` contains the single targeted Arduino-ESP32 patch retained by this project: authentication-expiry events set `WL_CONNECTION_LOST`. It affects ESP32 Core 3.3.12 only and has no effect on ESP8266. Back up the installed core file before applying it.
 
@@ -234,7 +294,7 @@ This firmware targets the self-hosted legacy server, not current Blynk Cloud. Do
 
 ## Windows dashboard (`aq_dashboard.py`)
 
-Dashboard v1.9 is a read-mostly Windows monitoring application for the local legacy Blynk server. It displays the current sensor/navigation values, the coherent V61/V62 record, diagnostics, maps and bounded history graphs. All Tk widget changes are applied on the main GUI thread; independent HTTP workers have their own `requests.Session` instances.
+Dashboard v2.3 is a read-mostly Windows monitoring application for the local legacy Blynk server. It displays the current sensor/navigation values, the coherent V61/V62 record, diagnostics, maps and bounded history graphs. All Tk widget changes are applied on the main GUI thread; independent HTTP workers have their own `requests.Session` instances.
 
 Install the required packages:
 
@@ -278,6 +338,20 @@ Dashboard states:
 | `SERVER UNAVAILABLE` | The dashboard cannot obtain a valid Blynk hardware-status response. |
 
 Internal evidence such as `Blynk + V4 heartbeat` is used by the worker but is not displayed while the dashboard is connected. The header shows only the most recent live-telemetry time.
+
+### Opt-in RPi5 transport capture
+
+The compact **Transport capture (V66)** card is intended for short investigations while the dashboard remains open. Press **Start 30 min capture** to write `1` to V66; press **Stop capture** to end it early. The button turns red while recording, shows the remaining time, and displays the newest server event. Both the ESP32 and server independently enforce a 30-minute maximum.
+
+Normal operation remains quiet: with V66 off, the ESP32 emits no V68 probes and the dashboard checks only the V66 state every 15 seconds. While capture is active, Core 0 sends the small `deviceMillis,sequence` V68 probe once per second. The server records hardware login, inbound frames, PING/RESPONSE completion or failure, channel writability, idle timeout, disconnect and reconnect events. A throttled live summary is mirrored to V67 for the dashboard; V67 is secondary evidence, not the authoritative record.
+
+The authoritative CSV is written on the Raspberry Pi under:
+
+```text
+<data.folder>/diag/transport/blynk-transport-<UTC>-dash<ID>-device<ID>.csv
+```
+
+Each row includes server UTC/epoch time, capture elapsed time, server queue delay, event type, session generation, message ID, V-pin, client value, remote endpoint, channel writability and pending-byte evidence. Rows are flushed immediately. Files older than 24 hours are deleted when a capture starts and by the server maintenance task. If the dashboard closes, the server keeps recording until V66 is turned off or the 30-minute deadline expires. A server restart intentionally returns capture to OFF. `FILE_ERROR` on V67 and V66 returning to `0` indicate that the server could not create or continue the CSV.
 
 ### Dashboard refresh rates
 
@@ -345,8 +419,8 @@ All ADC inputs use 12-bit resolution and per-pin 11 dB attenuation. The 5 V anal
 | Dashboard round robin | 4 seconds per selected pin | spreads V1–V32 load |
 | Diagnostic round robin | 15 seconds per selected pin | spreads V34–V65 load |
 | Map V33 | 120 seconds | avoids excessive map points |
-| Protocol PING target | 10 seconds | exact response tracked; 15-second protocol-proof deadline |
-| Application ACK checkpoint | every 4 Blynk application frames | HTTP isolated after 3 seconds late; socket deadline 70 seconds |
+| Protocol PING target | 10 seconds | exact response tracked; 12-second exact-request deadline |
+| Application ACK checkpoint | every 4 Blynk application frames | HTTP isolated at 10 seconds; MCU restart at 12 seconds if still unanswered |
 | Blynk heartbeat hard deadline | 189 seconds | final library-level backstop |
 
 V55 is an edge-armed remote hard-reset control. After the 30-second boot lockout, a LOW arms the input and the following HIGH requests `esp_restart()`; the dashboard sends `0 -> 1 -> 0`. The next boot reports `SOFTWARE` on V34.
@@ -372,8 +446,13 @@ Serial health blocks include `[PERF]`, `[SERVER]`, `[SERVER RX/PONG]`, `[SYNC]`,
 Useful interpretation:
 
 - `protocol PING sent == verified`, zero queue backlog and recent inbound activity indicate a healthy Blynk path.
-- HTTP `paused=1` after an application ACK or protocol PING recovery is expected until the 60-second quiet window completes.
-- `[Blynk/HTTP ISOLATION] exact Blynk proof overdue` followed by `proof recovered` without `SESSION END` is a successful quiet recovery, not a Blynk reconnect.
+- HTTP `paused=1` after an exact application ACK or protocol PING becomes
+  overdue is expected: the path is isolated at 10 seconds. If proof arrives
+  before 12 seconds, traffic can resume; otherwise v3.9.229 restarts the MCU.
+- `[Blynk/HTTP ISOLATION] exact Blynk proof overdue` followed by `proof
+  recovered` without `SESSION END` is a successful same-session recovery.
+- `[Blynk FAST LOSS RECOVERY]` followed by reset reason `SOFTWARE` is the
+  expected v3.9.229 bounded recovery for an exact 12-second sequence hole.
 - A short dashboard `NO LIVE DATA` indication without a firmware `SESSION END`, `Blynk LOSS` or `Disconnected` record is a strict liveness-window result, not a Blynk session loss.
 - `ESP reset reason: SOFTWARE` together with `[RESET] ... PROVEN_SHARED_TCP_PATH` is a deliberate recovery.
 - `ESP reset reason: BROWNOUT` and `Brownout detector was triggered` indicate real supply undervoltage, not a Blynk or INO recovery. Do not disable the brownout detector; power-cycle and correct the supply/cable/load.
@@ -381,16 +460,29 @@ Useful interpretation:
 ## Recovery ladder
 
 1. The application ACK barrier pauses later application writes while its exact checkpoint is outstanding.
-2. Close/pause the HTTP data plane when either an application ACK checkpoint or protocol PING is 3 seconds overdue.
-3. Allow up to 70 seconds of quiet TCP retransmission before declaring an application-path sequence hole.
-4. If only Blynk is affected, rotate the Blynk owner socket and run heartbeat-only probation.
-5. If Blynk fails and HTTP has a fresh unresolved streak of at least two transport failures, perform one complete MCU restart. An open circuit timer alone is insufficient evidence.
+2. At 10 seconds, close/pause the HTTP data plane when either an exact
+   application ACK checkpoint or protocol PING remains unanswered.
+3. At 12 seconds, if that exact request is still unanswered on an established
+   socket with unchanged WiFi association, perform the controlled full-MCU
+   restart immediately. Do not spend time on a socket-only trial first.
+4. If there is no exact outstanding request and only generic inbound silence is
+   observed, retain the conservative 70-second, Blynk-socket-first path.
+5. A replacement session that also becomes one-way, two independent failure
+   generations, or corroborating unresolved HTTP failures can still escalate
+   the generic path to a complete MCU restart.
 6. If WiFi actually loses association/IP, use the separate single-owner WiFi recovery state machine.
 7. Task-WDT and cross-core viability supervision remain final protection against a true task stall.
 
 Raw PCB aborts are disabled in the normal Blynk cleanup path. Owner-managed socket close is used instead.
 
-## Build and validation
+## Current field validation
+
+The 2026-10-15 serial log confirms that the deployed image identifies itself
+as firmware 3.9.229 on Arduino-ESP32 3.3.12. The paired server capture confirms
+that the first exact sequence-hole signature causes one software restart and a
+fresh authenticated server session, without the former socket-trial delay.
+
+## Historical build and simulation record
 
 The v3.9.214 build used Arduino-ESP32 3.3.12, QIO/40 MHz flash,
 Arduino Runs On Core 0 and Events Run On Core 0. It compiled successfully:
@@ -436,13 +528,13 @@ covered.
 ## Related files
 
 - `AirQualityOutdoor_ESP32_Blynk.ino` — current firmware.
-- `aq_dashboard.py` — Windows dashboard v1.9 with strict Blynk + live-data connection health.
+- `aq_dashboard.py` — Windows dashboard v2.3 with strict Blynk + live-data connection health.
 - `BLYNK_LIB/` — only the two modified Blynk library files.
 - `ESP32_CORE_PATCH/3.3.12/` — targeted ESP32-only WiFi status patch.
 - `blynk.service` — current Raspberry Pi 5 Java 21 service unit.
 - `simulation/blynk_quiet_recovery_v319214_2hour_sim.py` — current two-hour/100-ms recovery and regression model.
 - `AirQualityOutdoor_ESP32_Blynk.ino.20261011_pre_v3.9.214.bak` — rollback copy immediately before the quiet-recovery update.
-- `README_System_Health_Diagnostics.md` — historical diagnostic detail; where it conflicts with this README or v3.9.214 source, the source and this current README take precedence.
+- `README_System_Health_Diagnostics.md` — historical diagnostic detail; where it conflicts with this README or v3.9.229 source, the source and this current README take precedence.
 
 ## Change safety
 

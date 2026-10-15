@@ -17,6 +17,99 @@ struct Core1TelemetryPair;
 #define ESP32_RX_ISOLATION_TEST 0
 #endif
 
+// v3.9.229 DEFAULT WIFI BANDWIDTH + FIRST-HOLE FAST RESTART
+//   - The paired v3.9.228 capture verifies that the STA was actually using
+//     HT20, yet the same one-way Blynk/TCP sequence hole still occurred. HT20
+//     is therefore not a useful compatibility workaround for this installation.
+//   - Remove the bandwidth override and its post-association reassert/readback.
+//     The ESP32 WiFi driver and AP once again negotiate their default channel
+//     width; normal 802.11b/g/n protocol support remains unchanged.
+//   - The first exact application-checkpoint or protocol-PING timeout on an
+//     established session now requests the bounded whole-MCU restart directly
+//     at 12 seconds. The v3.9.228 trace showed that socket rotation plus two
+//     failed reconnect budgets only added about 11 seconds before the restart
+//     that restored live data. Generic inbound silence remains conservative.
+//
+// v3.9.228 FORCE 20-MHZ 802.11N FOR AP COMPATIBILITY (REMOVED IN v3.9.229)
+//   - Keep normal 802.11b/g/n support but force the ESP32 STA to HT20 instead
+//     of its HT40-capable default. This is a targeted A/B test for an ESP32/AP
+//     MAC interoperability failure: the paired captures prove that one uplink
+//     TCP segment disappears while later ESP32 segments reach the server, then
+//     TCP head-of-line ordering stalls both Blynk and the independent HTTP path.
+//   - Apply WIFI_BW_HT20 after every WiFi.mode(WIFI_STA), before WiFi.begin(),
+//     because a complete driver stop/start can restore defaults. Reassert and
+//     read it back after GOT_IP; `[WiFi BANDWIDTH VERIFY] ... actual=HT20`
+//     is required evidence that the compatibility setting is active.
+//   - This does not select legacy b/g-only mode and does not disable 802.11n or
+//     A-MPDU at compile time. Existing exact sequence-hole detection and the
+//     v3.9.227 corroborated whole-MCU recovery remain unchanged.
+//
+// v3.9.227 CORROBORATED SHARED-TCP FAST RECOVERY
+//   - The paired v3.9.226 ESP/server capture proves that an exact Blynk
+//     sequence hole accompanied by three unresolved HTTP timeouts is already
+//     sufficient evidence of a process-wide ESP32 TCP transmit-path failure.
+//     A replacement Blynk socket authenticated and passed all eight canaries,
+//     but became one-way immediately after normal publishing resumed. The
+//     socket-only trial therefore added about 60 seconds before the same MCU
+//     reset which ultimately restored both paths.
+//   - Restart the MCU immediately when an exact Blynk hole is corroborated by
+//     at least two consecutive failures on the independently owned HTTP path.
+//     An isolated Blynk-only hole still receives the narrow socket rotation.
+//
+// v3.9.226 LOW-LATENCY SEQUENCE-HOLE RECOVERY
+//   - A TCP stream with one missing ESP32 uplink segment cannot deliver any
+//     later Blynk frames until that segment is retransmitted. The server-side
+//     capture measured one such repair at 47.6 seconds; the server processed
+//     the bytes immediately when they finally became ordered and readable.
+//   - Waiting 70 seconds preserves the damaged TCP connection but also exposes
+//     the dashboard to that full delay. Normal paired captures put healthy
+//     Blynk responses below about seven seconds, so an exact unanswered
+//     application checkpoint or protocol PING now rotates only the Blynk socket
+//     at 12 seconds. Application/HTTP traffic is already stopped at 10 seconds,
+//     leaving a quiet two-second confirmation interval before reconnection.
+//   - This changes the priority from avoiding reconnects to restoring fresh TCP
+//     sequence space promptly. The independently authenticated second-session
+//     and bounded MCU-recovery guards remain unchanged.
+//
+// v3.9.225 PRESERVE TCP THROUGH THE PROVEN RETRANSMISSION WINDOW
+//   - The paired ESP32/RPi5 capture proves that an application checkpoint sent
+//     into the sequence hole can reach the server about 47.6 seconds later.
+//     Earlier captures measured the same class of TCP repair at 47..58 seconds.
+//   - v3.9.216 shortened the exact application-checkpoint deadline to 25
+//     seconds. That made the firmware close a stream which TCP was still able
+//     to repair, after which fresh SYN attempts could time out and force an
+//     unnecessary MCU reset. This is the failure sequence reproduced by the
+//     v3.9.224 log at approximately five minutes.
+//   - Keep the 10-second HTTP-isolation brake, but give both exact application
+//     and protocol probes the existing 70-second TCP recovery grace before
+//     rotating the Blynk socket. The ordinary 189-second Blynk deadline remains
+//     the final protocol bound; the generation-two recovery fix is unchanged.
+//
+// v3.9.224 SECOND INDEPENDENT SEQUENCE-HOLE ESCALATION
+//   - Cross-correlation of the ESP32 and RPi5 captures proves that two
+//     separately authenticated Blynk sockets became one-way only 84.6 seconds
+//     apart while the WiFi disconnect sequence remained unchanged. The
+//     independent HTTP path also had an unresolved failure streak.
+//   - The recurrence counter correctly reached generation two, but the normal
+//     established-session branch still labelled it as a first hole and rotated
+//     a third socket. Escalate generation two through the existing bounded
+//     shared-path recovery instead. One isolated hole still receives the
+//     narrow socket-only repair and all ordinary connect/login failures remain
+//     unable to restart the MCU.
+//
+// v3.9.223 OPT-IN END-TO-END TRANSPORT CAPTURE
+//   - V66 is a switch for a bounded diagnostic capture. The Blynk server saves
+//     the authoritative event stream on the RPi5 and mirrors a rate-limited
+//     summary to applications on V67. Normal operation creates no extra probe
+//     traffic while V66 is OFF.
+//   - While V66 is ON, Core 0 sends one small V68 probe per second containing
+//     device millis() and a monotonic sequence. Comparing that client key with
+//     the server receive timestamp identifies the first packet missing from an
+//     otherwise established Blynk stream.
+//   - Both sides independently enforce a 30-minute maximum. V66=0 stops the
+//     trial earlier. V67 is server-to-application only and is never generated
+//     by this sketch; sensors and the coherent V61/V62 path are unchanged.
+//
 // v3.9.222 COORDINATED DUAL-PATH RECOVERY TRIAL
 //   - Field evidence disproves the v3.9.221 assumption that approximately 50
 //     requests form an ESP32/lwIP failure boundary: the rotated HTTP socket
@@ -566,7 +659,7 @@ struct Core1TelemetryPair;
 //     requires a fresh unresolved streak of at least two HTTP failures.
 //   - V4 remains 1 second, V61/V62 remain an immutable timestamp pair, normal
 //     802.11b/g/n remains enabled, and Core 1 remains free of network calls.
-#define FIRMWARE_VERSION "3.9.222"
+#define FIRMWARE_VERSION "3.9.229"
 
 // v3.9.198 EARLY SESSION-PATH RECOVERY + FIRST-DISCONNECT OWNERSHIP
 //   - The v3.9.197 trace lost RESPONSE 691 while WiFi, heap and both cores were
@@ -2510,18 +2603,18 @@ static void diagnosticResetRequest(const char *reason) {
 #define BLYNK_STOCK_DEFERRED_TX_BYTES 2048U
 // v3.9.185: the v3.9.184 field run proved that a fresh socket authenticates in
 // about one second while preserving the old sequence space causes a 65s outage.
-// Normal RESPONSE gaps remain below about 20s, but packet captures also proved
-// that an accepted ESP32 TCP segment can need 47-58s of retransmission before
-// its RESPONSE returns.  Allow 70s with bulk HTTP quiesced before discarding
-// the affected Blynk socket; lower reset domains remain separately gated.
+// The generic 70s grace remains available for fallback/shared-path supervision.
 #define BLYNK_SERVER_STALL_GRACE_MS           70000UL
 #define BLYNK_STOCK_PATH_RECOVERY_ESCALATE_MS BLYNK_SERVER_STALL_GRACE_MS
-#define BLYNK_APPLICATION_PROBE_TIMEOUT_MS    25000UL
-// HTTP is isolated after either exact application or protocol proof has been
-// unanswered for 10s. v3.9.220 measured healthy response batches as high as
-// about 7s, so this still provides a quiet interval before the 25s decision
-// without turning normal server jitter into TCP close/reopen churn.
-#define BLYNK_PROTOCOL_PROBE_TIMEOUT_MS       15000UL
+// Healthy response batches were observed up to about 7s. Quiesce application/
+// HTTP traffic at 10s. v3.9.229 restarts the MCU when an exact request remains
+// unanswered at 12s; v3.9.228 proved that rotating only the Blynk socket still
+// led to failed reconnects and the same eventual restart. Generic inbound
+// silence remains a conservative 70s fallback because it is not tied to an
+// exact outstanding request.
+#define BLYNK_EXACT_PROBE_RECOVERY_MS          12000UL
+#define BLYNK_APPLICATION_PROBE_TIMEOUT_MS     BLYNK_EXACT_PROBE_RECOVERY_MS
+#define BLYNK_PROTOCOL_PROBE_TIMEOUT_MS        BLYNK_EXACT_PROBE_RECOVERY_MS
 #define BLYNK_STOCK_PATH_RECOVERY_VERIFY_MS   30000UL
 #define BLYNK_SEQUENCE_HOLE_MAX_SOCKET_TRIALS 3U
 #define BLYNK_SEQUENCE_HOLE_SERVER_COOLDOWN_MS 30000UL
@@ -4860,6 +4953,9 @@ uint8_t bmi160ActiveAddr = BMI160_ADDR;  // v3.9.32: runtime address; auto-detec
 #define V63 63  // current queued TX item count
 #define V64 64  // last transmitted V-pin
 #define V65 65  // maximum virtualWrite duration, ms (CSV string)
+#define V66 66  // opt-in server/ESP32 transport-capture control (0=off, 1=on)
+#define V67 67  // server-to-application live diagnostic mirror (ESP32 never writes)
+#define V68 68  // opt-in ESP32 probe: deviceMillis,sequence
 
 // ─── CO CLOSED-LOOP HEATER TARGETS ───────────────────────────────────────────
 // A1 feedback divider scales 5V→2.5V at ADC. We target the ADC-side voltage.
@@ -6602,6 +6698,18 @@ static long blynkCoherentPairGpsTs = 0;
 static uint32_t blynkCoherentPairSequence = 0;
 static uint32_t blynkLastAcceptedTelemetrySequence = 0;
 
+// v3.9.223: V66 enables a deliberately small correlation probe only for a
+// bounded field test. This state is owned by Core 0, where Blynk.run(), its
+// callbacks and blynkTransportDiagnosticService() all execute. No mutex or
+// sensor-core access is involved.
+#define BLYNK_TRANSPORT_DIAGNOSTIC_MAX_MS 1800000UL
+#define BLYNK_TRANSPORT_DIAGNOSTIC_PROBE_MS 1000UL
+static bool blynkTransportDiagnosticEnabled = false;
+static uint32_t blynkTransportDiagnosticEnabledAtMs = 0;
+static uint32_t blynkTransportDiagnosticUntilMs = 0;
+static uint32_t blynkTransportDiagnosticLastProbeMs = 0;
+static uint32_t blynkTransportDiagnosticProbeSequence = 0;
+
 
 // v3.9.20: instrument the Blynk transport itself. This is
 // deliberately below Blynk.virtualWrite() so we can distinguish a stall in
@@ -6920,11 +7028,9 @@ static unsigned long blynkStockLastCleanRefreshMillis = 0;
 // still attempted only once per Blynk outage and does not affect ESP8266 code.
 #define BLYNK_STOCK_WIFI_STACK_RECOVERY_MS 20000UL
 #define BLYNK_STOCK_WIFI_DRIVER_SETTLE_MS 2000UL
-// v3.9.216: this counter is evaluated only after a 25-second exact application
-// checkpoint hole (or the still-conservative 70-second generic hole). In the
-// supplied v3.9.215 trace every later retry failed until the eventual MCU
-// reset, so two fresh full-budget TCP timeouts trigger that bounded last resort
-// without adding another two minutes of known-offline time.
+// v3.9.226: exact probe failure starts low-latency socket recovery at 12s. If
+// that stream cannot recover and two fresh full-budget TCP connections also
+// time out, trigger the bounded last resort.
 #define BLYNK_STOCK_RX_PATH_TIMEOUTS_BEFORE_RESTART 2U
 static bool blynkStockWifiStackRecoveryAttempted = false;
 static bool blynkStockWifiStackRecoveryInProgress = false;
@@ -9839,6 +9945,40 @@ void blynkSendV4()
   core1StageEnd();
 }
 
+// v3.9.223: one explicit sequence/timestamp probe per second while the user has
+// enabled V66. V4 remains the production heartbeat. V68 is diagnostic-only and
+// uses the normal coalescing queue, so it never blocks Blynk.run() or builds a
+// reconnect backlog. The RPi5 server timestamps receipt of this exact key.
+static void blynkTransportDiagnosticService()
+{
+  const uint32_t now = millis();
+  if (!blynkTransportDiagnosticEnabled) return;
+
+  if ((int32_t)(now - blynkTransportDiagnosticUntilMs) >= 0) {
+    blynkTransportDiagnosticEnabled = false;
+    blynkTransportDiagnosticUntilMs = 0;
+    blynkTransportDiagnosticLastProbeMs = 0;
+    Serial.printf("[TRANSPORT DIAG] V66 capture auto-stopped after %lums; probes=%lu\n",
+                  (unsigned long)(now - blynkTransportDiagnosticEnabledAtMs),
+                  (unsigned long)blynkTransportDiagnosticProbeSequence);
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED || !Blynk.connected()) return;
+  if (blynkTransportDiagnosticLastProbeMs != 0 &&
+      (uint32_t)(now - blynkTransportDiagnosticLastProbeMs) <
+          BLYNK_TRANSPORT_DIAGNOSTIC_PROBE_MS) return;
+
+  blynkTransportDiagnosticLastProbeMs = now;
+  const uint32_t sequence = ++blynkTransportDiagnosticProbeSequence;
+  char probe[40];
+  snprintf(probe, sizeof(probe), "%lu,%lu",
+           (unsigned long)now, (unsigned long)sequence);
+  if (!blynkTxQueueValue(V68, probe)) {
+    ++blynkTxCongestionSkips;
+  }
+}
+
 // v3.9.180: V61/V62 remain independent of V4. The coherent database record is
 // generated every two seconds and both halves use the same SensorData snapshot.
 void blynkSendCoherentSnapshot()
@@ -10677,10 +10817,10 @@ static void blynkSequenceHoleEnterServerCooldown(const char *source)
 }
 
 // Whole-MCU recovery is the final bounded fallback. Callers reach this only
-// after a proven one-way established stream plus either repeated authenticated
-// replacement failure, corroborating independent HTTP failure, or two fresh
-// full-budget TCP connection timeouts. Ordinary connection failures cannot
-// invoke it.
+// after strong end-to-end evidence: an exact established-stream probe timeout,
+// repeated authenticated replacement failure, corroborating independent HTTP
+// failure, or two fresh full-budget TCP connection timeouts. Ordinary login or
+// connection failures cannot invoke it.
 static void blynkSequenceHoleRequestBoundedRestart(const char *source)
 {
   if (blynkStockWifiStackRecoveryAttempted ||
@@ -11403,6 +11543,7 @@ bool wifiConnect()
 //
 // Keep this include AFTER the Blynk headers have been included above.
 #include "V55Handler.h"
+#include "V66Handler.h"
 
 
 // v3.9.107: watchdog forensic heartbeat.  This survives TG0/TG1 watchdog
@@ -12379,6 +12520,7 @@ void loop()
   core0DrainSensorLog();
   core0RefreshSensorDiagnostics();
   core0PublishConnectionSnapshot(false);
+  blynkTransportDiagnosticService();
 
   loopState = LOOP_STATE_RUN;
   static uint32_t perfLastLoopStartUs = 0;
@@ -12844,11 +12986,11 @@ void loop()
   // deferred-byte and send-buffer counters all remain zero; they cannot be the
   // recovery gate.  A formerly healthy authenticated session with an unchanged
   // WiFi event sequence and no inbound Blynk response beyond the measured
-  // response window is the end-to-end signal. v3.9.185 uses 25 seconds because
-  // the supplied healthy maximum was 20.042s and the socket-only replacement
-  // authenticated in about one second. The first action
-  // is socket-only. v3.9.186 keeps all Blynk-only recovery socket-only and
-  // admits no application frames until the replacement passes verification.
+  // response window is the end-to-end signal. v3.9.229 prioritizes continuity:
+  // an exact unanswered probe restarts the MCU at 12 seconds, after the 10s
+  // application/HTTP brake, because the v3.9.228 socket-only attempt did not
+  // restore the path. Generic silence alone retains the conservative 70-second
+  // bound and socket-first recovery.
   const uint32_t blynkProtocolInboundAge =
       (uint32_t)(millis() - Blynk.lastInboundActivity());
 
@@ -12860,14 +13002,15 @@ void loop()
   const bool blynkProtocolProbeTimedOut =
       Blynk.protocolPingPending() &&
       Blynk.protocolPingAge() >= BLYNK_PROTOCOL_PROBE_TIMEOUT_MS;
+  const bool blynkExactProbeTimedOut =
+      blynkApplicationProbeTimedOut || blynkProtocolProbeTimedOut;
   const bool blynkGenericInboundTimedOut =
       blynkProtocolInboundAge >= BLYNK_STOCK_PATH_RECOVERY_ESCALATE_MS;
   if (Blynk.connected() &&
       blynkStockSessionState == BLYNK_STOCK_SESSION_ONLINE &&
       blynkSessionWifiUnchanged &&
       _blynkWifiClient.connected() &&
-      (blynkApplicationProbeTimedOut ||
-       blynkProtocolProbeTimedOut ||
+      (blynkExactProbeTimedOut ||
        blynkGenericInboundTimedOut)) {
     if (blynkSequenceHoleRecoveryTrial ||
         blynkSequenceHoleApplicationCanary) {
@@ -12911,7 +13054,7 @@ void loop()
       return;
     }
 
-    Serial.printf("[Blynk TCP SEQUENCE HOLE] established stream probe failed: inboundAge=%lums appProbe=%d id=%u age=%lums protocolProbe=%d id=%u age=%lums generic=%d; tcpConnected=1 pending=%u EAGAIN=%lu socketErr=%lu WiFi=%d RSSI=%d wifiDiscSeq=%lu unchanged=1; rotating Blynk socket first\n",
+    Serial.printf("[Blynk TCP SEQUENCE HOLE] established stream probe failed: inboundAge=%lums appProbe=%d id=%u age=%lums protocolProbe=%d id=%u age=%lums generic=%d; tcpConnected=1 pending=%u EAGAIN=%lu socketErr=%lu WiFi=%d RSSI=%d wifiDiscSeq=%lu unchanged=1; selecting exact/generic recovery policy\n",
                   (unsigned long)blynkProtocolInboundAge,
                   Blynk.applicationAckPending() ? 1 : 0,
                   (unsigned)Blynk.applicationAckPingId(),
@@ -12927,12 +13070,34 @@ void loop()
                   (unsigned long)wifiDisconnectEventSequence);
     blynkStockRxForensicSessionEnd(millis(), "tcp-sequence-hole");
 
-    // v3.9.222: an HTTP timeout concurrent with a Blynk hole proves that two
-    // established streams stopped progressing, but it does not prove a fresh
-    // TCP sequence space will fail. HTTP is already closed/paused by the exact
-    // Blynk checkpoint barrier. Test a newly authenticated Blynk socket before
-    // expanding recovery to the complete MCU; its existing two-connect-timeout
-    // and replacement-session-one-way guards still bound a real stack wedge.
+    // v3.9.229: the paired v3.9.228 ESP/server trace showed that the first
+    // exact 12-second application/protocol hole was not repaired by rotating
+    // only the Blynk socket. Two subsequent bounded TCP connect attempts also
+    // timed out before the MCU restart restored live data. For an established,
+    // authenticated session with unchanged WiFi association and a connected
+    // local socket, this exact probe evidence now skips that ineffective delay.
+    // Generic silence alone still follows the conservative corroboration and
+    // socket-first path below.
+    if (blynkExactProbeTimedOut) {
+      const uint32_t exactHoleNow = millis();
+      if (blynkSequenceHoleRecentGenerations == 0U) {
+        blynkSequenceHoleRecentGenerations = 1U;
+      }
+      blynkSequenceHoleLastGenerationMillis = exactHoleNow;
+      Serial.printf("[Blynk FAST LOSS RECOVERY] first exact established-stream probe timed out at 12s: appProbe=%d/%lums protocolProbe=%d/%lums; restarting MCU now to minimize missing live data\n",
+                    blynkApplicationProbeTimedOut ? 1 : 0,
+                    (unsigned long)Blynk.applicationAckAge(),
+                    blynkProtocolProbeTimedOut ? 1 : 0,
+                    (unsigned long)Blynk.protocolPingAge());
+      blynkSequenceHoleRequestBoundedRestart(
+          "first-exact-probe-timeout-fast-restart");
+      return;
+    }
+
+    // The remaining path is generic prolonged inbound silence, not an exact
+    // unanswered application/protocol checkpoint. Unresolved consecutive
+    // failures on the independently owned HTTP stream can still corroborate a
+    // shared ESP32 TCP path failure and authorize the bounded MCU restart.
     const uint32_t sequenceHoleNow = millis();
     const bool recentHttpTransportTimeout =
         telemetryHttpLastFailureMs != 0 &&
@@ -12955,12 +13120,19 @@ void loop()
     if (unresolvedRecentHttpFailure) {
       const uint32_t httpFailureAge = telemetryHttpLastFailureMs
           ? sequenceHoleNow - telemetryHttpLastFailureMs : 0UL;
-      Serial.printf("[Blynk SHARED PATH SUSPECT] exact Blynk sequence hole plus unresolved HTTP evidence: httpRecent=%d consecutive=%u httpAge=%lums circuit=%d httpFailures=%lu; HTTP is quiesced, testing one fresh Blynk socket before MCU reset\n",
+      Serial.printf("[Blynk SHARED PATH PROVEN] prolonged Blynk inbound silence plus unresolved HTTP evidence: httpRecent=%d consecutive=%u httpAge=%lums circuit=%d httpFailures=%lu; restarting MCU without ineffective socket-only trial\n",
                     recentHttpTransportTimeout ? 1 : 0,
                     (unsigned)telemetryHttpConsecutiveFailures,
                     (unsigned long)httpFailureAge,
                     activeHttpCircuit ? 1 : 0,
                     (unsigned long)telemetryHttpFailureCount);
+      if (blynkSequenceHoleRecentGenerations == 0U) {
+        blynkSequenceHoleRecentGenerations = 1U;
+      }
+      blynkSequenceHoleLastGenerationMillis = sequenceHoleNow;
+      blynkSequenceHoleRequestBoundedRestart(
+          "corroborated-blynk-http-path-failure");
+      return;
     }
 
     if (recentHttpTransportTimeout && !unresolvedRecentHttpFailure) {
@@ -12993,6 +13165,15 @@ void loop()
                   (unsigned long)(previousGenerationAt ?
                       sequenceHoleNow - previousGenerationAt : 0UL),
                   (unsigned long)wifiDisconnectEventSequence);
+
+    // A second independently authenticated session with prolonged inbound
+    // silence inside the recurrence window rules out one stale TCP sequence
+    // space. Do not rotate a third socket before bounded shared-path recovery.
+    if (blynkSequenceHoleRecentGenerations >= 2U) {
+      blynkSequenceHoleRequestBoundedRestart(
+          "second-independent-session-one-way");
+      return;
+    }
 
     // v3.9.202: both ESP-IDF 5.5.5 and 6.1 proved that touching STA here can
     // turn a bounded Blynk outage into a long association failure. A fresh TCP

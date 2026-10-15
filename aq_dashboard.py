@@ -1,4 +1,11 @@
 # Outdoor Air Quality Station — ESP32 Dashboard for Windows PC
+# v2.3 — Opt-in RPi5 transport capture
+#   - Adds a compact V66 control card for a server-side capture of Blynk/TCP
+#     timing. The server keeps the authoritative CSV; V67 is the live mirror.
+#   - OFF polling is deliberately sparse. RECORDING mode checks V66/V67 once
+#     per second, displays the remaining 30-minute window and journals each new
+#     server event in the dashboard's existing rolling 24-hour CSV.
+#
 # v2.2 — Lock-safe durable diagnostic journal
 #
 # v2.2 changes:
@@ -271,6 +278,11 @@ GRAPH_VALUE_KEYS = {
 }
 
 RESET_PIN = 55
+TRANSPORT_CAPTURE_CONTROL_PIN = 66
+TRANSPORT_CAPTURE_EVENT_PIN = 67
+TRANSPORT_CAPTURE_MAX_S = 30 * 60
+TRANSPORT_CAPTURE_ACTIVE_POLL_S = 1.0
+TRANSPORT_CAPTURE_IDLE_POLL_S = 15.0
 
 ALL_READ_PINS = {}
 ALL_READ_PINS.update(GPS_PINS)
@@ -1224,11 +1236,65 @@ v_app_telem_rnd = ctk.CTkLabel(
 )
 v_app_telem_rnd.pack(anchor="w", padx=12, pady=(0, 14))
 
+# Opt-in server transport capture. The RPi5 CSV is authoritative; this card is
+# only the control and a compact live V67 view. It sits with the other remote
+# controls and remains visually quiet while disabled.
+transport_card = ctk.CTkFrame(diag_right, fg_color=CARD, corner_radius=14,
+                              border_width=1, border_color=BORDER)
+transport_card.pack(fill="x", pady=(5, 6), after=diag_rnd_card)
+
+ctk.CTkLabel(transport_card, text="Transport capture (V66)",
+             font=FONT_LABEL, text_color=TXT_SUB).pack(
+                 anchor="w", padx=12, pady=(10, 3))
+
+transport_capture_status = ctk.CTkLabel(
+    transport_card, text="OFF · no extra probe traffic", font=FONT_SMALL,
+    text_color=TXT_DIM, anchor="w", justify="left", wraplength=215)
+transport_capture_status.pack(anchor="w", padx=12, pady=(0, 5))
+
+transport_capture_latest = ctk.CTkLabel(
+    transport_card, text="Latest server event: —", font=("Segoe UI", 10),
+    text_color=TXT_DIM, anchor="w", justify="left", wraplength=215)
+transport_capture_latest.pack(anchor="w", padx=12, pady=(0, 7))
+
+
+def toggle_transport_capture():
+    global _transport_capture_command_pending
+    with _transport_capture_lock:
+        if _transport_capture_command_pending:
+            return
+        desired = not _transport_capture_active
+        _transport_capture_command_pending = True
+
+    button_transport_capture.configure(
+        state="disabled", text="Starting…" if desired else "Stopping…")
+
+    def _worker():
+        delivered = write_pin(TRANSPORT_CAPTURE_CONTROL_PIN, 1 if desired else 0)
+        _event_journal.log(
+            "TRANSPORT_CAPTURE_COMMAND",
+            severity="INFO" if delivered else "ERROR",
+            confidence="confirmed" if delivered else "observed",
+            details=(f"V66={'1' if desired else '0'} delivered={delivered}"))
+        _result_queue.put(("transport_command", {
+            "desired": desired, "delivered": delivered,
+        }))
+
+    threading.Thread(target=_worker, name="transport-capture-control",
+                     daemon=True).start()
+
+
+button_transport_capture = ctk.CTkButton(
+    transport_card, text="Start 30 min capture", command=toggle_transport_capture,
+    fg_color="#174b63", hover_color="#206783", font=FONT_LABEL,
+    corner_radius=8, width=180)
+button_transport_capture.pack(padx=12, pady=(0, 14))
+
 # Clear card — resets all displayed values to their blank state, locally only.
 # Placed above the hard-reset card, below the DIAG (App/Telem. RND# Alive) card.
 clear_card = ctk.CTkFrame(diag_right, fg_color=CARD, corner_radius=14,
                           border_width=1, border_color=BORDER)
-clear_card.pack(fill="x", pady=(5, 6), after=diag_rnd_card)
+clear_card.pack(fill="x", pady=(5, 6), after=transport_card)
 
 ctk.CTkLabel(clear_card, text="🧹  Clear Displayed Values", font=FONT_LABEL,
              text_color=TXT_SUB).pack(anchor="w", padx=12, pady=(10, 6))
@@ -1585,6 +1651,14 @@ _last_pair_key = None
 _last_pair_activity = None
 _last_data_wallclock = None
 
+# Opt-in transport-capture UI state. Access is shared by the Tk thread and one
+# small polling worker, so updates are protected without blocking either path.
+_transport_capture_lock = threading.Lock()
+_transport_capture_active = False
+_transport_capture_command_pending = False
+_transport_capture_started_monotonic = None
+_transport_last_event_value = None
+
 
 def _poll_data_worker():
     """Read all dashboard datastreams exactly as before.
@@ -1782,10 +1856,54 @@ def _poll_health_worker():
         threading.Event().wait(max(0.0, HEALTH_POLL_MS / 1000.0 - elapsed))
 
 
+def _poll_transport_capture_worker():
+    """Observe V66/V67 without adding continuous traffic while capture is OFF."""
+    global _transport_last_event_value
+
+    while True:
+        cycle_started = time.monotonic()
+        with _transport_capture_lock:
+            active = _transport_capture_active
+            pending = _transport_capture_command_pending
+
+        raw_state = read_pin(
+            TRANSPORT_CAPTURE_CONTROL_PIN, timeout=HEALTH_HTTP_TIMEOUT_S)
+        server_active = _parse_blynk_bool(raw_state)
+        latest_event = None
+        if server_active is True or active or pending:
+            latest_event = read_pin(
+                TRANSPORT_CAPTURE_EVENT_PIN, timeout=HEALTH_HTTP_TIMEOUT_S)
+
+        is_new_event = False
+        if latest_event is not None:
+            latest_event = str(latest_event).strip()
+            with _transport_capture_lock:
+                if (latest_event and
+                        latest_event != _transport_last_event_value):
+                    _transport_last_event_value = latest_event
+                    is_new_event = True
+            if is_new_event:
+                _event_journal.log(
+                    "SERVER_TRANSPORT_EVENT", severity="INFO",
+                    confidence="confirmed", details=latest_event)
+
+        _result_queue.put(("transport_state", {
+            "server_active": server_active,
+            "latest_event": latest_event if is_new_event else None,
+        }))
+
+        interval = (TRANSPORT_CAPTURE_ACTIVE_POLL_S
+                    if server_active is True or active or pending
+                    else TRANSPORT_CAPTURE_IDLE_POLL_S)
+        elapsed = time.monotonic() - cycle_started
+        threading.Event().wait(max(0.0, interval - elapsed))
+
+
 def _poll_worker():
-    """Start independent full-data and one-second health workers."""
+    """Start independent data, health, and opt-in capture workers."""
     threading.Thread(target=_poll_data_worker, daemon=True).start()
     threading.Thread(target=_poll_health_worker, daemon=True).start()
+    threading.Thread(target=_poll_transport_capture_worker, daemon=True).start()
 
 
 def _poll_queue():
@@ -1808,6 +1926,10 @@ def _poll_queue():
                 _apply_heartbeat(payload)
             elif kind == "status":
                 _apply_connection_status(payload)
+            elif kind == "transport_command":
+                _apply_transport_command(payload)
+            elif kind == "transport_state":
+                _apply_transport_state(payload)
             elif kind == "graph":
                 results, hours, source_note = payload
                 _apply_graph_data(results, hours, source_note)
@@ -1816,6 +1938,7 @@ def _poll_queue():
     except queue.Empty:
         pass
     app.after(200, _poll_queue)
+
 
 def _as_float(values, key):
     v = values.get(key)
@@ -1839,6 +1962,86 @@ _displayed_message_pair_key = None
 def _apply_heartbeat(value):
     """Update only the dedicated V4 Alive widget from the one-second worker."""
     v_app_telem_rnd.configure(text=str(value) if value is not None else "—")
+
+
+def _refresh_transport_capture_ui():
+    with _transport_capture_lock:
+        active = _transport_capture_active
+        pending = _transport_capture_command_pending
+        started = _transport_capture_started_monotonic
+
+    if pending:
+        return
+    if active:
+        elapsed = max(0.0, time.monotonic() - started) if started else 0.0
+        remaining = max(0, int(TRANSPORT_CAPTURE_MAX_S - elapsed))
+        minutes, seconds = divmod(remaining, 60)
+        transport_capture_status.configure(
+            text=f"● RECORDING · RPi5 CSV · {minutes:02d}:{seconds:02d} left",
+            text_color=RED)
+        button_transport_capture.configure(
+            state="normal", text="Stop capture", fg_color="#7a2828",
+            hover_color="#963434")
+    else:
+        transport_capture_status.configure(
+            text="OFF · no extra probe traffic", text_color=TXT_DIM)
+        button_transport_capture.configure(
+            state="normal", text="Start 30 min capture", fg_color="#174b63",
+            hover_color="#206783")
+
+
+def _apply_transport_command(payload):
+    global _transport_capture_active, _transport_capture_command_pending
+    global _transport_capture_started_monotonic
+
+    desired = bool(payload.get("desired"))
+    delivered = bool(payload.get("delivered"))
+    with _transport_capture_lock:
+        _transport_capture_command_pending = False
+        if delivered:
+            _transport_capture_active = desired
+            _transport_capture_started_monotonic = (
+                time.monotonic() if desired else None)
+    _refresh_transport_capture_ui()
+    if not delivered:
+        messagebox.showerror(
+            "Transport capture",
+            "The V66 command could not be delivered to the Blynk server.")
+
+
+def _apply_transport_state(payload):
+    global _transport_capture_active, _transport_capture_started_monotonic
+
+    server_active = payload.get("server_active")
+    latest_event = payload.get("latest_event")
+    transition = None
+    with _transport_capture_lock:
+        previous = _transport_capture_active
+        if server_active is True:
+            _transport_capture_active = True
+            if _transport_capture_started_monotonic is None:
+                _transport_capture_started_monotonic = time.monotonic()
+        elif server_active is False:
+            _transport_capture_active = False
+            _transport_capture_started_monotonic = None
+        if previous != _transport_capture_active:
+            transition = _transport_capture_active
+
+    if transition is not None:
+        _event_journal.log(
+            "TRANSPORT_CAPTURE_STARTED" if transition
+            else "TRANSPORT_CAPTURE_STOPPED",
+            severity="INFO", confidence="confirmed",
+            details="Server-confirmed V66 state transition")
+    if latest_event:
+        transport_capture_latest.configure(
+            text=f"Latest server event: {latest_event}", text_color=TXT_SUB)
+    _refresh_transport_capture_ui()
+
+
+def _transport_capture_clock_tick():
+    _refresh_transport_capture_ui()
+    app.after(1000, _transport_capture_clock_tick)
 
 
 def _message_pair_key(value):
@@ -2131,6 +2334,8 @@ def clear_dashboard():
 clear_dashboard()
 threading.Thread(target=_poll_worker, daemon=True).start()
 app.after(200, _poll_queue)
+app.after(1000, _transport_capture_clock_tick)
+
 app.after(500, trigger_graph_refresh)
 
 
