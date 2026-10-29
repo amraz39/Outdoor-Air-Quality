@@ -1,4 +1,9 @@
 # Outdoor Air Quality Station — ESP32 Dashboard for Windows PC
+# v2.5 — Fresh location on startup
+#   - Starts with an empty map and suppresses cached GPS and INAV coordinates
+#     until the location changes during this session and the device is live.
+#   - Other dashboard data can still reload from the server.
+#
 # v2.4 — Map tile updates
 #   - Uses an app-specific identity, visible OpenStreetMap attribution,
 #     local tile caching, and no background tile prefetching.
@@ -139,6 +144,7 @@
 #
 # ============================================================
 
+import math
 import os
 import re
 import csv
@@ -956,7 +962,7 @@ def wifi_color_for(quality):
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-DASHBOARD_VERSION = "2.4"
+DASHBOARD_VERSION = "2.5"
 
 app = ctk.CTk()
 app.title(f"Outdoor Air Quality Station — ESP32 Dashboard v{DASHBOARD_VERSION}")
@@ -2176,6 +2182,28 @@ def _apply_connection_status(status):
             label_last_update.configure(text=f"No live telemetry yet  ·  check: {source}")
 
 
+# Treat the first valid coordinates from each source as a startup baseline.
+# Blynk can retain old pin values, so wait for a change during this session
+# and a live connection before displaying or mapping that source.
+_location_baselines = {}
+_location_fresh_sources = set()
+
+
+def _fresh_location(values, source, lat_key, lng_key):
+    lat = _as_float(values, lat_key)
+    lng = _as_float(values, lng_key)
+    if (lat is None or lng is None or not math.isfinite(lat) or
+            not math.isfinite(lng) or not -90 <= lat <= 90 or
+            not -180 <= lng <= 180 or (lat == 0 and lng == 0)):
+        return None
+    coords = (lat, lng)
+    if source not in _location_baselines:
+        _location_baselines[source] = coords
+    elif _device_connected and coords != _location_baselines[source]:
+        _location_fresh_sources.add(source)
+    return coords if _device_connected and source in _location_fresh_sources else None
+
+
 def _apply_values(values):
     global _last_values
     _last_values = values
@@ -2198,8 +2226,10 @@ def _apply_values(values):
         label_wifi.configure(text="📶  WiFi: OFFLINE", text_color=RED)
 
     # ---- GPS ----
-    v_gps_lat.configure(text=fmt(values.get("lat"), decimals=6))
-    v_gps_lng.configure(text=fmt(values.get("lng"), decimals=6))
+    gps_location = _fresh_location(values, "GPS", "lat", "lng")
+    inav_location = _fresh_location(values, "INAV", "inav_lat", "inav_lng")
+    v_gps_lat.configure(text=fmt(gps_location[0], decimals=6) if gps_location else "N/A")
+    v_gps_lng.configure(text=fmt(gps_location[1], decimals=6) if gps_location else "N/A")
     v_gps_sats.configure(text=fmt_int(values.get("sats")))
     v_gps_hdop.configure(text=fmt(values.get("hdop"), decimals=2))
     pps = _as_float(values, "pps")
@@ -2277,18 +2307,14 @@ def _apply_values(values):
             label_widget.configure(text=fmt_int(values.get(key), unit))
 
     # ---- Location / map ----
-    inav_lat = _as_float(values, "inav_lat")
-    inav_lng = _as_float(values, "inav_lng")
-    gps_lat = _as_float(values, "lat")
-    gps_lng = _as_float(values, "lng")
-
     lat = lng = None
     source = "—"
-    if inav_lat is not None and inav_lng is not None and inav_lat > UNAVAILABLE_THRESHOLD:
-        lat, lng, source = inav_lat, inav_lng, "INAV (fused)"
-    elif gps_lat is not None and gps_lng is not None and gps_lat != 0:
-        lat, lng, source = gps_lat, gps_lng, "GPS (raw)"
-
+    if inav_location:
+        lat, lng = inav_location
+        source = "INAV (fused)"
+    elif gps_location:
+        lat, lng = gps_location
+        source = "GPS (raw)"
     if lat is not None and lng is not None:
         _current_coords["lat"], _current_coords["lng"] = lat, lng
         v_map_source.configure(text=f"Source: {source}")
