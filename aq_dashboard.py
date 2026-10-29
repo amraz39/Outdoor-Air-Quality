@@ -1,4 +1,17 @@
 # Outdoor Air Quality Station — ESP32 Dashboard for Windows PC
+# v2.8 — Closer view of recorded locations
+#   - Show All Points zooms closer for a single location and uses less
+#     padding when fitting multiple points.
+#
+# v2.7 — Guard map bounds at projection limits
+#   - Clamps trail bounds to the map projection and centers degenerate bounds
+#     so Show All Points does not trigger an invalid bounding box callback.
+#
+# v2.6 — Map overview and point fitting
+#   - Opens the map at a world overview before a live location is available.
+#   - Show All Points centers a single location and fits repeated or aligned
+#     points with padding so the map widget accepts their bounds.
+#
 # v2.5 — Fresh location on startup
 #   - Starts with an empty map and suppresses cached GPS and INAV coordinates
 #     until the location changes during this session and the device is live.
@@ -962,7 +975,7 @@ def wifi_color_for(quality):
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-DASHBOARD_VERSION = "2.5"
+DASHBOARD_VERSION = "2.8"
 
 app = ctk.CTk()
 app.title(f"Outdoor Air Quality Station — ESP32 Dashboard v{DASHBOARD_VERSION}")
@@ -1480,15 +1493,26 @@ map_toolbar.pack(fill="x", padx=10, pady=(10, 0))
 
 
 def show_all_points():
-    if len(_position_trail) < 2:
-        messagebox.showinfo("Not enough data", "Need at least two recorded fixes.")
+    if not _position_trail:
+        messagebox.showinfo("No location", "No recorded fixes yet.")
         return
-    lats = [p[0] for p in _position_trail]
+    if len(set(_position_trail)) == 1:
+        map_widget.set_zoom(18)
+        map_widget.set_position(*_position_trail[0])
+        return
+    lats = [max(-85.0, min(85.0, p[0])) for p in _position_trail]
     lngs = [p[1] for p in _position_trail]
-    top_left = (max(lats), min(lngs))
-    bottom_right = (min(lats), max(lngs))
-    map_widget.fit_bounding_box(top_left, bottom_right)
-
+    # The widget requires a strictly positive span on both axes. Padding also
+    # keeps points away from the edges for short or axis-aligned trails.
+    lat_pad = max((max(lats) - min(lats)) * 0.03, 0.0001)
+    lng_pad = max((max(lngs) - min(lngs)) * 0.03, 0.0001)
+    top_left = (min(85.0, max(lats) + lat_pad), max(-180.0, min(lngs) - lng_pad))
+    bottom_right = (max(-85.0, min(lats) - lat_pad), min(180.0, max(lngs) + lng_pad))
+    if top_left[0] <= bottom_right[0] or top_left[1] >= bottom_right[1]:
+        map_widget.set_zoom(18)
+        map_widget.set_position(lats[0], lngs[0])
+    else:
+        map_widget.fit_bounding_box(top_left, bottom_right)
 
 ctk.CTkButton(map_toolbar, text="🔎  Show All Points", command=show_all_points,
               fg_color="#1e3a5f", hover_color=ACCENT, font=FONT_LABEL,
@@ -1537,8 +1561,8 @@ ctk.CTkLabel(map_plot_card, text="© OpenStreetMap contributors",
              font=FONT_SMALL, text_color=TXT_SUB).pack(side="bottom", anchor="e", padx=12, pady=(0, 4))
 map_widget = StationMapView(map_plot_card, corner_radius=10)
 map_widget.pack(fill="both", expand=True, padx=10, pady=10)
+map_widget.set_zoom(1)
 map_widget.set_position(0, 0)
-map_widget.set_zoom(3)
 
 _position_trail = []      # in-memory trail of (lat, lng) collected this session
 MAX_TRAIL_POINTS = 500

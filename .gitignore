@@ -55,5 +55,4 @@ diag/
 *.h
 !BLYNK_LIB/src/**/*.h
 
-# Generated dashboard executable
-/aq_dashboard.exe
+
