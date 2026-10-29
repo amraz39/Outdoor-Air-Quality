@@ -1,4 +1,8 @@
 # Outdoor Air Quality Station — ESP32 Dashboard for Windows PC
+# v2.4 — Map tile updates
+#   - Uses an app-specific identity, visible OpenStreetMap attribution,
+#     local tile caching, and no background tile prefetching.
+#
 # v2.3 — Opt-in RPi5 transport capture
 #   - Adds a compact V66 control card for a server-side capture of Blynk/TCP
 #     timing. The server keeps the authoritative CSV; V67 is the live mirror.
@@ -139,6 +143,7 @@ import os
 import re
 import csv
 import gzip
+import io
 import json
 import queue
 import sys
@@ -159,6 +164,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import matplotlib.dates as mdates
 import tkintermapview
+from PIL import Image, ImageTk
+from email.utils import formatdate
 
 # ============================================================
 # SECRETS.H PARSING
@@ -949,8 +956,10 @@ def wifi_color_for(quality):
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
+DASHBOARD_VERSION = "2.4"
+
 app = ctk.CTk()
-app.title("Outdoor Air Quality Station — ESP32 Dashboard")
+app.title(f"Outdoor Air Quality Station — ESP32 Dashboard v{DASHBOARD_VERSION}")
 app.geometry("1500x980")
 app.configure(fg_color=BG)
 
@@ -1183,10 +1192,15 @@ section_title(body, "🛠️", "Diagnostics & Remote control")
 
 diag_top = ctk.CTkFrame(body, fg_color="transparent")
 diag_top.pack(fill="x", padx=4)
+diag_top.grid_columnconfigure(0, weight=3, uniform="diagnostics")
+diag_top.grid_columnconfigure(1, weight=1, uniform="diagnostics")
+diag_top.grid_rowconfigure(0, weight=1)
 
 # Keep the engineering message as a single current-state message.
 # Updating the label replaces the previous value; it never appends/stack messages.
 msg_card = make_card(diag_top, side="left", fill="both", expand=True)
+msg_card.pack_forget()
+msg_card.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
 ctk.CTkLabel(msg_card, text="📝  Engineering Message (V19)", font=FONT_LABEL,
              text_color=TXT_SUB).pack(anchor="w", padx=12, pady=(10, 2))
 v_eng_msg = ctk.CTkLabel(msg_card, text="—", font=("Segoe UI", 13),
@@ -1217,8 +1231,8 @@ v_rtc_checkpoint.pack(anchor="w", padx=12, pady=(0, 10))
 # No fixed height/propagation lock: the column sizes itself to its three
 # stacked cards, and msg_card (fill="both") on the left matches that height
 # dynamically, so the left card's bottom always lines up with Reset Station.
-diag_right = ctk.CTkFrame(diag_top, fg_color="transparent", width=250)
-diag_right.pack(side="left", fill="y", padx=(6, 0), pady=6)
+diag_right = ctk.CTkFrame(diag_top, fg_color="transparent", width=340)
+diag_right.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=6)
 
 # App / telemetry diagnostic card (V4)
 diag_rnd_card = ctk.CTkFrame(diag_right, fg_color=CARD, corner_radius=14,
@@ -1227,7 +1241,7 @@ diag_rnd_card.pack(fill="x", pady=(6, 6))
 
 ctk.CTkLabel(diag_rnd_card, text="DIAG (App/Telem. RND# Alive)",
              font=("Segoe UI", 14, "bold"), text_color=TXT_MAIN,
-             anchor="w", justify="left", wraplength=210).pack(
+             anchor="w", justify="left", wraplength=300).pack(
                  anchor="w", padx=12, pady=(12, 8))
 
 v_app_telem_rnd = ctk.CTkLabel(
@@ -1249,12 +1263,12 @@ ctk.CTkLabel(transport_card, text="Transport capture (V66)",
 
 transport_capture_status = ctk.CTkLabel(
     transport_card, text="OFF · no extra probe traffic", font=FONT_SMALL,
-    text_color=TXT_DIM, anchor="w", justify="left", wraplength=215)
+    text_color=TXT_DIM, anchor="w", justify="left", wraplength=300)
 transport_capture_status.pack(anchor="w", padx=12, pady=(0, 5))
 
 transport_capture_latest = ctk.CTkLabel(
     transport_card, text="Latest server event: —", font=("Segoe UI", 10),
-    text_color=TXT_DIM, anchor="w", justify="left", wraplength=215)
+    text_color=TXT_DIM, anchor="w", justify="left", wraplength=300)
 transport_capture_latest.pack(anchor="w", padx=12, pady=(0, 7))
 
 
@@ -1287,7 +1301,7 @@ def toggle_transport_capture():
 button_transport_capture = ctk.CTkButton(
     transport_card, text="Start 30 min capture", command=toggle_transport_capture,
     fg_color="#174b63", hover_color="#206783", font=FONT_LABEL,
-    corner_radius=8, width=180)
+    corner_radius=8, width=300)
 button_transport_capture.pack(padx=12, pady=(0, 14))
 
 # Clear card — resets all displayed values to their blank state, locally only.
@@ -1301,7 +1315,7 @@ ctk.CTkLabel(clear_card, text="🧹  Clear Displayed Values", font=FONT_LABEL,
 
 button_clear = ctk.CTkButton(clear_card, text="🧹  Clear", command=lambda: clear_dashboard(),
                               fg_color="#1e3a5f", hover_color="#2a4a75",
-                              font=FONT_LABEL, corner_radius=8, width=180)
+                              font=FONT_LABEL, corner_radius=8, width=300)
 button_clear.pack(padx=12, pady=(0, 14))
 
 # Remote hard reset is intentionally lower on the right side.
@@ -1345,7 +1359,7 @@ def do_remote_reset():
 
 button_reset = ctk.CTkButton(reset_card, text="⚠  Reset Station", command=do_remote_reset,
                               fg_color="#5f1e1e", hover_color="#7a2828",
-                              font=FONT_LABEL, corner_radius=8, width=180)
+                              font=FONT_LABEL, corner_radius=8, width=300)
 button_reset.pack(padx=12, pady=(0, 14))
 
 # Status flags chips
@@ -1474,8 +1488,48 @@ ctk.CTkButton(map_toolbar, text="🔎  Show All Points", command=show_all_points
               fg_color="#1e3a5f", hover_color=ACCENT, font=FONT_LABEL,
               corner_radius=8, width=170).pack(side="left")
 
-# Real OpenStreetMap tiles — free, no API key required.
-map_widget = tkintermapview.TkinterMapView(map_plot_card, corner_radius=10)
+# The stock map widget uses a generic User-Agent and prefetches tiles. Request
+# only visible tiles with an app identity and retain them locally for 7 days.
+class StationMapView(tkintermapview.TkinterMapView):
+    def pre_cache(self):
+        pass
+
+    def request_image(self, zoom, x, y, db_cursor=None):
+        if x < 0 or y < 0 or x >= 2 ** zoom or y >= 2 ** zoom:
+            return self.empty_tile_image
+        cache_file = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "AirQualityOutdoor" / "tiles" / str(zoom) / str(x) / (str(y) + ".png")
+        try:
+            cached = cache_file.read_bytes() if cache_file.exists() else None
+            age = time.time() - cache_file.stat().st_mtime if cached else float("inf")
+            if age >= 7 * 86400:
+                headers = {"User-Agent": "AirQualityOutdoorDashboard/2.3"}
+                if cached:
+                    headers["If-Modified-Since"] = formatdate(cache_file.stat().st_mtime, usegmt=True)
+                url = f"https://tile.openstreetmap.org/{zoom}/{x}/{y}.png"
+                response = requests.get(url, headers=headers, timeout=10)
+                if response.status_code == 304 and cached:
+                    os.utime(cache_file, None)
+                elif response.ok:
+                    Image.open(io.BytesIO(response.content)).verify()
+                    cached = response.content
+                    cache_file.parent.mkdir(parents=True, exist_ok=True)
+                    temp_file = cache_file.with_name(cache_file.name + "." + uuid.uuid4().hex + ".tmp")
+                    temp_file.write_bytes(cached)
+                    os.replace(temp_file, cache_file)
+                elif not cached:
+                    return self.empty_tile_image
+            if not cached or not self.running:
+                return self.empty_tile_image
+            image = ImageTk.PhotoImage(Image.open(io.BytesIO(cached)))
+            self.tile_image_cache[f"{zoom}{x}{y}"] = image
+            return image
+        except (OSError, requests.RequestException, ValueError):
+            return self.empty_tile_image
+
+
+ctk.CTkLabel(map_plot_card, text="© OpenStreetMap contributors",
+             font=FONT_SMALL, text_color=TXT_SUB).pack(side="bottom", anchor="e", padx=12, pady=(0, 4))
+map_widget = StationMapView(map_plot_card, corner_radius=10)
 map_widget.pack(fill="both", expand=True, padx=10, pady=10)
 map_widget.set_position(0, 0)
 map_widget.set_zoom(3)
