@@ -1,7 +1,7 @@
 # Outdoor Air Quality Station — ESP32
 
 Current firmware: **v3.9.229**
-Current Windows dashboard: **v2.3** (`aq_dashboard.py`)
+Current Windows dashboard: **v2.13** (`aq_dashboard.py`)
 Target board package: **Arduino-ESP32 3.3.12**
 Backend: **self-hosted Blynk 0.41.18 / legacy Blynk protocol 0.6.1**
 Primary sketch: `AirQualityOutdoor_ESP32_Blynk.ino`
@@ -294,7 +294,7 @@ This firmware targets the self-hosted legacy server, not current Blynk Cloud. Do
 
 ## Windows dashboard (`aq_dashboard.py`)
 
-Dashboard v2.3 is a read-mostly Windows monitoring application for the local legacy Blynk server. It displays the current sensor/navigation values, the coherent V61/V62 record, diagnostics, maps and bounded history graphs. All Tk widget changes are applied on the main GUI thread; independent HTTP workers have their own `requests.Session` instances.
+Dashboard v2.13 is a read-mostly Windows monitoring application for the local legacy Blynk server. It displays the current sensor/navigation values, the coherent V61/V62 record, diagnostics, maps and bounded history graphs. All Tk widget changes are applied on the main GUI thread; independent HTTP workers have their own `requests.Session` instances.
 
 Install the required packages:
 
@@ -352,6 +352,20 @@ The authoritative CSV is written on the Raspberry Pi under:
 ```
 
 Each row includes server UTC/epoch time, capture elapsed time, server queue delay, event type, session generation, message ID, V-pin, client value, remote endpoint, channel writability and pending-byte evidence. Rows are flushed immediately. Files older than 24 hours are deleted when a capture starts and by the server maintenance task. If the dashboard closes, the server keeps recording until V66 is turned off or the 30-minute deadline expires. A server restart intentionally returns capture to OFF. `FILE_ERROR` on V67 and V66 returning to `0` indicate that the server could not create or continue the CSV.
+
+### System Health Core (v2.13)
+
+The Diagnostics & Remote control card places the health display beside its
+messages, with the V4 diagnostic below the RTC checkpoint. SYSTEM checks the
+V20 Wi-Fi flag and the recently changing V4 heartbeat. This is a connectivity
+and application activity check, not independent proof that both CPU cores are
+healthy. GPS, IMU and ENS160 use V20 subsystem flags; its environmental flag
+is shared by ENS160 and AHT2x. AHT2x, sound, UV and dust show **Reading** when
+their published values are available; a reading alone does not prove sensor
+health or freshness. Unavailable readings are neutral. CO shows a reported
+fault or unavailable status from V20; no fault is not proof of sensor health.
+NO₂ is not monitored by this firmware. Blynk can retain old sensor values, so
+the indicators become unknown when live telemetry is lost.
 
 ### Dashboard refresh rates
 
@@ -528,7 +542,7 @@ covered.
 ## Related files
 
 - `AirQualityOutdoor_ESP32_Blynk.ino` — current firmware.
-- `aq_dashboard.py` — Windows dashboard v2.3 with strict Blynk + live-data connection health.
+- `aq_dashboard.py` — Windows dashboard v2.13 with strict Blynk + live-data connection health.
 - `BLYNK_LIB/` — only the two modified Blynk library files.
 - `ESP32_CORE_PATCH/3.3.12/` — targeted ESP32-only WiFi status patch.
 - `blynk.service` — current Raspberry Pi 5 Java 21 service unit.

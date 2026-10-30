@@ -1,4 +1,24 @@
 # Outdoor Air Quality Station — ESP32 Dashboard for Windows PC
+# v2.13 — Expanded health indicators
+#   - Adds SYSTEM and individual sensor indicators based on available telemetry.
+#   - SYSTEM checks V20 Wi-Fi and the V4 heartbeat; it is not a per-core test.
+#
+# v2.12 — Compact remote controls
+#   - Moves the V4 live diagnostic card below the RTC checkpoint.
+#
+# v2.11 — Compact diagnostics layout
+#   - Places system health beside the messages to reduce section height.
+#
+# v2.10 — Redesigned System Health Core
+#   - Enlarges and centers the health display and integrates V20 status chips.
+#   - Treats CO not detected as unavailable; a reported CO fault remains a fault.
+#
+# v2.9 — System Health Core
+#   - Adds an overall health indicator and subsystem status chips to the
+#     diagnostics card, using V20 and the existing live-connection checks.
+#   - Shows unknown when live telemetry or V20 is unavailable; CO is labelled
+#     as having no reported fault rather than a confirmed healthy state.
+#
 # v2.8 — Closer view of recorded locations
 #   - Show All Points zooms closer for a single location and uses less
 #     padding when fitting multiple points.
@@ -178,6 +198,7 @@ import requests
 import numpy as np
 import customtkinter as ctk
 from tkinter import messagebox
+import tkinter as tk
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -277,7 +298,7 @@ SENSOR_PINS = {
 MISC_PINS = {"eng_msg": 19, "status_flags": 20, "msg_v61": 61, "msg_v62": 62}
 
 # V4 is used by the app/telemetry layer as a rolling diagnostic counter.
-# It is displayed in the top-right diagnostic card and is always replaced
+# It is displayed in the diagnostic message card and is always replaced
 # with the newest value rather than accumulated as history.
 APP_TELEM_RND_PIN = LIVE_TELEM_PIN
 
@@ -803,7 +824,7 @@ class DiagnosticEventMonitor:
 _event_journal = EventJournal(EVENT_CSV_PATH, JOURNAL_ALERT_QUEUE)
 _event_monitor = DiagnosticEventMonitor(_event_journal)
 _event_journal.log(
-    "DASHBOARD_STARTED", details=f"Dashboard v2.2; journal={EVENT_CSV_PATH.name}")
+    "DASHBOARD_STARTED", details=f"Dashboard v2.13; journal={EVENT_CSV_PATH.name}")
 
 # ============================================================
 # COLOR THEME
@@ -975,7 +996,7 @@ def wifi_color_for(quality):
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-DASHBOARD_VERSION = "2.8"
+DASHBOARD_VERSION = "2.13"
 
 app = ctk.CTk()
 app.title(f"Outdoor Air Quality Station — ESP32 Dashboard v{DASHBOARD_VERSION}")
@@ -1220,10 +1241,15 @@ diag_top.grid_rowconfigure(0, weight=1)
 msg_card = make_card(diag_top, side="left", fill="both", expand=True)
 msg_card.pack_forget()
 msg_card.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-ctk.CTkLabel(msg_card, text="📝  Engineering Message (V19)", font=FONT_LABEL,
+msg_card.grid_columnconfigure(0, weight=1)
+msg_card.grid_columnconfigure(1, weight=2)
+msg_card.grid_rowconfigure(0, weight=1)
+message_panel = ctk.CTkFrame(msg_card, fg_color="transparent")
+message_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+ctk.CTkLabel(message_panel, text="📝  Engineering Message (V19)", font=FONT_LABEL,
              text_color=TXT_SUB).pack(anchor="w", padx=12, pady=(10, 2))
-v_eng_msg = ctk.CTkLabel(msg_card, text="—", font=("Segoe UI", 13),
-                          text_color=TXT_MAIN, anchor="w", wraplength=520,
+v_eng_msg = ctk.CTkLabel(message_panel, text="—", font=("Segoe UI", 13),
+                          text_color=TXT_MAIN, anchor="w", wraplength=320,
                           justify="left")
 v_eng_msg.pack(anchor="w", padx=12, pady=(0, 6))
 
@@ -1231,32 +1257,24 @@ v_eng_msg.pack(anchor="w", padx=12, pady=(0, 6))
 # single-value line below it. The value widget is updated with
 # configure(text=...) only, so a new value replaces the previous one
 # instead of stacking another label/message below it.
-ctk.CTkLabel(msg_card, text="🔧  Reset Reason (V34)", font=FONT_LABEL,
+ctk.CTkLabel(message_panel, text="🔧  Reset Reason (V34)", font=FONT_LABEL,
              text_color=TXT_SUB).pack(anchor="w", padx=12, pady=(6, 2))
-v_reset_reason = ctk.CTkLabel(msg_card, text="—", font=("Segoe UI", 13),
-                               text_color=TXT_MAIN, anchor="w", wraplength=520,
+v_reset_reason = ctk.CTkLabel(message_panel, text="—", font=("Segoe UI", 13),
+                               text_color=TXT_MAIN, anchor="w", wraplength=320,
                                justify="left")
 v_reset_reason.pack(anchor="w", padx=12, pady=(0, 6))
 
-ctk.CTkLabel(msg_card, text="🕒  RTC Checkpoint (V51)", font=FONT_LABEL,
+ctk.CTkLabel(message_panel, text="🕒  RTC Checkpoint (V51)", font=FONT_LABEL,
              text_color=TXT_SUB).pack(anchor="w", padx=12, pady=(6, 2))
-v_rtc_checkpoint = ctk.CTkLabel(msg_card, text="—", font=("Segoe UI", 13),
-                                 text_color=TXT_MAIN, anchor="w", wraplength=520,
+v_rtc_checkpoint = ctk.CTkLabel(message_panel, text="—", font=("Segoe UI", 13),
+                                 text_color=TXT_MAIN, anchor="w", wraplength=320,
                                  justify="left")
 v_rtc_checkpoint.pack(anchor="w", padx=12, pady=(0, 10))
 
-# Right-side controls are kept in their own vertical column so the diagnostic
-# value stays at the top and the hard-reset control is clearly separated below.
-# No fixed height/propagation lock: the column sizes itself to its three
-# stacked cards, and msg_card (fill="both") on the left matches that height
-# dynamically, so the left card's bottom always lines up with Reset Station.
-diag_right = ctk.CTkFrame(diag_top, fg_color="transparent", width=340)
-diag_right.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=6)
-
 # App / telemetry diagnostic card (V4)
-diag_rnd_card = ctk.CTkFrame(diag_right, fg_color=CARD, corner_radius=14,
+diag_rnd_card = ctk.CTkFrame(message_panel, fg_color=CARD, corner_radius=14,
                              border_width=1, border_color=BORDER)
-diag_rnd_card.pack(fill="x", pady=(6, 6))
+diag_rnd_card.pack(fill="x", padx=12, pady=(6, 10))
 
 ctk.CTkLabel(diag_rnd_card, text="DIAG (App/Telem. RND# Alive)",
              font=("Segoe UI", 14, "bold"), text_color=TXT_MAIN,
@@ -1269,12 +1287,43 @@ v_app_telem_rnd = ctk.CTkLabel(
 )
 v_app_telem_rnd.pack(anchor="w", padx=12, pady=(0, 14))
 
+# A compact mission-control view fills the remaining diagnostic card space.
+health_panel = ctk.CTkFrame(msg_card, fg_color="transparent")
+health_panel.grid(row=0, column=1, sticky="n", padx=12, pady=(10, 12))
+ctk.CTkLabel(health_panel, text="SYSTEM HEALTH", font=("Segoe UI", 11, "bold"),
+             text_color=TXT_SUB).pack(pady=(0, 2))
+health_canvas = tk.Canvas(health_panel, width=310, height=270, bg=CARD,
+                          highlightthickness=0, bd=0)
+health_canvas.pack(expand=True)
+health_detail = ctk.CTkLabel(health_panel, text="Waiting for live data",
+                             font=FONT_LABEL, text_color=TXT_SUB,
+                             wraplength=480, justify="center")
+health_detail.pack(pady=(2, 4))
+health_chips = ctk.CTkFrame(health_panel, fg_color="transparent")
+health_chips.pack(pady=(0, 4))
+health_nodes = {}
+for index, name in enumerate(("SYSTEM", "GPS", "IMU", "ENS160", "AHT2x",
+                               "SOUND", "UV", "DUST", "CO", "NO₂")):
+    label = ctk.CTkLabel(health_chips, text=name + "  —", font=FONT_SMALL,
+                         fg_color=BORDER, text_color=TXT_SUB, corner_radius=8,
+                         padx=7, pady=4)
+    label.grid(row=index // 5, column=index % 5, padx=3, pady=3, sticky="ew")
+    health_nodes[name] = label
+
+# Right-side controls are kept in their own vertical column so the diagnostic
+# transport capture stays at the top and the hard-reset control is below.
+# No fixed height/propagation lock: the column sizes itself to its three
+# stacked cards, and msg_card (fill="both") on the left matches that height
+# dynamically, so the left card's bottom always lines up with Reset Station.
+diag_right = ctk.CTkFrame(diag_top, fg_color="transparent", width=340)
+diag_right.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=6)
+
 # Opt-in server transport capture. The RPi5 CSV is authoritative; this card is
 # only the control and a compact live V67 view. It sits with the other remote
 # controls and remains visually quiet while disabled.
 transport_card = ctk.CTkFrame(diag_right, fg_color=CARD, corner_radius=14,
                               border_width=1, border_color=BORDER)
-transport_card.pack(fill="x", pady=(5, 6), after=diag_rnd_card)
+transport_card.pack(fill="x", pady=(5, 6))
 
 ctk.CTkLabel(transport_card, text="Transport capture (V66)",
              font=FONT_LABEL, text_color=TXT_SUB).pack(
@@ -1324,7 +1373,7 @@ button_transport_capture = ctk.CTkButton(
 button_transport_capture.pack(padx=12, pady=(0, 14))
 
 # Clear card — resets all displayed values to their blank state, locally only.
-# Placed above the hard-reset card, below the DIAG (App/Telem. RND# Alive) card.
+# Placed above the hard-reset card, below transport capture.
 clear_card = ctk.CTkFrame(diag_right, fg_color=CARD, corner_radius=14,
                           border_width=1, border_color=BORDER)
 clear_card.pack(fill="x", pady=(5, 6), after=transport_card)
@@ -1380,22 +1429,6 @@ button_reset = ctk.CTkButton(reset_card, text="⚠  Reset Station", command=do_r
                               fg_color="#5f1e1e", hover_color="#7a2828",
                               font=FONT_LABEL, corner_radius=8, width=300)
 button_reset.pack(padx=12, pady=(0, 14))
-
-# Status flags chips
-flags_card = ctk.CTkFrame(body, fg_color=CARD, corner_radius=14,
-                           border_width=1, border_color=BORDER)
-flags_card.pack(fill="x", padx=8, pady=6)
-ctk.CTkLabel(flags_card, text="🚩  Status Flags (V20)", font=FONT_LABEL,
-             text_color=TXT_SUB).pack(anchor="w", padx=12, pady=(10, 4))
-flags_wrap = ctk.CTkFrame(flags_card, fg_color="transparent")
-flags_wrap.pack(fill="x", padx=8, pady=(0, 12))
-flag_chip_labels = []
-for bit, name in STATUS_FLAGS:
-    chip = ctk.CTkLabel(flags_wrap, text=name, font=FONT_SMALL,
-                         text_color="#0f1623", fg_color=TXT_DIM,
-                         corner_radius=8, padx=10, pady=4)
-    chip.pack(side="left", padx=4, pady=4)
-    flag_chip_labels.append((bit, chip))
 
 # Diagnostic pin table
 diag_table_card = ctk.CTkFrame(body, fg_color=CARD, corner_radius=14,
@@ -2035,6 +2068,93 @@ def _as_float(values, key):
 _device_connected = False
 _server_link_state = None
 _last_values = {}
+_health_status = {}
+
+def _refresh_health_core():
+    """Summarize current V20 flags only while the telemetry path is live."""
+    raw = _as_float(_last_values, "status_flags")
+    try:
+        flags = int(raw) if raw is not None and raw >= 0 and raw == int(raw) else None
+    except (ValueError, OverflowError):
+        flags = None
+    usable = _device_connected and flags is not None
+    faults, missing = [], []
+    def show(name, state, color):
+        health_nodes[name].configure(text=f"{name}  {state}", text_color=color)
+
+    def reading_available(key):
+        value = _as_float(_last_values, key)
+        return value is not None and value > UNAVAILABLE_THRESHOLD and value < float("inf")
+
+    if usable:
+        heartbeat = _health_status.get("heartbeat_fresh", False)
+        if flags & 1 and heartbeat:
+            show("SYSTEM", "OK", GREEN)
+        else:
+            show("SYSTEM", "CHECK", AMBER)
+            missing.append("Wi-Fi / V4 heartbeat")
+        for name, good_bit, fault_bit in (("GPS", 2, 32), ("IMU", 4, 64),
+                                          ("ENS160", 8, 128)):
+            if flags & fault_bit:
+                show(name, "FAULT", RED)
+                faults.append(name)
+            elif not flags & good_bit:
+                show(name, "CHECK", AMBER)
+                missing.append(name)
+            else:
+                show(name, "OK", GREEN)
+        for name, keys in (("AHT2x", ("temperature", "humidity")),
+                           ("SOUND", ("sound_db",)), ("UV", ("uvi",)),
+                           ("DUST", ("dust",))):
+            available = all(reading_available(key) for key in keys)
+            show(name, "READING" if available else "UNAVAILABLE",
+                 GREEN if available else TXT_SUB)
+        if flags & 16:
+            show("CO", "FAULT", RED)
+            faults.append("CO")
+        elif flags & 256:
+            show("CO", "UNAVAILABLE", TXT_SUB)
+        else:
+            show("CO", "NO FAULT", TXT_SUB)
+        # The firmware no longer publishes a separate NO2 sensor status.
+        show("NO₂", "NOT MONITORED", TXT_SUB)
+    else:
+        for name in health_nodes:
+            show(name, "—", TXT_SUB)
+    if not _device_connected:
+        title, color = "UNKNOWN", TXT_SUB
+        detail = "Waiting for live telemetry" if _server_link_state is not False else "Device offline · health data may be stale"
+    elif flags is None:
+        title, color, detail = "UNKNOWN", TXT_SUB, "System status (V20) unavailable"
+    elif faults:
+        title, color, detail = "FAULT", RED, "Reported fault: " + ", ".join(faults)
+    elif missing:
+        title, color, detail = "DEGRADED", AMBER, "Status not OK: " + ", ".join(missing)
+    else:
+        title, color, detail = "HEALTHY", GREEN, "Live telemetry · primary subsystems OK"
+    health_detail.configure(text=detail, text_color=color)
+    health_canvas.delete("all")
+    # Concentric instrument rings and segmented arcs keep the status readable
+    # while giving the health core a larger, centered visual presence.
+    cx, cy = 155, 135
+    for radius, outline, width in ((124, BORDER, 1), (113, BORDER, 2),
+                                   (91, BORDER, 1), (76, "#1b3040", 1)):
+        health_canvas.create_oval(cx-radius, cy-radius, cx+radius, cy+radius,
+                                  outline=outline, width=width)
+    for angle in range(0, 360, 30):
+        health_canvas.create_arc(37, 17, 273, 253, start=angle+3, extent=23,
+                                 style="arc", outline=color, width=3)
+    for angle in (20, 200):
+        health_canvas.create_arc(54, 34, 256, 236, start=angle, extent=140,
+                                 style="arc", outline=color, width=7)
+    health_canvas.create_text(cx, cy-24, text="SYSTEM HEALTH", fill=TXT_SUB,
+                              font=("Segoe UI", 10, "bold"))
+    health_canvas.create_text(cx, cy+4, text=title, fill=color,
+                              font=("Segoe UI", 22, "bold"))
+    health_canvas.create_text(cx, cy+33, text="●  LIVE" if usable else "●  NO LIVE STATUS",
+                              fill=color if usable else TXT_SUB,
+                              font=("Segoe UI", 9, "bold"))
+
 
 # V61 and V62 are independent Blynk pins. A poll can read one before its
 # update and the other after it. Cache both halves and change both labels only
@@ -2167,7 +2287,8 @@ def _apply_message_pair(values):
 
 def _apply_connection_status(status):
     """Update connection widgets without inventing a fresh-data timestamp."""
-    global _device_connected, _server_link_state
+    global _device_connected, _server_link_state, _health_status
+    _health_status = status if isinstance(status, dict) else {}
     if isinstance(status, dict):
         _device_connected = bool(status.get("connected"))
         source = status.get("source", "unknown")
@@ -2180,6 +2301,7 @@ def _apply_connection_status(status):
         last_live = None
         _server_link_state = None
 
+    _refresh_health_core()
     if _device_connected:
         label_status.configure(text="⬤  CONNECTED", text_color=GREEN)
         if last_live is not None:
@@ -2231,6 +2353,7 @@ def _fresh_location(values, source, lat_key, lng_key):
 def _apply_values(values):
     global _last_values
     _last_values = values
+    _refresh_health_core()
 
     # Connection state is maintained separately. Never infer it from cached
     # virtual-pin values.
@@ -2312,13 +2435,6 @@ def _apply_values(values):
     v_reset_reason.configure(text=reset_reason_text)
 
     v_rtc_checkpoint.configure(text=values.get("rtc_checkpoint") or "—")
-
-    status_flags = _as_float(values, "status_flags")
-    flags_int = int(status_flags) if status_flags is not None else 0
-    for bit, chip in flag_chip_labels:
-        is_set = bool(flags_int & bit)
-        good = is_set if bit in STATUS_GOOD_WHEN_SET else not is_set
-        chip.configure(fg_color=(GREEN if good else RED))
 
     for key, (label_widget, unit) in diag_value_labels.items():
         if key in ("i2c_device",):
@@ -2403,7 +2519,9 @@ _TEXT_LABELS = [
 
 def clear_dashboard():
     """Reset all displayed values to 0.0 (numeric) / NaN (text) locally."""
-    global _displayed_message_pair_key
+    global _displayed_message_pair_key, _last_values
+    _last_values = {}
+    _refresh_health_core()
     _pending_message_pair["msg_v61"] = None
     _pending_message_pair["msg_v62"] = None
     _displayed_message_pair_key = None
@@ -2412,9 +2530,6 @@ def clear_dashboard():
 
     for label in _TEXT_LABELS:
         label.configure(text=TXT_NA, text_color=TXT_MAIN)
-
-    for bit, chip in flag_chip_labels:
-        chip.configure(fg_color=TXT_DIM)
 
     for key, (label_widget, unit) in diag_value_labels.items():
         if key in ("i2c_device", "i2c_op"):
